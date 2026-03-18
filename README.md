@@ -1,3 +1,5 @@
+<p align="center"><img src="icon.svg" width="128" height="128" alt="Restore-WindowsDefaults"></p>
+
 # Windows Restore Tool
 
 A one-click solution to fix Windows PCs broken by debloat scripts, privacy.sexy tweaks, and aggressive registry modifications.

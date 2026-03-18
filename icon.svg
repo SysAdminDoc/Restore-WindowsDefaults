@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <rect width="128" height="128" rx="24" fill="#1a1a2e"/>
+  <path d="M44 58a24 24 0 1 1 6 16" stroke="#2ecc71" stroke-width="5" fill="none" stroke-linecap="round"/>
+  <polygon points="38,56 50,56 44,68" fill="#2ecc71"/>
+  <rect x="50" y="42" width="10" height="10" rx="1" fill="#3498db" opacity="0.6"/>
+  <rect x="64" y="42" width="10" height="10" rx="1" fill="#3498db" opacity="0.6"/>
+  <rect x="50" y="56" width="10" height="10" rx="1" fill="#3498db" opacity="0.6"/>
+  <rect x="64" y="56" width="10" height="10" rx="1" fill="#3498db" opacity="0.6"/>
+  <text x="64" y="108" text-anchor="middle" fill="#7f8c8d" font-family="Segoe UI,sans-serif" font-size="10" font-weight="600">RESTORE</text>
+</svg>
