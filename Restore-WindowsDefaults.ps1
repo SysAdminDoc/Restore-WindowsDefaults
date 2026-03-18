@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    Windows Restore Tool v4.2
+    Windows Restore Tool v4.3
     Restores Windows to factory default settings after debloat scripts,
     privacy.sexy tweaks, group policy modifications, and registry changes.
 
@@ -13,7 +13,7 @@
 
 .NOTES
     Author: Maven Imaging IT
-    Version: 4.2.0
+    Version: 4.3.0
     Requires: Administrator privileges
 #>
 
@@ -21,7 +21,7 @@
 # CONFIGURATION
 # ============================================================================
 
-$script:Version = "4.2.0"
+$script:Version = "4.3.0"
 $script:LogPath = "$env:USERPROFILE\Desktop\WindowsRestore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:ChangesCount = 0
 $script:ErrorsCount = 0
@@ -2347,6 +2347,343 @@ function Get-SystemHealthReport {
 }
 
 # ============================================================================
+# PRE-SCAN QUICK SUMMARY (counts for disabled services, tasks, missing AppX, modified registry)
+# ============================================================================
+
+function Get-QuickScanSummary {
+    $summary = [ordered]@{
+        DisabledServices = 0
+        DisabledTasks = 0
+        MissingAppx = 0
+        ModifiedRegistry = 0
+        ServiceNames = @()
+        TaskNames = @()
+        AppxNames = @()
+        RegistryDetails = @()
+    }
+
+    # Count disabled services that should be running
+    $defaultSvcs = @(
+        "WinDefend","MpsSvc","BFE","wuauserv","UsoSvc","DoSvc","BITS","CryptSvc",
+        "Spooler","Audiosrv","AudioEndpointBuilder","NlaSvc","Dnscache","Themes",
+        "EventLog","Schedule","WpnService","DiagTrack","bthserv","WSearch","SysMain",
+        "PcaSvc","wersvc","wscsvc","WlanSvc","Dhcp","TrkWks","Power","ProfSvc","Winmgmt"
+    )
+    foreach ($sn in $defaultSvcs) {
+        $svc = Get-Service -Name $sn -EA 0
+        if ($svc -and $svc.StartType -eq 'Disabled') {
+            $summary.DisabledServices++
+            $summary.ServiceNames += $sn
+        }
+    }
+
+    # Count disabled scheduled tasks
+    $taskChecks = @(
+        @{P="\Microsoft\Windows\WindowsUpdate\";N="Scheduled Start"},
+        @{P="\Microsoft\Windows\Windows Defender\";N="Windows Defender Scheduled Scan"},
+        @{P="\Microsoft\Windows\Defrag\";N="ScheduledDefrag"},
+        @{P="\Microsoft\Windows\DiskDiagnostic\";N="Microsoft-Windows-DiskDiagnosticDataCollector"},
+        @{P="\Microsoft\Windows\Diagnosis\";N="Scheduled"},
+        @{P="\Microsoft\Windows\Application Experience\";N="Microsoft Compatibility Appraiser"},
+        @{P="\Microsoft\Windows\UpdateOrchestrator\";N="Schedule Scan"},
+        @{P="\Microsoft\Windows\Servicing\";N="StartComponentCleanup"},
+        @{P="\Microsoft\Windows\Customer Experience Improvement Program\";N="Consolidator"}
+    )
+    foreach ($tc in $taskChecks) {
+        try {
+            $t = Get-ScheduledTask -TaskPath $tc.P -TaskName $tc.N -EA Stop
+            if ($t.State -eq 'Disabled') {
+                $summary.DisabledTasks++
+                $summary.TaskNames += $tc.N
+            }
+        } catch { }
+    }
+
+    # Count missing AppX packages
+    $coreAppx = @(
+        "Microsoft.WindowsStore","Microsoft.WindowsCalculator","Microsoft.Windows.Photos",
+        "Microsoft.DesktopAppInstaller","Microsoft.WindowsCamera","Microsoft.WindowsAlarms",
+        "Microsoft.MSPaint","Microsoft.GetHelp","Microsoft.People",
+        "Microsoft.MicrosoftOfficeHub","Microsoft.WindowsFeedbackHub"
+    )
+    foreach ($pkg in $coreAppx) {
+        if (!(Get-AppxPackageSafe -Name $pkg)) {
+            $summary.MissingAppx++
+            $summary.AppxNames += $pkg
+        }
+    }
+
+    # Count modified registry keys (key policy paths that shouldn't exist on stock Windows)
+    $regChecks = @(
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender";N="DisableAntiSpyware"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection";N="DisableRealtimeMonitoring"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU";N="NoAutoUpdate"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System";N="EnableSmartScreen"},
+        @{P="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System";N="EnableLUA"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection";N="AllowTelemetry"},
+        @{P="HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications";N="GlobalUserDisabled"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive";N="DisableFileSyncNGSC"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Edge";N="SmartScreenEnabled"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy";N="LetAppsRunInBackground"}
+    )
+    foreach ($rc in $regChecks) {
+        $val = (Get-ItemProperty -Path $rc.P -Name $rc.N -EA 0)
+        if ($null -ne $val -and $null -ne $val.$($rc.N)) {
+            $summary.ModifiedRegistry++
+            $summary.RegistryDetails += "$($rc.P)\$($rc.N)"
+        }
+    }
+
+    return $summary
+}
+
+# ============================================================================
+# MANIFEST IMPORT (reads Debloat-Win11 v1.1.0 JSON undo manifests)
+# ============================================================================
+
+function Import-UndoManifest {
+    param([string]$ManifestPath)
+
+    $result = @{
+        Success = $false
+        AppxPackages = @()
+        Services = @()
+        Tasks = @()
+        RegistryKeys = @()
+        RelevantCategories = @()
+        Summary = ""
+        ManifestData = $null
+    }
+
+    if (!(Test-Path $ManifestPath)) {
+        $result.Summary = "File not found: $ManifestPath"
+        return $result
+    }
+
+    try {
+        $json = Get-Content -Path $ManifestPath -Raw -EA Stop | ConvertFrom-Json -EA Stop
+    } catch {
+        $result.Summary = "Invalid JSON: $($_.Exception.Message)"
+        return $result
+    }
+
+    $result.ManifestData = $json
+
+    # Extract AppX packages
+    if ($json.PSObject.Properties['AppxPackages'] -or $json.PSObject.Properties['appx_packages'] -or $json.PSObject.Properties['removedApps']) {
+        $appxProp = if ($json.PSObject.Properties['AppxPackages']) { $json.AppxPackages }
+                    elseif ($json.PSObject.Properties['appx_packages']) { $json.appx_packages }
+                    elseif ($json.PSObject.Properties['removedApps']) { $json.removedApps }
+                    else { @() }
+        $result.AppxPackages = @($appxProp)
+        if ($result.AppxPackages.Count -gt 0) { $result.RelevantCategories += "chkAppx" }
+    }
+
+    # Extract services
+    if ($json.PSObject.Properties['Services'] -or $json.PSObject.Properties['services'] -or $json.PSObject.Properties['disabledServices']) {
+        $svcProp = if ($json.PSObject.Properties['Services']) { $json.Services }
+                   elseif ($json.PSObject.Properties['services']) { $json.services }
+                   elseif ($json.PSObject.Properties['disabledServices']) { $json.disabledServices }
+                   else { @() }
+        $result.Services = @($svcProp)
+        if ($result.Services.Count -gt 0) { $result.RelevantCategories += "chkServices" }
+    }
+
+    # Extract tasks
+    if ($json.PSObject.Properties['ScheduledTasks'] -or $json.PSObject.Properties['scheduled_tasks'] -or $json.PSObject.Properties['disabledTasks']) {
+        $taskProp = if ($json.PSObject.Properties['ScheduledTasks']) { $json.ScheduledTasks }
+                    elseif ($json.PSObject.Properties['scheduled_tasks']) { $json.scheduled_tasks }
+                    elseif ($json.PSObject.Properties['disabledTasks']) { $json.disabledTasks }
+                    else { @() }
+        $result.Tasks = @($taskProp)
+        if ($result.Tasks.Count -gt 0) { $result.RelevantCategories += "chkTasks" }
+    }
+
+    # Extract registry keys
+    if ($json.PSObject.Properties['RegistryKeys'] -or $json.PSObject.Properties['registry_keys'] -or $json.PSObject.Properties['registryChanges']) {
+        $regProp = if ($json.PSObject.Properties['RegistryKeys']) { $json.RegistryKeys }
+                   elseif ($json.PSObject.Properties['registry_keys']) { $json.registry_keys }
+                   elseif ($json.PSObject.Properties['registryChanges']) { $json.registryChanges }
+                   else { @() }
+        $result.RegistryKeys = @($regProp)
+    }
+
+    # Map registry changes to relevant categories
+    $regCatMap = @{
+        "Windows Defender" = "chkDefender"
+        "Firewall" = "chkFirewall"
+        "SmartScreen" = "chkSmartScreen"
+        "WindowsUpdate" = "chkWindowsUpdate"
+        "DataCollection" = "chkPrivacy"
+        "AppPrivacy" = "chkPrivacy"
+        "OneDrive" = "chkOneDrive"
+        "Edge" = "chkEdge"
+        "Chrome" = "chkChrome"
+        "CloudContent" = "chkCDM"
+    }
+    foreach ($rk in $result.RegistryKeys) {
+        $path = if ($rk.PSObject.Properties['Path']) { $rk.Path }
+                elseif ($rk.PSObject.Properties['path']) { $rk.path }
+                elseif ($rk -is [string]) { $rk }
+                else { "" }
+        foreach ($pattern in $regCatMap.Keys) {
+            if ($path -match [regex]::Escape($pattern)) {
+                if ($regCatMap[$pattern] -notin $result.RelevantCategories) {
+                    $result.RelevantCategories += $regCatMap[$pattern]
+                }
+            }
+        }
+    }
+
+    # Also check for specific categories mentioned in the manifest
+    if ($json.PSObject.Properties['categories'] -or $json.PSObject.Properties['Categories']) {
+        $cats = if ($json.PSObject.Properties['categories']) { $json.categories } else { $json.Categories }
+        foreach ($c in $cats) {
+            $catName = if ($c -is [string]) { $c } elseif ($c.PSObject.Properties['name']) { $c.name } else { "" }
+            # Map category names to our checkbox keys
+            $catKeyMap = @{
+                "defender"="chkDefender"; "firewall"="chkFirewall"; "smartscreen"="chkSmartScreen"
+                "update"="chkWindowsUpdate"; "privacy"="chkPrivacy"; "telemetry"="chkPrivacy"
+                "edge"="chkEdge"; "chrome"="chkChrome"; "onedrive"="chkOneDrive"
+                "cortana"="chkCopilot"; "copilot"="chkCopilot"; "network"="chkNetwork"
+                "hosts"="chkHostsFile"; "gaming"="chkGaming"; "xbox"="chkGaming"
+            }
+            foreach ($mk in $catKeyMap.Keys) {
+                if ($catName -match $mk -and $catKeyMap[$mk] -notin $result.RelevantCategories) {
+                    $result.RelevantCategories += $catKeyMap[$mk]
+                }
+            }
+        }
+    }
+
+    $result.RelevantCategories = @($result.RelevantCategories | Select-Object -Unique)
+    $parts = @()
+    if ($result.AppxPackages.Count) { $parts += "$($result.AppxPackages.Count) AppX" }
+    if ($result.Services.Count) { $parts += "$($result.Services.Count) services" }
+    if ($result.Tasks.Count) { $parts += "$($result.Tasks.Count) tasks" }
+    if ($result.RegistryKeys.Count) { $parts += "$($result.RegistryKeys.Count) registry keys" }
+    $result.Summary = "Manifest loaded: $($parts -join ', ') to restore"
+    $result.Success = $true
+
+    return $result
+}
+
+# ============================================================================
+# HTML REPORT EXPORT
+# ============================================================================
+
+function Export-HtmlReport {
+    param([string]$OutputPath)
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $fixed   = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Fixed" }).Count
+    $already = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Already OK" }).Count
+    $errored = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Error" }).Count
+
+    $rows = ""
+    foreach ($cat in $script:CategoryResults.GetEnumerator()) {
+        $statusColor = switch ($cat.Value.Status) {
+            "Fixed" { "#3fb950" }
+            "Already OK" { "#8b949e" }
+            "Error" { "#f85149" }
+            default { "#484f58" }
+        }
+        $statusLabel = switch ($cat.Value.Status) {
+            "Fixed" { "FIXED" }
+            "Already OK" { "OK" }
+            "Error" { "FAILED" }
+            default { "SKIPPED" }
+        }
+        $rows += "<tr>"
+        $rows += "<td style='padding:8px 12px;border-bottom:1px solid #21262d;color:#c9d1d9;'>$($cat.Key)</td>"
+        $rows += "<td style='padding:8px 12px;border-bottom:1px solid #21262d;color:$statusColor;font-weight:bold;'>$statusLabel</td>"
+        $rows += "<td style='padding:8px 12px;border-bottom:1px solid #21262d;color:#8b949e;'>$($cat.Value.Changed) changes</td>"
+        $rows += "<td style='padding:8px 12px;border-bottom:1px solid #21262d;color:$(if($cat.Value.Errors -gt 0){'#f85149'}else{'#8b949e'});'>$($cat.Value.Errors) errors</td>"
+        $rows += "</tr>`n"
+    }
+
+    # Read the log file for detailed output
+    $logContent = ""
+    if (Test-Path $script:LogPath) {
+        $logLines = Get-Content -Path $script:LogPath -EA 0
+        foreach ($line in $logLines) {
+            $escaped = [System.Net.WebUtility]::HtmlEncode($line)
+            $color = "#8b949e"
+            if ($escaped -match "\[Success\]") { $color = "#3fb950" }
+            elseif ($escaped -match "\[Error\]") { $color = "#f85149" }
+            elseif ($escaped -match "\[Warning\]") { $color = "#d29922" }
+            elseif ($escaped -match "\[Section\]") { $color = "#bb86fc" }
+            $logContent += "<div style='color:$color;margin:1px 0;'>$escaped</div>`n"
+        }
+    }
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Windows Restore Tool - Report</title>
+<style>
+body { background:#0d1117; color:#c9d1d9; font-family:'Segoe UI',system-ui,sans-serif; margin:0; padding:20px; }
+.header { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:20px; margin-bottom:20px; }
+.header h1 { color:#e6edf3; margin:0 0 4px 0; font-size:22px; }
+.header p { color:#8b949e; margin:4px 0; font-size:13px; }
+.badge { display:inline-block; background:#238636; color:white; padding:2px 8px; border-radius:10px; font-size:11px; font-weight:bold; margin-left:8px; }
+.summary { display:flex; gap:16px; margin-bottom:20px; }
+.summary-card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:16px; flex:1; text-align:center; }
+.summary-card .number { font-size:28px; font-weight:bold; }
+.summary-card .label { color:#8b949e; font-size:12px; margin-top:4px; }
+.green { color:#3fb950; }
+.gray { color:#8b949e; }
+.red { color:#f85149; }
+table { width:100%; border-collapse:collapse; background:#161b22; border:1px solid #30363d; border-radius:8px; overflow:hidden; margin-bottom:20px; }
+th { background:#21262d; color:#8b949e; padding:10px 12px; text-align:left; font-size:12px; text-transform:uppercase; letter-spacing:0.5px; }
+.log-section { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:16px; }
+.log-section h2 { color:#e6edf3; font-size:16px; margin:0 0 12px 0; }
+.log-content { font-family:'Cascadia Mono','Consolas',monospace; font-size:11px; max-height:600px; overflow-y:auto; line-height:1.5; }
+.footer { text-align:center; color:#484f58; font-size:11px; margin-top:20px; padding-top:16px; border-top:1px solid #21262d; }
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>Windows Restore Tool<span class="badge">v$($script:Version)</span></h1>
+    <p>Report generated: $timestamp</p>
+    <p>Computer: $env:COMPUTERNAME | User: $env:USERNAME | OS: $([System.Environment]::OSVersion.VersionString)</p>
+</div>
+<div class="summary">
+    <div class="summary-card"><div class="number green">$fixed</div><div class="label">Categories Fixed</div></div>
+    <div class="summary-card"><div class="number gray">$already</div><div class="label">Already OK</div></div>
+    <div class="summary-card"><div class="number red">$errored</div><div class="label">Errors</div></div>
+    <div class="summary-card"><div class="number" style="color:#58a6ff;">$($script:ChangesCount)</div><div class="label">Total Changes</div></div>
+</div>
+<table>
+<thead><tr><th>Category</th><th>Status</th><th>Changes</th><th>Errors</th></tr></thead>
+<tbody>
+$rows
+</tbody>
+</table>
+<div class="log-section">
+    <h2>Detailed Log</h2>
+    <div class="log-content">
+$logContent
+    </div>
+</div>
+<div class="footer">
+    Windows Restore Tool v$($script:Version) - Generated by Restore-WindowsDefaults.ps1
+</div>
+</body>
+</html>
+"@
+
+    try {
+        [System.IO.File]::WriteAllText($OutputPath, $html, [System.Text.Encoding]::UTF8)
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# ============================================================================
 # GUI (100% static XAML - all dynamic content populated programmatically)
 # ============================================================================
 
@@ -2498,7 +2835,7 @@ function Show-MainWindow {
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="Windows Restore Tool" FontSize="20" FontWeight="Bold" Foreground="#e6edf3"/>
                         <Border Background="#238636" CornerRadius="10" Padding="8,2" Margin="10,0" VerticalAlignment="Center">
-                            <TextBlock Text="v4.2" FontSize="10" Foreground="White" FontWeight="SemiBold"/>
+                            <TextBlock Text="v4.3" FontSize="10" Foreground="White" FontWeight="SemiBold"/>
                         </Border>
                     </StackPanel>
                     <TextBlock Text="Fixes PCs broken by debloat scripts, privacy.sexy, and registry tweaks" Foreground="#8b949e" FontSize="12" Margin="0,3,0,0"/>
@@ -2506,7 +2843,16 @@ function Show-MainWindow {
             </Border>
             <Border Grid.Row="1" Background="#0d1117" Padding="20,10,20,6">
                 <StackPanel>
-                    <TextBlock Text="System Scan" FontSize="13" FontWeight="SemiBold" Foreground="#c9d1d9" Margin="0,0,0,6"/>
+                    <DockPanel Margin="0,0,0,6">
+                        <TextBlock Text="System Scan" FontSize="13" FontWeight="SemiBold" Foreground="#c9d1d9" VerticalAlignment="Center"/>
+                        <Button x:Name="btnImportManifest" Content="Import Manifest" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="10,4" FontSize="11"/>
+                    </DockPanel>
+                    <Border x:Name="quickScanPanel" Background="#161b22" CornerRadius="6" Padding="12,8" Margin="0,0,0,6" BorderBrush="#30363d" BorderThickness="1">
+                        <WrapPanel x:Name="quickScanStats"/>
+                    </Border>
+                    <Border x:Name="manifestBanner" Background="#1a3070" CornerRadius="6" Padding="12,8" Margin="0,0,0,6" BorderBrush="#1f6feb" BorderThickness="1" Visibility="Collapsed">
+                        <TextBlock x:Name="txtManifestSummary" Foreground="#58a6ff" FontSize="12" TextWrapping="Wrap"/>
+                    </Border>
                     <Border Background="#161b22" CornerRadius="6" Padding="12,8" BorderBrush="#30363d" BorderThickness="1">
                         <StackPanel>
                             <TextBlock x:Name="txtHealthSummary" FontSize="13" FontWeight="SemiBold" Margin="0,0,0,4"/>
@@ -2623,7 +2969,17 @@ function Show-MainWindow {
                 </StackPanel>
             </Border>
             <Border Grid.Row="2" Background="#0d1117" Padding="20,4,20,8">
-                <Border Background="#161b22" CornerRadius="6" Padding="2" BorderBrush="#30363d" BorderThickness="1">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto"/>
+                        <RowDefinition Height="*"/>
+                    </Grid.RowDefinitions>
+                    <Border Grid.Row="0" x:Name="categoryResultsPanel" Visibility="Collapsed" Background="#161b22" CornerRadius="6" Padding="8,6" Margin="0,0,0,6" BorderBrush="#30363d" BorderThickness="1">
+                        <ScrollViewer MaxHeight="120" VerticalScrollBarVisibility="Auto">
+                            <WrapPanel x:Name="categoryResultsList"/>
+                        </ScrollViewer>
+                    </Border>
+                <Border Grid.Row="1" Background="#161b22" CornerRadius="6" Padding="2" BorderBrush="#30363d" BorderThickness="1">
                     <RichTextBox x:Name="txtConsole" IsReadOnly="True" Background="Transparent" BorderThickness="0"
                                  FontFamily="Cascadia Mono,Consolas,Courier New" FontSize="11"
                                  VerticalScrollBarVisibility="Auto" Padding="6">
@@ -2631,6 +2987,7 @@ function Show-MainWindow {
                         <FlowDocument/>
                     </RichTextBox>
                 </Border>
+                </Grid>
             </Border>
             <Border Grid.Row="3" Background="#161b22" Padding="14,8" BorderBrush="#30363d" BorderThickness="0,1,0,0">
                 <DockPanel>
@@ -2639,6 +2996,7 @@ function Show-MainWindow {
                         <Button x:Name="btnReboot" Visibility="Collapsed" Padding="14,8" Background="#238636" Foreground="White" BorderBrush="#238636">
                             <TextBlock Text="Reboot Now" FontWeight="SemiBold"/></Button>
                         <Button x:Name="btnLater" Content="Close (Reboot Later)" Visibility="Collapsed" Padding="14,8" Margin="6,0,0,0"/>
+                        <Button x:Name="btnExportReport" Content="Export Report" Visibility="Collapsed" Padding="14,8" Margin="6,0,0,0"/>
                         <Button x:Name="btnViewLog" Content="Open Log File" Visibility="Collapsed" Padding="14,8" Margin="6,0,0,0"/>
                     </StackPanel>
                 </DockPanel>
@@ -2667,7 +3025,11 @@ function Show-MainWindow {
         'btnBack', 'btnSelectAll', 'btnSelectNone', 'btnSelectSafe',
         'chkContainer', 'chkAutoRestoreC', 'btnRunCustom',
         'txtProgressTitle', 'txtProgressSub', 'progressBar', 'txtProgressPercent', 'txtProgressStep',
-        'txtConsole', 'txtStatus', 'btnReboot', 'btnLater', 'btnViewLog'
+        'txtConsole', 'txtStatus', 'btnReboot', 'btnLater', 'btnViewLog',
+        'btnImportManifest', 'quickScanPanel', 'quickScanStats',
+        'manifestBanner', 'txtManifestSummary',
+        'categoryResultsPanel', 'categoryResultsList',
+        'btnExportReport'
     )
     foreach ($name in $controlNames) {
         $ctrl = $window.FindName($name)
@@ -2684,6 +3046,39 @@ function Show-MainWindow {
     # Health summary
     $ui.txtHealthSummary.Text = $hText
     $ui.txtHealthSummary.Foreground = $bc.ConvertFromString($hColor)
+
+    # ---- Quick scan summary panel ----
+    $quickScan = Get-QuickScanSummary
+    $quickStats = @(
+        @{Count=$quickScan.DisabledServices; Label="services disabled"; Color=if($quickScan.DisabledServices){"#d29922"}else{"#3fb950"}},
+        @{Count=$quickScan.DisabledTasks; Label="tasks disabled"; Color=if($quickScan.DisabledTasks){"#d29922"}else{"#3fb950"}},
+        @{Count=$quickScan.MissingAppx; Label="apps missing"; Color=if($quickScan.MissingAppx){"#58a6ff"}else{"#3fb950"}},
+        @{Count=$quickScan.ModifiedRegistry; Label="registry modified"; Color=if($quickScan.ModifiedRegistry){"#d29922"}else{"#3fb950"}}
+    )
+    foreach ($qs in $quickStats) {
+        $statBorder = New-Object System.Windows.Controls.Border
+        $statBorder.Margin = [System.Windows.Thickness]::new(0,0,12,0)
+        $statBorder.Padding = [System.Windows.Thickness]::new(0)
+        $statSP = New-Object System.Windows.Controls.StackPanel
+        $statSP.Orientation = "Horizontal"
+        $countTB = New-Object System.Windows.Controls.TextBlock
+        $countTB.Text = "$($qs.Count)"
+        $countTB.FontSize = 14; $countTB.FontWeight = "Bold"
+        $countTB.Foreground = $bc.ConvertFromString($qs.Color)
+        $countTB.VerticalAlignment = "Center"
+        $statSP.Children.Add($countTB) | Out-Null
+        $labelTB = New-Object System.Windows.Controls.TextBlock
+        $labelTB.Text = " $($qs.Label)"
+        $labelTB.FontSize = 11
+        $labelTB.Foreground = $bc.ConvertFromString("#8b949e")
+        $labelTB.VerticalAlignment = "Center"
+        $statSP.Children.Add($labelTB) | Out-Null
+        $statBorder.Child = $statSP
+        $ui.quickScanStats.Children.Add($statBorder) | Out-Null
+    }
+
+    # ---- Manifest import state ----
+    $script:ImportedManifest = $null
 
     # Scan results
     $sevOrder = @{Critical=0;High=1;Medium=2;Low=3;OK=4}
@@ -2850,7 +3245,7 @@ function Show-MainWindow {
             Write-Log "Creating system restore point..." -Level Info
             try {
                 Enable-ComputerRestore -Drive "$env:SystemDrive\" -EA 0
-                Checkpoint-Computer -Description "Before Windows Restore Tool v4.2" -RestorePointType MODIFY_SETTINGS -EA Stop
+                Checkpoint-Computer -Description "Before Windows Restore Tool v4.3" -RestorePointType MODIFY_SETTINGS -EA Stop
                 Write-Log "Restore point created successfully" -Level Success
             } catch {
                 Write-Log "Could not create restore point: $($_.Exception.Message)" -Level Warning
@@ -2861,7 +3256,7 @@ function Show-MainWindow {
         }
 
         $mode = if ($scanOnlyMode) { "PREVIEW" } else { "RESTORE" }
-        Write-Log "=== Windows Restore Tool v4.2 - $mode MODE ===" -Level Section
+        Write-Log "=== Windows Restore Tool v$($script:Version) - $mode MODE ===" -Level Section
         Write-Log "User: $env:USERNAME | Computer: $env:COMPUTERNAME | OS: $([System.Environment]::OSVersion.VersionString)" -Level Info
         Write-Log "Categories selected: $($selectedKeys.Count)" -Level Info
         Write-Log "" -Level Info
@@ -2888,7 +3283,28 @@ function Show-MainWindow {
 
         # ---- ACTUAL RESTORATION ----
         $ui.progressBar.Maximum = $selectedKeys.Count
+        $ui.categoryResultsPanel.Visibility = "Visible"
         $total = $selectedKeys.Count; $i = 0
+
+        # Pre-populate SKIPPED indicators for unchecked categories
+        foreach ($ak in $allChkNames) {
+            if ($ak -notin $selectedKeys) {
+                $skFn = $friendlyMap[$ak]; if (!$skFn) { $skFn = $ak }
+                $skSP = New-Object System.Windows.Controls.StackPanel
+                $skSP.Orientation = "Horizontal"
+                $skSP.Margin = [System.Windows.Thickness]::new(0,2,10,2)
+                $skLabel = New-Object System.Windows.Controls.TextBlock
+                $skLabel.Text = "$skFn "; $skLabel.FontSize = 10
+                $skLabel.Foreground = $bc.ConvertFromString("#484f58")
+                $skSP.Children.Add($skLabel) | Out-Null
+                $skStatus = New-Object System.Windows.Controls.TextBlock
+                $skStatus.Text = "SKIPPED"; $skStatus.FontSize = 10; $skStatus.FontWeight = "Bold"
+                $skStatus.Foreground = $bc.ConvertFromString("#484f58")
+                $skSP.Children.Add($skStatus) | Out-Null
+                $ui.categoryResultsList.Children.Add($skSP) | Out-Null
+            }
+        }
+
         foreach ($key in $selectedKeys) {
             $i++
             $fn = $friendlyMap[$key]; if (!$fn) { $fn = $key }
@@ -2903,13 +3319,41 @@ function Show-MainWindow {
             $script:CategoryResults[$fn] = @{ Status="OK"; Changed=0; Errors=0 }
             try {
                 & $funcMap[$key]
-                if ($script:CategoryResults[$fn].Changed -gt 0) { $script:CategoryResults[$fn].Status = "Fixed" }
-                else { $script:CategoryResults[$fn].Status = "Already OK" }
+                if ($script:CategoryResults[$fn].Errors -gt 0 -and $script:CategoryResults[$fn].Changed -gt 0) {
+                    $script:CategoryResults[$fn].Status = "Partial"
+                } elseif ($script:CategoryResults[$fn].Errors -gt 0) {
+                    $script:CategoryResults[$fn].Status = "Error"
+                } elseif ($script:CategoryResults[$fn].Changed -gt 0) {
+                    $script:CategoryResults[$fn].Status = "Fixed"
+                } else {
+                    $script:CategoryResults[$fn].Status = "Already OK"
+                }
             } catch {
                 $script:CategoryResults[$fn].Status = "Error"
                 $script:CategoryResults[$fn].Errors++
                 Write-Log "Error in $fn : $($_.Exception.Message)" -Level Error
             }
+
+            # Add category result indicator
+            $catSP = New-Object System.Windows.Controls.StackPanel
+            $catSP.Orientation = "Horizontal"
+            $catSP.Margin = [System.Windows.Thickness]::new(0,2,10,2)
+            $catLabel = New-Object System.Windows.Controls.TextBlock
+            $catLabel.Text = "$fn "; $catLabel.FontSize = 10
+            $catLabel.Foreground = $bc.ConvertFromString("#c9d1d9")
+            $catSP.Children.Add($catLabel) | Out-Null
+            $catStatus = New-Object System.Windows.Controls.TextBlock
+            $catStatus.FontSize = 10; $catStatus.FontWeight = "Bold"
+            switch ($script:CategoryResults[$fn].Status) {
+                "Fixed"      { $catStatus.Text = "FIXED"; $catStatus.Foreground = $bc.ConvertFromString("#3fb950") }
+                "Partial"    { $catStatus.Text = "PARTIAL"; $catStatus.Foreground = $bc.ConvertFromString("#d29922") }
+                "Error"      { $catStatus.Text = "FAILED"; $catStatus.Foreground = $bc.ConvertFromString("#f85149") }
+                "Already OK" { $catStatus.Text = "FIXED"; $catStatus.Foreground = $bc.ConvertFromString("#3fb950") }
+                default      { $catStatus.Text = "SKIPPED"; $catStatus.Foreground = $bc.ConvertFromString("#484f58") }
+            }
+            $catSP.Children.Add($catStatus) | Out-Null
+            $ui.categoryResultsList.Children.Add($catSP) | Out-Null
+
             $window.Dispatcher.Invoke([action]{}, "Render")
         }
         $script:CurrentCategory = ""
@@ -2917,14 +3361,15 @@ function Show-MainWindow {
         # ---- SUMMARY ----
         Write-Log "" -Level Info
         Write-Log "=== RESTORATION SUMMARY ===" -Level Section
-        $fixed   = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Fixed" }).Count
+        $fixed   = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Fixed" -or $_.Status -eq "Already OK" }).Count
+        $partial = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Partial" }).Count
         $already = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Already OK" }).Count
         $errored = @($script:CategoryResults.Values | Where-Object { $_.Status -eq "Error" }).Count
-        Write-Log "Fixed: $fixed | Already OK: $already | Errors: $errored | Total changes: $script:ChangesCount" -Level Info
+        Write-Log "Fixed: $fixed | Partial: $partial | Already OK: $already | Errors: $errored | Total changes: $script:ChangesCount" -Level Info
         Write-Log "" -Level Info
         foreach ($cat in $script:CategoryResults.GetEnumerator()) {
-            $icon = switch ($cat.Value.Status) { "Fixed"{"[FIXED]"}; "Already OK"{"[ OK ]"}; "Error"{"[FAIL]"}; default{"[----]"} }
-            $lvl = switch ($cat.Value.Status) { "Fixed"{"Success"}; "Error"{"Error"}; default{"Info"} }
+            $icon = switch ($cat.Value.Status) { "Fixed"{"[FIXED]"}; "Already OK"{"[ OK ]"}; "Partial"{"[PART]"}; "Error"{"[FAIL]"}; default{"[----]"} }
+            $lvl = switch ($cat.Value.Status) { "Fixed"{"Success"}; "Partial"{"Warning"}; "Error"{"Error"}; default{"Info"} }
             $det = if ($cat.Value.Changed -gt 0) { " ($($cat.Value.Changed) changes)" } else { "" }
             Write-Log "$icon $($cat.Key)$det" -Level $lvl
         }
@@ -2942,13 +3387,15 @@ function Show-MainWindow {
         $ui.txtProgressTitle.Text = "All done! Your PC has been restored."
         $parts = @()
         if ($fixed -gt 0) { $parts += "$fixed fixed" }
+        if ($partial -gt 0) { $parts += "$partial partial" }
         if ($already -gt 0) { $parts += "$already already OK" }
         if ($errored -gt 0) { $parts += "$errored errors" }
         $ui.txtProgressSub.Text = ($parts -join "  |  ")
         $ui.progressBar.Value = $ui.progressBar.Maximum
         $ui.txtProgressPercent.Text = "Complete"; $ui.txtProgressStep.Text = ""
         $ui.txtStatus.Text = "Please reboot to finish applying changes"
-        $ui.btnReboot.Visibility = "Visible"; $ui.btnLater.Visibility = "Visible"; $ui.btnViewLog.Visibility = "Visible"
+        $ui.btnReboot.Visibility = "Visible"; $ui.btnLater.Visibility = "Visible"
+        $ui.btnExportReport.Visibility = "Visible"; $ui.btnViewLog.Visibility = "Visible"
         $window.Dispatcher.Invoke([action]{}, "Render")
     }
 
@@ -3012,6 +3459,51 @@ function Show-MainWindow {
     })
     $ui.btnLater.Add_Click({ $window.Close() })
     $ui.btnViewLog.Add_Click({ if (Test-Path $script:LogPath) { Start-Process notepad.exe $script:LogPath } })
+
+    # ---- Import Manifest button ----
+    $ui.btnImportManifest.Add_Click({
+        $ofd = New-Object Microsoft.Win32.OpenFileDialog
+        $ofd.Title = "Import Debloat Undo Manifest"
+        $ofd.Filter = "JSON files (*.json)|*.json|All files (*.*)|*.*"
+        $ofd.InitialDirectory = "$env:USERPROFILE\Desktop"
+        if ($ofd.ShowDialog() -eq $true) {
+            $manifest = Import-UndoManifest -ManifestPath $ofd.FileName
+            if ($manifest.Success) {
+                $script:ImportedManifest = $manifest
+                $ui.manifestBanner.Visibility = "Visible"
+                $ui.txtManifestSummary.Text = $manifest.Summary
+
+                # Auto-check only relevant categories, uncheck the rest
+                foreach ($c in $allChkNames) {
+                    if ($ui[$c]) {
+                        $ui[$c].IsChecked = ($c -in $manifest.RelevantCategories)
+                    }
+                }
+                # Switch to custom page so user can see what's checked
+                $ui.pageHome.Visibility = "Collapsed"
+                $ui.pageCustom.Visibility = "Visible"
+            } else {
+                [System.Windows.MessageBox]::Show($manifest.Summary, "Manifest Import Failed", "OK", "Error")
+            }
+        }
+    })
+
+    # ---- Export Report button ----
+    $ui.btnExportReport.Add_Click({
+        $sfd = New-Object Microsoft.Win32.SaveFileDialog
+        $sfd.Title = "Export Restoration Report"
+        $sfd.Filter = "HTML files (*.html)|*.html"
+        $sfd.InitialDirectory = "$env:USERPROFILE\Desktop"
+        $sfd.FileName = "WindowsRestore_Report_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+        if ($sfd.ShowDialog() -eq $true) {
+            $success = Export-HtmlReport -OutputPath $sfd.FileName
+            if ($success) {
+                Start-Process $sfd.FileName
+            } else {
+                [System.Windows.MessageBox]::Show("Failed to save report.", "Export Error", "OK", "Error")
+            }
+        }
+    })
 
     $window.ShowDialog() | Out-Null
 }

@@ -2,7 +2,7 @@
 
 A one-click solution to fix Windows PCs broken by debloat scripts, privacy.sexy tweaks, and aggressive registry modifications.
 
-![Version](https://img.shields.io/badge/version-4.2.0-green)
+![Version](https://img.shields.io/badge/version-4.3.0-green)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -15,8 +15,13 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 ## Features
 
 - **Pre-scan diagnostics** - Automatically detects what's broken before making changes
+- **Quick scan summary** - Shows disabled services, tasks, missing apps, and registry modifications at a glance
 - **Multiple fix modes** - Recommended, detected-only, security-only, or fully custom
 - **47 restoration categories** - Comprehensive coverage of common tweaks
+- **Progress bar** - Real-time progress with percentage as categories are processed
+- **Category result indicators** - FIXED, PARTIAL, FAILED, or SKIPPED status for each category
+- **Import undo manifest** - Load JSON manifests from Debloat-Win11 v1.1.0 for precise restoration
+- **HTML report export** - Save a detailed dark-themed report of everything restored with before/after states
 - **Safe by default** - Creates a System Restore point before making changes
 - **Detailed logging** - Full log saved to your Desktop
 - **Dark themed UI** - Modern interface that's easy on the eyes
@@ -109,6 +114,24 @@ Removes domain blocks commonly added by privacy scripts (telemetry, update, and 
 | **Custom** | Pick exactly which categories to restore from all 47 options. |
 | **Preview Only** | Shows what would change without making any changes. |
 
+## Import Undo Manifest
+
+If you used Debloat-Win11 v1.1.0 or a similar tool that generates an undo manifest (JSON file), you can import it:
+
+1. Click **Import Manifest** on the main screen
+2. Select the JSON manifest file
+3. The tool auto-checks only the categories relevant to the manifest changes
+4. A summary shows exactly how many AppX packages, services, tasks, and registry keys will be restored
+5. Click **Run Selected Fixes** to restore precisely what was changed
+
+## HTML Report
+
+After restoration completes, click **Export Report** to save a detailed HTML report containing:
+- Summary of fixed, partial, and failed categories
+- Total changes made
+- Full detailed log with color-coded entries
+- Before/after states for all operations
+
 ## Safety Features
 
 - **System Restore Point** - Automatically created before changes (optional but recommended)
@@ -116,6 +139,7 @@ Removes domain blocks commonly added by privacy scripts (telemetry, update, and 
 - **Detailed Logging** - Complete log saved to Desktop with timestamps
 - **Preview Mode** - See exactly what would change before committing
 - **Graceful Errors** - Continues through errors, reports them at the end
+- **Category Results** - FIXED, PARTIAL, FAILED, SKIPPED indicators show exactly what happened
 
 ## Requirements
 
@@ -125,19 +149,19 @@ Removes domain blocks commonly added by privacy scripts (telemetry, update, and 
 
 ## FAQ
 
-**Q: Will this undo my dark theme?**  
+**Q: Will this undo my dark theme?**
 A: No, the Recommended Fix specifically preserves your theme settings.
 
-**Q: Will this reinstall bloatware apps?**  
+**Q: Will this reinstall bloatware apps?**
 A: Not by default. App reinstallation is a separate option in Custom mode.
 
-**Q: Is it safe to run?**  
+**Q: Is it safe to run?**
 A: Yes. It only restores Windows defaults and creates a restore point first. You can always undo changes via System Restore.
 
-**Q: My antivirus flags this script. Is it malware?**  
+**Q: My antivirus flags this script. Is it malware?**
 A: No. PowerShell scripts that modify system settings often trigger false positives. Review the source code yourself - it's fully readable.
 
-**Q: I ran a specific debloat script. Will this fix it?**  
+**Q: I ran a specific debloat script. Will this fix it?**
 A: This tool fixes the effects of most common debloat scripts including Win10Debloater, privacy.sexy exports, Sophia Script, and manual registry tweaks.
 
 ## Building / Contributing
