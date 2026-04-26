@@ -3009,6 +3009,15 @@ function Show-MainWindow {
     # ---- Load window using Parse() which properly registers NameScope ----
     try {
         $window = [System.Windows.Markup.XamlReader]::Parse($xamlString)
+# codex-branding:start
+                try {
+                    $brandingIconPath = Join-Path $PSScriptRoot 'icon.ico'
+                    if (Test-Path $brandingIconPath) {
+                        $window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create((New-Object System.Uri($brandingIconPath)))
+                    }
+                } catch {
+                }
+                # codex-branding:end
     } catch {
         [System.Windows.MessageBox]::Show("UI failed to load: $($_.Exception.Message)", "Error", "OK", "Error")
         return
