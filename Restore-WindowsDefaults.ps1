@@ -1,5 +1,12 @@
 #Requires -Version 5.1
 
+param(
+    [switch]$NoGui,
+    [switch]$NoElevation,
+    [string]$ExportSnapshot,
+    [string]$CompareSnapshot
+)
+
 <#
 .SYNOPSIS
     Windows Restore Tool v4.3
@@ -38,12 +45,21 @@ $script:CurrentCategory = ""
 # PowerShell 7+ has broken Appx module and WPF quirks - force Windows PowerShell 5.1
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     $ps5 = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-    Start-Process $ps5 -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    $relaunchArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+    if ($NoGui) { $relaunchArgs += "-NoGui" }
+    if ($NoElevation) { $relaunchArgs += "-NoElevation" }
+    if ($ExportSnapshot) { $relaunchArgs += @("-ExportSnapshot", "`"$ExportSnapshot`"") }
+    if ($CompareSnapshot) { $relaunchArgs += @("-CompareSnapshot", "`"$CompareSnapshot`"") }
+    Start-Process $ps5 -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
     exit
 }
 # Self-elevate if not admin
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $relaunchArgs = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+    if ($NoGui) { $relaunchArgs += "-NoGui" }
+    if ($ExportSnapshot) { $relaunchArgs += @("-ExportSnapshot", "`"$ExportSnapshot`"") }
+    if ($CompareSnapshot) { $relaunchArgs += @("-CompareSnapshot", "`"$CompareSnapshot`"") }
+    Start-Process powershell -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
     exit
 }
 
@@ -51,10 +67,12 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 # ASSEMBLY LOADING
 # ============================================================================
 
-Add-Type -AssemblyName PresentationFramework
-Add-Type -AssemblyName PresentationCore
-Add-Type -AssemblyName WindowsBase
-Add-Type -AssemblyName System.Windows.Forms
+if (-not $NoGui) {
+    Add-Type -AssemblyName PresentationFramework
+    Add-Type -AssemblyName PresentationCore
+    Add-Type -AssemblyName WindowsBase
+    Add-Type -AssemblyName System.Windows.Forms
+}
 
 # ============================================================================
 # HELPERS
@@ -211,6 +229,383 @@ function Enable-ScheduledTaskSafe {
     }
     return $false
 }
+# ============================================================================
+# DATA-DRIVEN INVENTORY AND SNAPSHOT HELPERS
+# ============================================================================
+
+$script:RegistrySnapshotSchemaVersion = 1
+$script:RegistrySnapshotPaths = @(
+    "HKLM:\SOFTWARE\Policies\Microsoft\Windows",
+    "HKLM:\SOFTWARE\Policies\Microsoft\Edge",
+    "HKLM:\SOFTWARE\Policies\Google",
+    "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL",
+    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies",
+    "HKCU:\SOFTWARE\Policies\Microsoft\Windows",
+    "HKCU:\SOFTWARE\Policies\Google",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search",
+    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+)
+
+$script:CoreAppxPackageCatalog = @(
+    @{Name="Microsoft.WindowsStore"; Role="Core"},
+    @{Name="Microsoft.StorePurchaseApp"; Role="Core"},
+    @{Name="Microsoft.DesktopAppInstaller"; Role="Core"},
+    @{Name="Microsoft.WindowsCalculator"; Role="Core"},
+    @{Name="Microsoft.Windows.Photos"; Role="Core"},
+    @{Name="Microsoft.WindowsCamera"; Role="Core"},
+    @{Name="Microsoft.WindowsAlarms"; Role="Core"},
+    @{Name="Microsoft.WindowsSoundRecorder"; Role="Core"},
+    @{Name="Microsoft.WindowsFeedbackHub"; Role="Optional"},
+    @{Name="Microsoft.GetHelp"; Role="Optional"},
+    @{Name="Microsoft.MSPaint"; Role="Optional"},
+    @{Name="Microsoft.MicrosoftStickyNotes"; Role="Optional"},
+    @{Name="Microsoft.MicrosoftOfficeHub"; Role="Optional"}
+)
+
+# These are evidence-only fingerprints. A detected tool is never treated as
+# proof that a domain policy is unwanted; the user still chooses categories.
+$script:DebloatToolFingerprints = @(
+    @{Name="O&O ShutUp10"; Indicators=@(
+        @{Kind="Registry";Path="HKCU:\Software\O&O Software\ShutUp10";Description="O&O ShutUp10 user settings"},
+        @{Kind="File";Path="$env:ProgramFiles\OOSU10\OOSU10.exe";Description="OOSU10 executable"},
+        @{Kind="File";Path="$env:ProgramFiles\O&O ShutUp10\OOSU10.exe";Description="OOSU10 executable"},
+        @{Kind="File";Path="$env:ProgramData\O&O Software\ShutUp10\*";Description="O&O ShutUp10 data"}
+    );FixKeys=@("chkPrivacy","chkServices","chkTasks","chkNetwork","chkHostsFile")}
+    @{Name="WPD"; Indicators=@(
+        @{Kind="Registry";Path="HKCU:\Software\WPD";Description="WPD user settings"},
+        @{Kind="File";Path="$env:ProgramFiles\WPD\WPD.exe";Description="WPD executable"},
+        @{Kind="File";Path="$env:ProgramFiles\WPD\*";Description="WPD installation"}
+    );FixKeys=@("chkPrivacy","chkServices","chkTasks","chkAppx")}
+    @{Name="ThisIsWin11"; Indicators=@(
+        @{Kind="Registry";Path="HKCU:\Software\ThisIsWin11";Description="ThisIsWin11 user settings"},
+        @{Kind="File";Path="$env:ProgramFiles\ThisIsWin11\*";Description="ThisIsWin11 installation"},
+        @{Kind="File";Path="$env:ProgramData\ThisIsWin11\*";Description="ThisIsWin11 data"}
+    );FixKeys=@("chkPrivacy","chkTaskbar","chkExplorer","chkStartMenu","chkServices")}
+    @{Name="Sophia Script"; Indicators=@(
+        @{Kind="Registry";Path="HKCU:\Software\Sophia Script";Description="Sophia Script user settings"},
+        @{Kind="File";Path="$env:ProgramData\Sophia Script*";Description="Sophia Script data"},
+        @{Kind="File";Path="$env:TEMP\Sophia*";Description="Sophia Script log or export"}
+    );FixKeys=@("chkPrivacy","chkServices","chkTasks","chkNetwork","chkHostsFile")}
+    @{Name="Win10Privacy"; Indicators=@(
+        @{Kind="Registry";Path="HKCU:\Software\Win10Privacy";Description="Win10Privacy user settings"},
+        @{Kind="File";Path="$env:ProgramFiles\Win10Privacy\*";Description="Win10Privacy installation"},
+        @{Kind="File";Path="$env:ProgramData\Win10Privacy\*";Description="Win10Privacy data"}
+    );FixKeys=@("chkPrivacy","chkServices","chkTasks","chkNetwork","chkHostsFile")}
+)
+
+$script:ServiceTaskFingerprintCatalog = @(
+    @{Tool="O&O ShutUp10";Services=@("DiagTrack","dmwappushservice","WerSvc","WSearch","SysMain");Tasks=@(
+        @{P="\Microsoft\Windows\Application Experience\";N="Microsoft Compatibility Appraiser"},
+        @{P="\Microsoft\Windows\Customer Experience Improvement Program\";N="Consolidator"},
+        @{P="\Microsoft\Windows\Feedback\Siuf\";N="DmClient"}
+    )},
+    @{Tool="WPD";Services=@("DiagTrack","dmwappushservice","lfsvc","MapsBroker");Tasks=@(
+        @{P="\Microsoft\Windows\Application Experience\";N="ProgramDataUpdater"},
+        @{P="\Microsoft\Windows\Maps\";N="MapsUpdateTask"}
+    )},
+    @{Tool="ThisIsWin11";Services=@("DiagTrack","WSearch","SysMain","WpnService");Tasks=@(
+        @{P="\Microsoft\Windows\WindowsUpdate\";N="Scheduled Start"},
+        @{P="\Microsoft\Windows\Windows Defender\";N="Windows Defender Scheduled Scan"}
+    )},
+    @{Tool="Sophia Script";Services=@("DiagTrack","dmwappushservice","WerSvc","WSearch","SysMain","MapsBroker");Tasks=@(
+        @{P="\Microsoft\Windows\Application Experience\";N="StartupAppTask"},
+        @{P="\Microsoft\Windows\Customer Experience Improvement Program\";N="KernelCeipTask"},
+        @{P="\Microsoft\Windows\WindowsUpdate\";N="Scheduled Start"}
+    )},
+    @{Tool="Win10Privacy";Services=@("DiagTrack","dmwappushservice","WerSvc","WSearch","SysMain");Tasks=@(
+        @{P="\Microsoft\Windows\Application Experience\";N="Microsoft Compatibility Appraiser"},
+        @{P="\Microsoft\Windows\Customer Experience Improvement Program\";N="Consolidator"},
+        @{P="\Microsoft\Windows\Feedback\Siuf\";N="DmClientOnScenarioDownload"}
+    )}
+)
+
+$script:ScheduledTaskRestoreMatrix = @(
+    @{Source="Windows maintenance";Tools=@("O&O ShutUp10","WPD","ThisIsWin11","Sophia Script","Win10Privacy");P="\Microsoft\Windows\Application Experience\";N="Microsoft Compatibility Appraiser";Category="chkTasks"},
+    @{Source="Windows maintenance";Tools=@("WPD","Sophia Script");P="\Microsoft\Windows\Application Experience\";N="ProgramDataUpdater";Category="chkTasks"},
+    @{Source="Windows maintenance";Tools=@("O&O ShutUp10","Sophia Script");P="\Microsoft\Windows\Application Experience\";N="StartupAppTask";Category="chkTasks"},
+    @{Source="Customer experience";Tools=@("O&O ShutUp10","Sophia Script","Win10Privacy");P="\Microsoft\Windows\Customer Experience Improvement Program\";N="Consolidator";Category="chkTasks"},
+    @{Source="Customer experience";Tools=@("Sophia Script");P="\Microsoft\Windows\Customer Experience Improvement Program\";N="KernelCeipTask";Category="chkTasks"},
+    @{Source="Feedback";Tools=@("O&O ShutUp10","Win10Privacy");P="\Microsoft\Windows\Feedback\Siuf\";N="DmClient";Category="chkTasks"},
+    @{Source="Feedback";Tools=@("Win10Privacy");P="\Microsoft\Windows\Feedback\Siuf\";N="DmClientOnScenarioDownload";Category="chkTasks"},
+    @{Source="Windows Defender";Tools=@("ThisIsWin11");P="\Microsoft\Windows\Windows Defender\";N="Windows Defender Scheduled Scan";Category="chkDefender"},
+    @{Source="Windows Update";Tools=@("ThisIsWin11","Sophia Script");P="\Microsoft\Windows\WindowsUpdate\";N="Scheduled Start";Category="chkWindowsUpdate"},
+    @{Source="Maps";Tools=@("WPD");P="\Microsoft\Windows\Maps\";N="MapsUpdateTask";Category="chkTasks"}
+)
+
+function Get-DebloatToolFingerprintReport {
+    param(
+        [object[]]$Catalog = $script:DebloatToolFingerprints,
+        [switch]$IncludeUndetected
+    )
+    $reports = @()
+    foreach ($tool in $Catalog) {
+        $evidence = @()
+        foreach ($indicator in @($tool.Indicators)) {
+            try {
+                $matched = $false
+                switch ($indicator.Kind) {
+                    "Registry" { $matched = Test-Path -LiteralPath $indicator.Path }
+                    "File" { $matched = Test-Path -Path $indicator.Path }
+                }
+                if ($matched) { $evidence += $indicator.Description + ": " + $indicator.Path }
+            } catch { }
+        }
+        $detected = $evidence.Count -gt 0
+        if ($detected -or $IncludeUndetected) {
+            $confidence = if ($evidence.Count -ge 2) { "High" } elseif ($detected) { "Medium" } else { "None" }
+            $reports += [pscustomobject]@{
+                Tool=$tool.Name; Detected=$detected; Confidence=$confidence
+                Evidence=@($evidence); FixKeys=@($tool.FixKeys)
+            }
+        }
+    }
+    return @($reports)
+}
+
+function Get-ScheduledTaskRestoreMatrix {
+    param(
+        [object[]]$Matrix = $script:ScheduledTaskRestoreMatrix,
+        [switch]$IncludeHealthy,
+        [scriptblock]$TaskProvider
+    )
+    $results = @()
+    foreach ($entry in $Matrix) {
+        $task = $null
+        try {
+            if ($TaskProvider) { $task = & $TaskProvider $entry.P $entry.N }
+            else { $task = Get-ScheduledTask -TaskPath $entry.P -TaskName $entry.N -ErrorAction Stop }
+        } catch { $task = $null }
+        $state = if (-not $task) { "Missing" } elseif ($task.State -and $task.State.ToString() -eq "Disabled") { "Disabled" } else { "Enabled" }
+        if ($IncludeHealthy -or $state -ne "Enabled") {
+            $results += [pscustomobject]@{
+                ToolSources=@($entry.Tools); Source=$entry.Source; Path=$entry.P; Name=$entry.N
+                Category=$entry.Category; State=$state; NeedsRestore=($state -eq "Disabled")
+            }
+        }
+    }
+    return @($results)
+}
+
+function Get-ServiceTaskFingerprintReport {
+    param(
+        [object[]]$Catalog = $script:ServiceTaskFingerprintCatalog,
+        [switch]$IncludeHealthy,
+        [scriptblock]$ServiceProvider,
+        [scriptblock]$TaskProvider
+    )
+    $results = @()
+    foreach ($definition in $Catalog) {
+        foreach ($serviceName in @($definition.Services)) {
+            $service = $null
+            try {
+                if ($ServiceProvider) { $service = & $ServiceProvider $serviceName }
+                else { $service = Get-Service -Name $serviceName -ErrorAction Stop }
+            } catch { $service = $null }
+            if ($service) {
+                $disabled = $service.StartType.ToString() -eq "Disabled"
+                if ($IncludeHealthy -or $disabled) {
+                    $results += [pscustomobject]@{
+                        Tool=$definition.Tool; Kind="Service"; Name=$serviceName
+                        Path=$null; State=$service.StartType.ToString(); NeedsRestore=$disabled
+                    }
+                }
+            }
+        }
+        foreach ($taskInfo in @($definition.Tasks)) {
+            $task = $null
+            try {
+                if ($TaskProvider) { $task = & $TaskProvider $taskInfo.P $taskInfo.N }
+                else { $task = Get-ScheduledTask -TaskPath $taskInfo.P -TaskName $taskInfo.N -ErrorAction Stop }
+            } catch { $task = $null }
+            if ($task) {
+                $disabled = $task.State -and $task.State.ToString() -eq "Disabled"
+                if ($IncludeHealthy -or $disabled) {
+                    $results += [pscustomobject]@{
+                        Tool=$definition.Tool; Kind="Task"; Name=$taskInfo.N
+                        Path=$taskInfo.P; State=$task.State.ToString(); NeedsRestore=$disabled
+                    }
+                }
+            }
+        }
+    }
+    return @($results)
+}
+
+function ConvertTo-SnapshotRegistryPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    $normalized = $Path -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+    $normalized = $normalized -replace '^HKEY_LOCAL_MACHINE', 'HKLM:'
+    $normalized = $normalized -replace '^HKEY_CURRENT_USER', 'HKCU:'
+    $normalized = $normalized -replace '^HKEY_CLASSES_ROOT', 'HKCR:'
+    $normalized = $normalized -replace '^HKEY_USERS', 'HKU:'
+    return $normalized
+}
+
+function Get-RegistrySnapshot {
+    param([string[]]$Path = $script:RegistrySnapshotPaths)
+    $entries = New-Object System.Collections.Generic.List[object]
+    $seenKeys = @{}
+    foreach ($root in @($Path)) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $keys = @()
+        try { $keys += Get-Item -LiteralPath $root -ErrorAction Stop } catch { }
+        try { $keys += @(Get-ChildItem -LiteralPath $root -Recurse -ErrorAction SilentlyContinue) } catch { }
+        foreach ($key in $keys) {
+            $keyPath = ConvertTo-SnapshotRegistryPath -Path ([string]$key.PSPath)
+            if ($seenKeys.ContainsKey($keyPath)) { continue }
+            $seenKeys[$keyPath] = $true
+            $propertyNames = @($key.Property | Where-Object { $_ -and $_ -notmatch '^PS' })
+            if ($propertyNames.Count -eq 0) { continue }
+            $properties = Get-ItemProperty -LiteralPath $key.PSPath -ErrorAction SilentlyContinue
+            foreach ($propertyName in $propertyNames) {
+                $value = $properties.$propertyName
+                $valueType = if ($value -is [byte[]]) { "Binary" }
+                    elseif ($value -is [string[]]) { "MultiString" }
+                    elseif ($value -is [long] -or $value -is [int64]) { "QWord" }
+                    elseif ($value -is [int] -or $value -is [int32] -or $value -is [bool]) { "DWord" }
+                    else { "String" }
+                $entries.Add([pscustomobject][ordered]@{
+                    Path=$keyPath; Name=[string]$propertyName; Type=$valueType; Value=$value
+                })
+            }
+        }
+    }
+    $entryArray = @($entries.ToArray())
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:RegistrySnapshotSchemaVersion
+        CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
+        ComputerName=$env:COMPUTERNAME
+        Entries=$entryArray
+    }
+}
+
+function Export-RegistrySnapshot {
+    param(
+        [Parameter(Mandatory=$true)][string]$OutputPath,
+        [string[]]$Path = $script:RegistrySnapshotPaths
+    )
+    $snapshot = Get-RegistrySnapshot -Path $Path
+    $parent = Split-Path -Parent $OutputPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $fullPath = [System.IO.Path]::GetFullPath($OutputPath)
+    $json = $snapshot | ConvertTo-Json -Depth 12
+    [System.IO.File]::WriteAllText($fullPath, $json, [System.Text.Encoding]::UTF8)
+    return $snapshot
+}
+
+function Import-RegistrySnapshot {
+    param([Parameter(Mandatory=$true)][string]$InputPath)
+    if (-not (Test-Path -LiteralPath $InputPath)) { throw "Snapshot not found: $InputPath" }
+    $snapshot = Get-Content -LiteralPath $InputPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    if ($snapshot.SchemaVersion -ne $script:RegistrySnapshotSchemaVersion) {
+        throw "Unsupported registry snapshot schema: $($snapshot.SchemaVersion)"
+    }
+    if (-not $snapshot.PSObject.Properties['Entries']) { throw "Snapshot is missing Entries" }
+    return $snapshot
+}
+
+function Compare-RegistrySnapshots {
+    param(
+        [Parameter(Mandatory=$true)]$Before,
+        [Parameter(Mandatory=$true)]$After
+    )
+    if ($Before -is [string]) { $Before = Import-RegistrySnapshot -InputPath $Before }
+    if ($After -is [string]) { $After = Import-RegistrySnapshot -InputPath $After }
+    $beforeMap = @{}; $afterMap = @{}
+    foreach ($entry in @($Before.Entries)) { $beforeMap["$($entry.Path)|$($entry.Name)"] = $entry }
+    foreach ($entry in @($After.Entries)) { $afterMap["$($entry.Path)|$($entry.Name)"] = $entry }
+    $added = @(); $removed = @(); $changed = @()
+    foreach ($key in $afterMap.Keys) {
+        if (-not $beforeMap.ContainsKey($key)) {
+            $added += [pscustomobject]@{Kind="Added";Path=$afterMap[$key].Path;Name=$afterMap[$key].Name;Before=$null;After=$afterMap[$key]}
+        } else {
+            $beforeValue = $beforeMap[$key] | ConvertTo-Json -Depth 12 -Compress
+            $afterValue = $afterMap[$key] | ConvertTo-Json -Depth 12 -Compress
+            if ($beforeValue -ne $afterValue) {
+                $changed += [pscustomobject]@{Kind="Changed";Path=$afterMap[$key].Path;Name=$afterMap[$key].Name;Before=$beforeMap[$key];After=$afterMap[$key]}
+            }
+        }
+    }
+    foreach ($key in $beforeMap.Keys) {
+        if (-not $afterMap.ContainsKey($key)) {
+            $removed += [pscustomobject]@{Kind="Removed";Path=$beforeMap[$key].Path;Name=$beforeMap[$key].Name;Before=$beforeMap[$key];After=$null}
+        }
+    }
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:RegistrySnapshotSchemaVersion
+        Added=@($added); Removed=@($removed); Changed=@($changed)
+        TotalChanges=$added.Count + $removed.Count + $changed.Count
+        Summary="Added $($added.Count), removed $($removed.Count), changed $($changed.Count) registry values"
+    }
+}
+
+function Get-AppxPackageRemovalReport {
+    param(
+        [object[]]$ExpectedPackages = $script:CoreAppxPackageCatalog,
+        [object[]]$InstalledPackages,
+        [object[]]$ProvisionedPackages
+    )
+    if ($PSBoundParameters.ContainsKey('InstalledPackages')) { $installed = @($InstalledPackages) }
+    else { $installed = @(Get-AppxPackageSafe) }
+    if ($PSBoundParameters.ContainsKey('ProvisionedPackages')) { $provisioned = @($ProvisionedPackages) }
+    else {
+        try { $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) } catch { $provisioned = @() }
+    }
+    $installedNames = @($installed | ForEach-Object {
+        if ($_.Name) { [string]$_.Name } elseif ($_.PackageName) { [string]$_.PackageName } else { [string]$_ }
+    })
+    $provisionedNames = @($provisioned | ForEach-Object {
+        if ($_.DisplayName) { [string]$_.DisplayName } elseif ($_.PackageName) { [string]$_.PackageName } else { [string]$_ }
+    })
+    $missing = @(); $present = @(); $provisionedOnly = @()
+    foreach ($expected in @($ExpectedPackages)) {
+        $name = if ($expected -is [string]) { $expected } elseif ($expected.Name) { [string]$expected.Name } else { [string]$expected }
+        $installedMatch = @($installedNames | Where-Object { $_ -eq $name -or $_ -like "${name}_*" }).Count -gt 0
+        $provisionedMatch = @($provisionedNames | Where-Object { $_ -eq $name -or $_ -like "${name}_*" }).Count -gt 0
+        if ($installedMatch) { $present += $name }
+        elseif ($provisionedMatch) { $provisionedOnly += $name }
+        else { $missing += $name }
+    }
+    return [pscustomobject][ordered]@{
+        ExpectedCount=@($ExpectedPackages).Count; InstalledCount=$installedNames.Count
+        ProvisionedCount=$provisionedNames.Count; Present=@($present)
+        ProvisionedOnly=@($provisionedOnly); Missing=@($missing)
+        MissingCount=$missing.Count; ProvisionedOnlyCount=$provisionedOnly.Count
+    }
+}
+
+function Compare-AppxPackageBaseline {
+    param(
+        [string]$BaselinePath,
+        [string]$WimPath,
+        [int]$ImageIndex = 1,
+        [object[]]$InstalledPackages,
+        [object[]]$ProvisionedPackages
+    )
+    $baselineNames = @()
+    if ($BaselinePath) {
+        $baseline = Get-Content -LiteralPath $BaselinePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $items = if ($baseline.PSObject.Properties['Packages']) { $baseline.Packages } else { $baseline }
+        $baselineNames = @($items | ForEach-Object {
+            if ($_ -is [string]) { $_ } elseif ($_.DisplayName) { $_.DisplayName } elseif ($_.PackageName) { $_.PackageName } elseif ($_.Name) { $_ } else { [string]$_ }
+        })
+    } elseif ($WimPath) {
+        if (-not (Test-Path -LiteralPath $WimPath)) { throw "WIM not found: $WimPath" }
+        $dism = Get-Command dism.exe -ErrorAction SilentlyContinue
+        if (-not $dism) { throw "DISM is unavailable; cannot inspect the WIM baseline" }
+        $dismOutput = @(& $dism.Source /English /ImageFile:$WimPath /Index:$ImageIndex /Get-ProvisionedAppxPackages 2>&1)
+        $baselineNames = @($dismOutput | ForEach-Object {
+            if ($_ -match 'PackageName\s*:\s*(\S+)') { $Matches[1] }
+        })
+    } else { throw "Specify BaselinePath or WimPath" }
+    $report = Get-AppxPackageRemovalReport -ExpectedPackages $baselineNames -InstalledPackages $InstalledPackages -ProvisionedPackages $ProvisionedPackages
+    $report | Add-Member -NotePropertyName BaselinePath -NotePropertyValue $BaselinePath
+    $report | Add-Member -NotePropertyName WimPath -NotePropertyValue $WimPath
+    return $report
+}
+
 # ============================================================================
 # CATEGORY 1: PRIVACY & TELEMETRY (COMPREHENSIVE)
 # ============================================================================
@@ -2117,6 +2512,33 @@ function Get-SystemHealthReport {
         }
     }
 
+    # --- Debloat tool fingerprints and source-attributed service/task evidence ---
+    $detectedTools = @(Get-DebloatToolFingerprintReport)
+    $toolDetails = @()
+    $toolFixKeys = @()
+    foreach ($tool in $detectedTools) {
+        $toolDetails += "$($tool.Tool) detected ($($tool.Confidence) confidence)"
+        $toolDetails += @($tool.Evidence | ForEach-Object { "  $_" })
+        $toolFixKeys += @($tool.FixKeys)
+    }
+    $fingerprintFindings = @()
+    if ($detectedTools.Count -gt 0) {
+        $fingerprintFindings = @(Get-ServiceTaskFingerprintReport)
+        foreach ($finding in $fingerprintFindings) {
+            $stateText = if ($finding.Kind -eq "Service") { "service $($finding.Name)" } else { "task $($finding.Path)$($finding.Name)" }
+            $toolDetails += "$($finding.Tool): $stateText is $($finding.State)"
+            if ($finding.Kind -eq "Service") { $toolFixKeys += "chkServices" } else { $toolFixKeys += "chkTasks" }
+        }
+    }
+    $toolFixKeys = @($toolFixKeys | Select-Object -Unique)
+    $toolIssues = @()
+    if ($detectedTools.Count -gt 0) { $toolIssues += "$($detectedTools.Count) debloat tool footprint(s) detected" }
+    if ($fingerprintFindings.Count -gt 0) { $toolIssues += "$($fingerprintFindings.Count) attributed service/task change(s)" }
+    $toolSeverity = if ($fingerprintFindings.Count -gt 0) { "Medium" } elseif ($detectedTools.Count -gt 0) { "Low" } else { "OK" }
+    & $addCat "DebloatTools" "Debloat Tool Footprints" $toolIssues $toolDetails $toolSeverity $toolFixKeys
+    $script:ToolFingerprintReport = $detectedTools
+    $script:TaskRestoreMatrixReport = @(Get-ScheduledTaskRestoreMatrix)
+
     # --- Windows Defender ---
     $issues = @(); $details = @()
     $defPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
@@ -2255,12 +2677,15 @@ function Get-SystemHealthReport {
 
     # --- Store/Apps ---
     $issues = @(); $details = @()
-    $appChecks = [ordered]@{
-        "Microsoft.WindowsStore"="Microsoft Store"; "Microsoft.WindowsCalculator"="Calculator"
-        "Microsoft.Windows.Photos"="Photos"; "Microsoft.DesktopAppInstaller"="App Installer (winget)"
+    $appCatalog = @($script:CoreAppxPackageCatalog | Where-Object { $_.Role -eq "Core" })
+    $appReport = Get-AppxPackageRemovalReport -ExpectedPackages $appCatalog
+    $script:AppxRemovalReport = $appReport
+    foreach ($missingName in @($appReport.Missing)) {
+        $friendly = ($appCatalog | Where-Object { $_.Name -eq $missingName } | Select-Object -First 1).Name
+        $issues += "$friendly removed"; $details += "Missing from current user and provisioned image: $missingName"
     }
-    foreach ($a in $appChecks.GetEnumerator()) {
-        if (!(Get-AppxPackageSafe -Name $a.Key)) { $issues += "$($a.Value) removed"; $details += "Missing: $($a.Key)" }
+    foreach ($provisionedName in @($appReport.ProvisionedOnly)) {
+        $details += "Provisioned but not registered for current user: $provisionedName"
     }
     & $addCat "StoreApps" "Windows Apps" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkAppx")
 
@@ -3521,4 +3946,17 @@ function Show-MainWindow {
 # ENTRY POINT
 # ============================================================================
 
-Show-MainWindow
+if ($ExportSnapshot) {
+    $null = Export-RegistrySnapshot -OutputPath $ExportSnapshot
+    Write-Output "Registry snapshot exported: $ExportSnapshot"
+    exit
+}
+
+if ($CompareSnapshot) {
+    $currentSnapshot = Get-RegistrySnapshot
+    $diff = Compare-RegistrySnapshots -Before $CompareSnapshot -After $currentSnapshot
+    Write-Output ($diff | ConvertTo-Json -Depth 12)
+    exit
+}
+
+if (-not $NoGui) { Show-MainWindow }
