@@ -4,7 +4,7 @@
 
 A one-click solution to fix Windows PCs broken by debloat scripts, privacy.sexy tweaks, and aggressive registry modifications.
 
-![Version](https://img.shields.io/badge/version-4.3.0-green)
+![Version](https://img.shields.io/badge/version-4.4.0-green)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -23,6 +23,11 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 - **Progress bar** - Real-time progress with percentage as categories are processed
 - **Category result indicators** - FIXED, PARTIAL, FAILED, or SKIPPED status for each category
 - **Import undo manifest** - Load JSON manifests from Debloat-Win11 v1.1.0 for precise restoration
+- **Debloat fingerprinting** - Detects evidence from O&O ShutUp10, WPD, ThisIsWin11, Sophia Script, and Win10Privacy without executing their code
+- **Baseline inventory** - Exports and compares registry/AppX state, including provisioned-package and offline-WIM comparisons
+- **Managed-device safety** - Detects domain/MDM policy ownership and preserves managed policy containers unless explicitly overridden
+- **Operational recovery** - Adds security reset, Search index rebuild, Store/WinGet repair, privacy-slider repair, rollback snapshots, and next-boot restore scheduling
+- **Deployment wrappers** - Read-only compliance and optional remediation entry points for Intune and Configuration Manager
 - **HTML report export** - Save a detailed dark-themed report of everything restored with before/after states
 - **Safe by default** - Creates a System Restore point before making changes
 - **Detailed logging** - Full log saved to your Desktop
@@ -52,6 +57,28 @@ irm https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/Restore-Windo
 ```
 
 The script automatically elevates to Administrator and runs in Windows PowerShell 5.1 for maximum compatibility.
+
+### Option 4: Detection and recovery CLI
+
+The same script supports non-GUI workflows for automation and diagnostics:
+
+```powershell
+# Capture and compare a versioned registry snapshot
+.\Restore-WindowsDefaults.ps1 -NoGui -ExportSnapshot .\before.json
+.\Restore-WindowsDefaults.ps1 -NoGui -CompareSnapshot .\before.json
+
+# Run a bounded restore tier or a targeted operational workflow
+.\Restore-WindowsDefaults.ps1 -RestoreTier Quick
+.\Restore-WindowsDefaults.ps1 -SecurityReset
+.\Restore-WindowsDefaults.ps1 -RebuildSearch
+.\Restore-WindowsDefaults.ps1 -PostUpdateCheck
+.\Restore-WindowsDefaults.ps1 -ExportSupportBundle .\support.zip
+
+# Schedule selected categories for the next boot
+.\Restore-WindowsDefaults.ps1 -ScheduleRestore -RestoreCategories chkDefender,chkWindowsUpdate,chkTasks
+```
+
+`-NoGui` is intended for automation. The Intune and Configuration Manager wrappers under `deploy\` emit JSON compliance results by default; add `-Remediate` to run the critical security and service/task categories in an already elevated management context.
 
 ## What It Restores
 
@@ -125,6 +152,8 @@ If you used Debloat-Win11 v1.1.0 or a similar tool that generates an undo manife
 3. The tool auto-checks only the categories relevant to the manifest changes
 4. A summary shows exactly how many AppX packages, services, tasks, and registry keys will be restored
 5. Click **Run Selected Fixes** to restore precisely what was changed
+
+The import path is evidence-only: privacy.sexy compensation logs, Chris Titus WinUtil diffs, `.reg` exports, and newer nested undo manifests are parsed into planned operations and never executed as imported code.
 
 ## HTML Report
 

@@ -20,7 +20,7 @@ param(
 
 <#
 .SYNOPSIS
-    Windows Restore Tool v4.3
+    Windows Restore Tool v4.4
     Restores Windows to factory default settings after debloat scripts,
     privacy.sexy tweaks, group policy modifications, and registry changes.
 
@@ -31,7 +31,7 @@ param(
 
 .NOTES
     Author: SysAdminDoc
-    Version: 4.3.0
+    Version: 4.4.0
     Requires: Administrator privileges
 #>
 
@@ -39,7 +39,7 @@ param(
 # CONFIGURATION
 # ============================================================================
 
-$script:Version = "4.3.0"
+$script:Version = "4.4.0"
 $script:LogPath = "$env:USERPROFILE\Desktop\WindowsRestore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:ChangesCount = 0
 $script:ErrorsCount = 0
@@ -430,7 +430,7 @@ function Get-DebloatToolFingerprintReport {
                     "File" { $matched = Test-Path -Path $indicator.Path }
                 }
                 if ($matched) { $evidence += $indicator.Description + ": " + $indicator.Path }
-            } catch { }
+            } catch { Write-Verbose "Could not inspect fingerprint indicator $($indicator.Path)" }
         }
         $detected = $evidence.Count -gt 0
         if ($detected -or $IncludeUndetected) {
@@ -531,8 +531,8 @@ function Get-RegistrySnapshot {
     foreach ($root in @($Path)) {
         if (-not (Test-Path -LiteralPath $root)) { continue }
         $keys = @()
-        try { $keys += Get-Item -LiteralPath $root -ErrorAction Stop } catch { }
-        try { $keys += @(Get-ChildItem -LiteralPath $root -Recurse -ErrorAction SilentlyContinue) } catch { }
+        try { $keys += Get-Item -LiteralPath $root -ErrorAction Stop } catch { Write-Verbose "Could not read registry root $root" }
+        try { $keys += @(Get-ChildItem -LiteralPath $root -Recurse -ErrorAction SilentlyContinue) } catch { Write-Verbose "Could not enumerate registry root $root" }
         foreach ($key in $keys) {
             $keyPath = ConvertTo-SnapshotRegistryPath -Path ([string]$key.PSPath)
             if ($seenKeys.ContainsKey($keyPath)) { continue }
@@ -587,7 +587,7 @@ function Import-RegistrySnapshot {
     return $snapshot
 }
 
-function Compare-RegistrySnapshots {
+function Compare-RegistrySnapshot {
     param(
         [Parameter(Mandatory=$true)]$Before,
         [Parameter(Mandatory=$true)]$After
@@ -703,12 +703,7 @@ function Get-PolicyManagementState {
     try {
         $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
         $domainJoined = [bool]$computerSystem.PartOfDomain
-    } catch {
-        try {
-            $computerSystem = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
-            $domainJoined = [bool]$computerSystem.PartOfDomain
-        } catch { }
-    }
+    } catch { Write-Verbose "Could not query domain membership through CIM" }
     $mdmPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Enrollments",
         "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts",
@@ -742,8 +737,11 @@ function Get-EdgePolicyState {
     }
 }
 
-function Reset-WindowsUpdateChannelAndDeferrals {
+function Reset-WindowsUpdateChannelAndDeferral {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    [OutputType([bool])]
     param([switch]$ForceManaged)
+    if (-not $PSCmdlet.ShouldProcess("Windows Update policy and deferral state", "reset")) { return $false }
     $management = Get-PolicyManagementState
     $policyRoots = @(
         "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
@@ -854,7 +852,7 @@ function Restore-StoreWingetServiceChain {
     Write-Log "Store and WinGet service chain: Complete" -Level Success
 }
 
-function Restore-DevicePrivacySliders {
+function Restore-DevicePrivacySlider {
     Write-Log "=== CAMERA, MICROPHONE, AND BLUETOOTH PRIVACY ===" -Level Section
     $capabilities = @("webcam","microphone","bluetooth","location","radios")
     foreach ($capability in $capabilities) {
@@ -875,7 +873,7 @@ function Get-AccountSignInState {
             if ($line -match 'WorkplaceJoined\s*:\s*YES') { $workplaceJoined = $true }
             if ($line -match 'DomainJoined\s*:\s*YES') { $dsregDomainJoined = $true }
         }
-    } catch { }
+    } catch { Write-Verbose "dsregcmd.exe was unavailable or did not return account state" }
     $management = Get-PolicyManagementState
     $kind = if ($azureJoined) { "Azure AD / Microsoft account capable" }
         elseif ($dsregDomainJoined -or $management.DomainJoined) { "Domain account" }
@@ -927,7 +925,7 @@ function Get-MissingTaskRegistrationPlan {
     return @($plan)
 }
 
-function Restore-MissingScheduledTasks {
+function Restore-MissingScheduledTask {
     param([object[]]$Matrix = $script:ScheduledTaskRestoreMatrix)
     $plan = @(Get-MissingTaskRegistrationPlan -Matrix $Matrix)
     foreach ($item in $plan) {
@@ -1084,7 +1082,7 @@ function Restore-PrivacyTelemetry {
     @("$env:SystemRoot\System32\CompatTelRunner.exe","$env:SystemRoot\System32\DeviceCensus.exe") | ForEach-Object {
         $oldPath = "$_.OLD"
         if ((Test-Path $oldPath) -and !(Test-Path $_)) {
-            try { Rename-Item -Path $oldPath -NewName (Split-Path $_ -Leaf) -Force -EA Stop; $script:ChangesCount++ } catch { }
+            try { Rename-Item -Path $oldPath -NewName (Split-Path $_ -Leaf) -Force -EA Stop; $script:ChangesCount++ } catch { Write-Verbose "Could not restore renamed compatibility executable $oldPath" }
         }
     }
 
@@ -1753,7 +1751,7 @@ function Restore-WindowsUpdateSettings {
 
     # ---- Reset update channel, release targeting, and deferral policies ----
     $management = Get-PolicyManagementState
-    Reset-WindowsUpdateChannelAndDeferrals -ForceManaged:$ForceManaged
+    Reset-WindowsUpdateChannelAndDeferral -ForceManaged:$ForceManaged
     if ($ForceManaged -or -not $management.IsManaged) {
         Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Silent
         Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" -Silent
@@ -2540,7 +2538,7 @@ function Restore-ScheduledTasks {
         @{P="\Microsoft\Windows\Windows Error Reporting\"; N="QueueReporting"}
     ) | ForEach-Object { Enable-ScheduledTaskSafe -TaskPath $_.P -TaskName $_.N -Silent }
 
-    Restore-MissingScheduledTasks | Out-Null
+    Restore-MissingScheduledTask | Out-Null
     Write-Log "Scheduled Tasks: Complete" -Level Success
 }
 
@@ -2802,7 +2800,7 @@ function Restore-AppxPackages {
             $installed++
             Write-Log "Reinstalled: $name (family)" -Level Success
             continue
-        } catch { }
+        } catch { Write-Verbose "Could not re-register package family $familyName" }
 
         $failed++
         Write-Log "Could not reinstall: $name (may need Store or Windows Update)" -Level Warning
@@ -2872,9 +2870,9 @@ function Get-RestoreFunctionMap {
         chkServices={Restore-Services}; chkTasks={Restore-ScheduledTasks}
         chkHostsFile={Restore-HostsFile}; chkCrypto={Restore-CryptoProtocols}
         chkFeatures={Restore-WindowsFeatures}; chkAppx={Restore-AppxPackages}
-        chkDevicePrivacy={Restore-DevicePrivacySliders}; chkSearchIndexer={Restore-SearchIndexer -Rebuild}
+        chkDevicePrivacy={Restore-DevicePrivacySlider}; chkSearchIndexer={Restore-SearchIndexer -Rebuild}
         chkStoreChain={Restore-StoreWingetServiceChain}; chkAccount={Restore-AccountSignIn}
-        chkGroupPolicy={Restore-LocalGroupPolicyDefaults}
+        chkGroupPolicy={Restore-LocalGroupPolicyDefault}
     }
 }
 
@@ -3465,7 +3463,7 @@ function Get-RestoreCategoryForImportedChange {
     return "chkMisc"
 }
 
-function New-ExternalChangeImportResult {
+function ConvertTo-ExternalChangeImportResult {
     param([string]$Source,[object[]]$Operations)
     $categories = @($Operations | ForEach-Object {
         Get-RestoreCategoryForImportedChange -Operation $_
@@ -3482,8 +3480,8 @@ function New-ExternalChangeImportResult {
     return $result
 }
 
-function ConvertTo-ExternalChangeOperations {
-    param([string[]]$Lines,[string]$Source)
+function ConvertTo-ExternalChangeOperation {
+    param([string[]]$Lines)
     $operations = @()
     foreach ($line in @($Lines)) {
         $raw = [string]$line
@@ -3525,18 +3523,18 @@ function ConvertTo-ExternalChangeOperations {
 
 function Import-PrivacySexyCompensationLog {
     param([Parameter(Mandatory=$true)][string]$LogPath)
-    if (-not (Test-Path -LiteralPath $LogPath)) { return (New-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations @()) }
+    if (-not (Test-Path -LiteralPath $LogPath)) { return (ConvertTo-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations @()) }
     $lines = Get-Content -LiteralPath $LogPath -ErrorAction Stop
-    $operations = ConvertTo-ExternalChangeOperations -Lines $lines -Source "privacy.sexy"
-    return (New-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations $operations)
+    $operations = ConvertTo-ExternalChangeOperation -Lines $lines
+    return (ConvertTo-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations $operations)
 }
 
 function Import-ChrisTitusWinUtilDiff {
     param([Parameter(Mandatory=$true)][string]$DiffPath)
-    if (-not (Test-Path -LiteralPath $DiffPath)) { return (New-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations @()) }
+    if (-not (Test-Path -LiteralPath $DiffPath)) { return (ConvertTo-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations @()) }
     $lines = Get-Content -LiteralPath $DiffPath -ErrorAction Stop
-    $operations = ConvertTo-ExternalChangeOperations -Lines $lines -Source "Chris Titus WinUtil"
-    return (New-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations $operations)
+    $operations = ConvertTo-ExternalChangeOperation -Lines $lines
+    return (ConvertTo-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations $operations)
 }
 
 function Import-RegExportSnapshot {
@@ -3551,7 +3549,7 @@ function Import-RegExportSnapshot {
         }
         if (-not $currentPath -or -not $trimmed -or $trimmed.StartsWith("Windows Registry Editor") -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("-")) { continue }
         if ($trimmed -notmatch '^(?:"([^"]*)"|@)=(.*)$') { continue }
-        $name = if ($Matches[1] -ne $null) { $Matches[1] } else { "(Default)" }
+        $name = if ($null -ne $Matches[1]) { $Matches[1] } else { "(Default)" }
         $encoded = $Matches[2]
         $type = "String"; $value = $encoded
         if ($encoded -match '(?i)^dword:([0-9a-f]{1,8})$') { $type="DWord"; $value=[Convert]::ToInt32($Matches[1],16) }
@@ -3566,9 +3564,9 @@ function Import-RegExportSnapshot {
     }
 }
 
-function Compare-RegExportSnapshots {
+function Compare-RegExportSnapshot {
     param([Parameter(Mandatory=$true)][string]$BeforePath,[Parameter(Mandatory=$true)][string]$AfterPath)
-    return (Compare-RegistrySnapshots -Before (Import-RegExportSnapshot $BeforePath) -After (Import-RegExportSnapshot $AfterPath))
+    return (Compare-RegistrySnapshot -Before (Import-RegExportSnapshot $BeforePath) -After (Import-RegExportSnapshot $AfterPath))
 }
 
 function Get-RestoreImpactPreview {
@@ -3600,6 +3598,7 @@ function Get-RestoreRollbackDirectory {
 }
 
 function New-RestoreRollbackSnapshot {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([string[]]$SelectedKeys)
     $serviceNames = @(
         "WinDefend","MpsSvc","BFE","wuauserv","UsoSvc","BITS","DoSvc","WSearch",
@@ -3620,6 +3619,7 @@ function New-RestoreRollbackSnapshot {
         BeforeRegistry=(Get-RegistrySnapshot); Services=@($services); Tasks=@($tasks)
     }
     $path = Join-Path (Get-RestoreRollbackDirectory) ("rollback-{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    if (-not $PSCmdlet.ShouldProcess($path, "write rollback snapshot and prune older snapshots")) { return $null }
     [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 15), [System.Text.Encoding]::UTF8)
     $oldSnapshots = @(Get-ChildItem -LiteralPath (Get-RestoreRollbackDirectory) -Filter "rollback-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 10)
     foreach ($oldSnapshot in $oldSnapshots) { Remove-Item -LiteralPath $oldSnapshot.FullName -Force -ErrorAction SilentlyContinue }
@@ -3629,8 +3629,11 @@ function New-RestoreRollbackSnapshot {
 }
 
 function Set-RegistrySnapshotValue {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    [OutputType([bool])]
     param([object]$Entry)
     if ($Entry.Name -eq "(Default)" -or $Entry.Type -eq "Binary") { return $false }
+    if (-not $PSCmdlet.ShouldProcess("$($Entry.Path)\$($Entry.Name)", "restore registry value")) { return $false }
     $value = $Entry.Value
     if ($Entry.Type -eq "MultiString") { $value = @($value) }
     elseif ($Entry.Type -eq "DWord") { $value = [int]$value }
@@ -3756,13 +3759,15 @@ function Export-RestoreSupportBundle {
     }
 }
 
-function Restore-LocalGroupPolicyDefaults {
+function Restore-LocalGroupPolicyDefault {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([switch]$ForceManaged)
     $management = Get-PolicyManagementState
     if ($management.IsManaged -and -not $ForceManaged) {
         Write-Log "Domain or MDM management detected; local Group Policy reset skipped" -Level Warning
         return $false
     }
+    if (-not $PSCmdlet.ShouldProcess("local Group Policy stores", "reset and request gpupdate")) { return $false }
     Write-Log "=== LOCAL GROUP POLICY RESET ===" -Level Section
     foreach ($path in @(
         (Join-Path $env:WINDIR "System32\GroupPolicy"),
@@ -4059,7 +4064,7 @@ function Show-MainWindow {
                     <StackPanel Orientation="Horizontal">
                         <TextBlock Text="Windows Restore Tool" FontSize="20" FontWeight="Bold" Foreground="#e6edf3"/>
                         <Border Background="#238636" CornerRadius="10" Padding="8,2" Margin="10,0" VerticalAlignment="Center">
-                            <TextBlock Text="v4.3" FontSize="10" Foreground="White" FontWeight="SemiBold"/>
+                            <TextBlock Text="v4.4" FontSize="10" Foreground="White" FontWeight="SemiBold"/>
                         </Border>
                     </StackPanel>
                     <TextBlock Text="Fixes PCs broken by debloat scripts, privacy.sexy, and registry tweaks" Foreground="#8b949e" FontSize="12" Margin="0,3,0,0"/>
@@ -4502,7 +4507,7 @@ function Show-MainWindow {
             Write-Log "Creating system restore point..." -Level Info
             try {
                 Enable-ComputerRestore -Drive "$env:SystemDrive\" -EA 0
-                Checkpoint-Computer -Description "Before Windows Restore Tool v4.3" -RestorePointType MODIFY_SETTINGS -EA Stop
+                Checkpoint-Computer -Description "Before Windows Restore Tool v4.4" -RestorePointType MODIFY_SETTINGS -EA Stop
                 Write-Log "Restore point created successfully" -Level Success
             } catch {
                 Write-Log "Could not create restore point: $($_.Exception.Message)" -Level Warning
@@ -4809,6 +4814,16 @@ function Show-MainWindow {
     $window.ShowDialog() | Out-Null
 }
 
+# Preserve the descriptive collection-oriented command names used by earlier
+# releases while keeping the implementation nouns singular for analyzer hygiene.
+Set-Alias -Name Compare-RegistrySnapshots -Value Compare-RegistrySnapshot -Scope Script -Force
+Set-Alias -Name Reset-WindowsUpdateChannelAndDeferrals -Value Reset-WindowsUpdateChannelAndDeferral -Scope Script -Force
+Set-Alias -Name Restore-DevicePrivacySliders -Value Restore-DevicePrivacySlider -Scope Script -Force
+Set-Alias -Name Restore-MissingScheduledTasks -Value Restore-MissingScheduledTask -Scope Script -Force
+Set-Alias -Name ConvertTo-ExternalChangeOperations -Value ConvertTo-ExternalChangeOperation -Scope Script -Force
+Set-Alias -Name Compare-RegExportSnapshots -Value Compare-RegExportSnapshot -Scope Script -Force
+Set-Alias -Name Restore-LocalGroupPolicyDefaults -Value Restore-LocalGroupPolicyDefault -Scope Script -Force
+
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
@@ -4821,7 +4836,7 @@ if ($ExportSnapshot) {
 
 if ($CompareSnapshot) {
     $currentSnapshot = Get-RegistrySnapshot
-    $diff = Compare-RegistrySnapshots -Before $CompareSnapshot -After $currentSnapshot
+    $diff = Compare-RegistrySnapshot -Before $CompareSnapshot -After $currentSnapshot
     Write-Output ($diff | ConvertTo-Json -Depth 12)
     exit
 }
