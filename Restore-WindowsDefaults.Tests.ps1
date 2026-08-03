@@ -239,4 +239,24 @@ Describe "Restore-WindowsDefaults planning helpers" {
         $plan.Count | Should -Be 1
         $plan[0].TaskName | Should -Be "\Test\TaskOne"
     }
+
+    It "evaluates a custom safe-default catalog without changing state" {
+        $catalog = @(@{Name="Missing policy";Path="HKCU:\Software\Restore-WindowsDefaults-Test";ValueName="Missing";Action="Remove";Category="chkMisc"})
+
+        $report = @(Get-RegistryDefaultBaselineReport -Catalog $catalog)
+
+        $report.Count | Should -Be 1
+        $report[0].IsDefault | Should -BeTrue
+        $report[0].Action | Should -Be "Remove"
+    }
+
+    It "keeps the restore function map aligned with the new operational categories" {
+        $map = Get-RestoreFunctionMap
+
+        $map.ContainsKey("chkSearchIndexer") | Should -BeTrue
+        $map.ContainsKey("chkStoreChain") | Should -BeTrue
+        $map.ContainsKey("chkAccount") | Should -BeTrue
+        $map.ContainsKey("chkGroupPolicy") | Should -BeTrue
+        $map.ContainsKey("chkDefenderCpuCap") | Should -BeTrue
+    }
 }

@@ -10,7 +10,12 @@ param(
     [switch]$ScheduleRestore,
     [switch]$ResumeScheduledRestore,
     [switch]$RollbackLastRun,
-    [string]$RestoreCategories
+    [string]$RestoreCategories,
+    [ValidateSet("Quick","Full","Nuclear")][string]$RestoreTier,
+    [switch]$PostUpdateCheck,
+    [string]$ExportSupportBundle,
+    [string[]]$RemoteComputerName,
+    [string]$RemoteScriptPath
 )
 
 <#
@@ -62,6 +67,11 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
     if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
     if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
+    if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
+    if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
+    if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
+    if ($RemoteComputerName) { $relaunchArgs += @("-RemoteComputerName", "`"$($RemoteComputerName -join ',')`"") }
+    if ($RemoteScriptPath) { $relaunchArgs += @("-RemoteScriptPath", "`"$RemoteScriptPath`"") }
     Start-Process $ps5 -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
     exit
 }
@@ -77,6 +87,11 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
     if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
     if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
+    if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
+    if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
+    if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
+    if ($RemoteComputerName) { $relaunchArgs += @("-RemoteComputerName", "`"$($RemoteComputerName -join ',')`"") }
+    if ($RemoteScriptPath) { $relaunchArgs += @("-RemoteScriptPath", "`"$RemoteScriptPath`"") }
     Start-Process powershell -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
     exit
 }
@@ -174,7 +189,7 @@ function Remove-RegistryValue {
     try {
         if (Test-Path $Path) {
             $current = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
-            if ($null -ne $current.$Name) {
+            if ($current -and $current.PSObject.Properties[$Name]) {
                 Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction Stop
                 if (-not $Silent) { Write-Log "Removed: $Path\$Name" -Level Success }
                 $script:ChangesCount++
@@ -191,6 +206,12 @@ function Set-RegistryValue {
     param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord", [switch]$Silent)
     try {
         if (!(Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+        $current = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+        if ($current -and $current.PSObject.Properties[$Name]) {
+            $currentJson = $current.$Name | ConvertTo-Json -Depth 8 -Compress
+            $desiredJson = $Value | ConvertTo-Json -Depth 8 -Compress
+            if ($currentJson -eq $desiredJson) { return $false }
+        }
         Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop
         if (-not $Silent) { Write-Log "Set: $Path\$Name = $Value" -Level Success }
         $script:ChangesCount++
@@ -221,6 +242,7 @@ function Restore-ServiceStartup {
     try {
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($svc) {
+            if ($svc.StartType.ToString() -ieq $StartupType) { return $false }
             Set-Service -Name $ServiceName -StartupType $StartupType -ErrorAction Stop
             if (-not $Silent) { Write-Log "Service '$ServiceName' set to $StartupType" -Level Success }
             $script:ChangesCount++
@@ -237,6 +259,7 @@ function Enable-ScheduledTaskSafe {
     try {
         $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($task) {
+            if ($task.State -and $task.State.ToString() -ne "Disabled") { return $false }
             Enable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop | Out-Null
             if (-not $Silent) { Write-Log "Enabled task: $TaskPath$TaskName" -Level Success }
             $script:ChangesCount++
@@ -264,6 +287,46 @@ $script:RegistrySnapshotPaths = @(
     "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search",
     "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
 )
+
+# Versioned, data-driven defaults for policy values whose stock state is the
+# absence of an override. This catalog is also used by the CLI baseline report.
+$script:RegistryDefaultCatalog = @(
+    @{Name="Defender anti-spyware policy";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender";ValueName="DisableAntiSpyware";Action="Remove";Category="chkDefender"},
+    @{Name="Defender real-time policy";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection";ValueName="DisableRealtimeMonitoring";Action="Remove";Category="chkDefender"},
+    @{Name="Windows Update automatic updates";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU";ValueName="NoAutoUpdate";Action="Remove";Category="chkWindowsUpdate"},
+    @{Name="Windows Update feature deferral";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate";ValueName="DeferFeatureUpdatesPeriodInDays";Action="Remove";Category="chkWindowsUpdate"},
+    @{Name="Windows Update quality deferral";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate";ValueName="DeferQualityUpdatesPeriodInDays";Action="Remove";Category="chkWindowsUpdate"},
+    @{Name="SmartScreen policy";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System";ValueName="EnableSmartScreen";Action="Remove";Category="chkSmartScreen"},
+    @{Name="Edge policy override";Path="HKLM:\SOFTWARE\Policies\Microsoft\Edge";ValueName="SmartScreenEnabled";Action="Remove";Category="chkEdge"},
+    @{Name="Background app policy";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy";ValueName="LetAppsRunInBackground";Action="Remove";Category="chkBgApps"},
+    @{Name="OneDrive sync policy";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive";ValueName="DisableFileSyncNGSC";Action="Remove";Category="chkOneDrive"},
+    @{Name="Defender CPU cap";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan";ValueName="AvgCPULoadFactor";Action="Remove";Category="chkDefenderCpuCap"}
+)
+
+function Get-RegistryDefaultBaselineReport {
+    param([object[]]$Catalog = $script:RegistryDefaultCatalog)
+    $findings = @()
+    foreach ($entry in $Catalog) {
+        $current = Get-ItemProperty -LiteralPath $entry.Path -Name $entry.ValueName -ErrorAction SilentlyContinue
+        $present = $current -and $current.PSObject.Properties[$entry.ValueName]
+        $matchesDefault = if ($entry.Action -eq "Remove") { -not $present }
+            else { $present -and (($current.$($entry.ValueName) | ConvertTo-Json -Compress) -eq ($entry.DefaultValue | ConvertTo-Json -Compress)) }
+        $findings += [pscustomobject][ordered]@{
+            Name=$entry.Name; Path=$entry.Path; ValueName=$entry.ValueName; Category=$entry.Category
+            Action=$entry.Action; CurrentValue=if($present){$current.$($entry.ValueName)}else{$null}
+            IsDefault=$matchesDefault
+        }
+    }
+    return @($findings)
+}
+
+function Restore-RegistryDefaultBaseline {
+    param([object[]]$Catalog = $script:RegistryDefaultCatalog)
+    foreach ($entry in $Catalog) {
+        if ($entry.Action -eq "Remove") { Remove-RegistryValue -Path $entry.Path -Name $entry.ValueName -Silent }
+        elseif ($entry.Action -eq "Set") { Set-RegistryValue -Path $entry.Path -Name $entry.ValueName -Value $entry.DefaultValue -Type $entry.Type -Silent }
+    }
+}
 
 $script:CoreAppxPackageCatalog = @(
     @{Name="Microsoft.WindowsStore"; Role="Core"},
@@ -729,6 +792,13 @@ function Restore-SecurityCenterFullReset {
     Restore-WindowsUpdateSettings -ForceManaged:$ForceManaged
     Restore-WindowsSecurityUI
     Write-Log "Windows Security Center full reset: Complete" -Level Success
+}
+
+function Restore-DefenderCpuCap {
+    Write-Log "=== DEFENDER CPU CAP ===" -Level Section
+    Remove-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan" -Name "AvgCPULoadFactor" -Silent
+    Remove-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows Defender\Scan" -Name "AvgCPULoadFactor" -Silent
+    Write-Log "Defender CPU cap removed; Windows will manage scan scheduling" -Level Success
 }
 
 function Restore-SearchIndexer {
@@ -2790,6 +2860,7 @@ function Get-RestoreFunctionMap {
         chkOffice={Restore-OfficeSettings}; chkNvidia={Restore-NvidiaTelemetry}
         chk3rdParty={Restore-ThirdPartyServices}
         chkDefender={Restore-DefenderSettings}; chkSmartScreen={Restore-SmartScreenSettings}
+        chkDefenderCpuCap={Restore-DefenderCpuCap}
         chkFirewall={Restore-FirewallSettings}; chkUAC={Restore-UACSettings}
         chkSecurityUI={Restore-WindowsSecurityUI}
         chkBiometrics={Restore-BiometricsSettings}; chkGaming={Restore-GamingSettings}
@@ -2803,6 +2874,7 @@ function Get-RestoreFunctionMap {
         chkFeatures={Restore-WindowsFeatures}; chkAppx={Restore-AppxPackages}
         chkDevicePrivacy={Restore-DevicePrivacySliders}; chkSearchIndexer={Restore-SearchIndexer -Rebuild}
         chkStoreChain={Restore-StoreWingetServiceChain}; chkAccount={Restore-AccountSignIn}
+        chkGroupPolicy={Restore-LocalGroupPolicyDefaults}
     }
 }
 
@@ -3549,6 +3621,8 @@ function New-RestoreRollbackSnapshot {
     }
     $path = Join-Path (Get-RestoreRollbackDirectory) ("rollback-{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
     [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 15), [System.Text.Encoding]::UTF8)
+    $oldSnapshots = @(Get-ChildItem -LiteralPath (Get-RestoreRollbackDirectory) -Filter "rollback-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 10)
+    foreach ($oldSnapshot in $oldSnapshots) { Remove-Item -LiteralPath $oldSnapshot.FullName -Force -ErrorAction SilentlyContinue }
     $script:LastRollbackPath = $path
     Write-Log "Rollback snapshot saved: $(Split-Path $path -Leaf)" -Level Info
     return $path
@@ -3628,6 +3702,113 @@ function Invoke-ScheduledRestore {
     $script:CurrentCategory = ""
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Write-Log "Scheduled restore completed" -Level Success
+}
+
+function Get-PostUpdateSecurityRecheck {
+    $health = Get-SystemHealthReport
+    $securityKeys = @("Defender","Firewall","SmartScreen","WindowsUpdate","SecurityUI","Crypto")
+    $security = @()
+    foreach ($key in $securityKeys) {
+        if ($health.Contains($key)) {
+            $security += [pscustomobject]@{
+                Category=$key; Severity=$health[$key].Severity; IssueCount=$health[$key].IssueCount
+                Issues=@($health[$key].Issues); Details=@($health[$key].Details)
+            }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        CheckedAt=(Get-Date).ToUniversalTime().ToString("o")
+        Passed=(@($security | Where-Object { $_.Severity -in @("Critical","High") }).Count -eq 0)
+        Categories=@($security)
+    }
+}
+
+function Export-RestoreSupportBundle {
+    param([Parameter(Mandatory=$true)][string]$OutputPath)
+    $fullPath = [System.IO.Path]::GetFullPath($OutputPath)
+    if ([System.IO.Path]::GetExtension($fullPath) -ine ".zip") { $fullPath += ".zip" }
+    $staging = Join-Path ([System.IO.Path]::GetTempPath()) ("RestoreSupport-{0}" -f ([guid]::NewGuid().ToString("N")))
+    New-Item -ItemType Directory -Path $staging -Force | Out-Null
+    try {
+        $health = Get-SystemHealthReport
+        $quick = Get-QuickScanSummary
+        [System.IO.File]::WriteAllText((Join-Path $staging "health.json"), ($health | ConvertTo-Json -Depth 12), [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllText((Join-Path $staging "quick-scan.json"), ($quick | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+        $logFiles = @(Get-ChildItem -LiteralPath (Split-Path $script:LogPath) -Filter "WindowsRestore_*.log" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10)
+        foreach ($log in $logFiles) {
+            $safe = Get-Content -LiteralPath $log.FullName -Raw -ErrorAction SilentlyContinue
+            if ($env:USERNAME) { $safe = $safe -replace [regex]::Escape($env:USERNAME), "REDACTED_USER" }
+            if ($env:COMPUTERNAME) { $safe = $safe -replace [regex]::Escape($env:COMPUTERNAME), "REDACTED_COMPUTER" }
+            [System.IO.File]::WriteAllText((Join-Path $staging $log.Name), $safe, [System.Text.Encoding]::UTF8)
+        }
+        $rollbackDirectory = Join-Path $env:ProgramData "Restore-WindowsDefaults\rollback"
+        if (Test-Path -LiteralPath $rollbackDirectory) {
+            Copy-Item -Path (Join-Path $rollbackDirectory "rollback-*.json") -Destination $staging -Force -ErrorAction SilentlyContinue
+        }
+        $parent = Split-Path -Parent $fullPath
+        if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+        if (Test-Path -LiteralPath $fullPath) { Remove-Item -LiteralPath $fullPath -Force }
+        Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $fullPath -CompressionLevel Optimal -Force
+        Write-Log "Telemetry-free support bundle exported: $fullPath" -Level Success
+        return $fullPath
+    } finally {
+        if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Restore-LocalGroupPolicyDefaults {
+    param([switch]$ForceManaged)
+    $management = Get-PolicyManagementState
+    if ($management.IsManaged -and -not $ForceManaged) {
+        Write-Log "Domain or MDM management detected; local Group Policy reset skipped" -Level Warning
+        return $false
+    }
+    Write-Log "=== LOCAL GROUP POLICY RESET ===" -Level Section
+    foreach ($path in @(
+        (Join-Path $env:WINDIR "System32\GroupPolicy"),
+        (Join-Path $env:WINDIR "System32\GroupPolicyUsers")
+    )) {
+        if (Test-Path -LiteralPath $path) {
+            $backupPath = "$path.RestoreBackup.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+            try {
+                Move-Item -LiteralPath $path -Destination $backupPath -Force -ErrorAction Stop
+                Write-Log "Moved local policy store to $(Split-Path $backupPath -Leaf)" -Level Success
+            } catch { Write-Log "Could not move local policy store $path" -Level Warning }
+        }
+    }
+    & gpupdate.exe /force 2>&1 | Out-Null
+    Write-Log "Local Group Policy reset requested; gpupdate completed" -Level Success
+    return $true
+}
+
+function Invoke-RestoreTier {
+    param([ValidateSet("Quick","Full","Nuclear")][string]$Tier)
+    $tierKeys = switch ($Tier) {
+        "Quick" { @("chkDefender","chkFirewall","chkWindowsUpdate","chkServices","chkTasks") }
+        "Full" { @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto","chkNetwork","chkHostsFile","chkServices","chkTasks","chkFeatures","chkErrorReport","chkPrinting","chkMisc","chkPrivacy","chkCopilot","chkBing","chkCDM","chkBgApps","chkSync","chkNotifications","chkEnvVars","chkDevicePrivacy","chkTaskbar","chkExplorer","chkStartMenu","chkContextMenus","chkOOBE","chkEdge","chkChrome","chkOffice","chkOneDrive","chkNvidia","chk3rdParty","chkStoreChain","chkAccount","chkBluetooth","chkBiometrics","chkGaming","chkRemoteDesktop","chkAccessibility","chkInput","chkPower","chkMemory","chkStorage","chkInsider") }
+        "Nuclear" { @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto","chkNetwork","chkHostsFile","chkServices","chkTasks","chkFeatures","chkErrorReport","chkPrinting","chkMisc","chkPrivacy","chkCopilot","chkBing","chkCDM","chkBgApps","chkSync","chkNotifications","chkEnvVars","chkDevicePrivacy","chkTaskbar","chkExplorer","chkStartMenu","chkContextMenus","chkOOBE","chkEdge","chkChrome","chkOffice","chkOneDrive","chkNvidia","chk3rdParty","chkStoreChain","chkAccount","chkBluetooth","chkBiometrics","chkGaming","chkRemoteDesktop","chkAccessibility","chkInput","chkPower","chkMemory","chkStorage","chkInsider","chkAppx") }
+    }
+    $null = New-RestoreRollbackSnapshot -SelectedKeys $tierKeys
+    $map = Get-RestoreFunctionMap
+    foreach ($key in $tierKeys) { if ($map.ContainsKey($key)) { $script:CurrentCategory=$key; & $map[$key] } }
+    $script:CurrentCategory = ""
+    return @($tierKeys)
+}
+
+function Invoke-RemoteRestoreBatch {
+    param(
+        [Parameter(Mandatory=$true)][string[]]$ComputerName,
+        [Parameter(Mandatory=$true)][string[]]$SelectedKeys,
+        [Parameter(Mandatory=$true)][string]$ScriptPath,
+        [pscredential]$Credential
+    )
+    $remoteBlock = {
+        param($remoteScript,$keys)
+        & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $remoteScript -NoGui -RestoreCategories ($keys -join ',')
+    }
+    $invokeParams = @{ComputerName=$ComputerName;ScriptBlock=$remoteBlock;ArgumentList=$ScriptPath,@($SelectedKeys)}
+    if ($Credential) { $invokeParams.Credential = $Credential }
+    return @(Invoke-Command @invokeParams)
 }
 
 # ============================================================================
@@ -3765,6 +3946,7 @@ function Show-MainWindow {
     # ---- Checkbox definitions ----
     $categories = @(
         @{K="chkDefender";L="Windows Defender";D="Re-enables antivirus, real-time scanning, updates, unblocks executables";On=$true;G="Security"}
+        @{K="chkDefenderCpuCap";L="Defender CPU Cap";D="Removes an explicit scan CPU limit and returns scheduling to Windows defaults";On=$false;G="Security"}
         @{K="chkFirewall";L="Windows Firewall";D="Re-enables firewall on all network profiles, restores BFE service";On=$true;G="Security"}
         @{K="chkSmartScreen";L="SmartScreen Protection";D="Re-enables download/website safety checks in Windows and browsers";On=$true;G="Security"}
         @{K="chkWindowsUpdate";L="Windows Update";D="Restores update services, delivery optimization, re-registers components";On=$true;G="Security"}
@@ -3780,6 +3962,7 @@ function Show-MainWindow {
         @{K="chkPrinting";L="Printing";D="Restores Print Spooler service and print notification service";On=$true;G="System"}
         @{K="chkMisc";L="Misc System Policies";D="Snipping Tool, Copilot autolaunch, location, Maps, DEP";On=$true;G="System"}
         @{K="chkSearchIndexer";L="Rebuild Search Index";D="Restarts Windows Search and rebuilds its local index database";On=$false;G="System"}
+        @{K="chkGroupPolicy";L="Reset Local Group Policy";D="Moves local policy stores to a backup and reapplies Windows defaults";On=$false;G="System"}
         @{K="chkClipboard";L="Clipboard History and Sync";D="Restores clipboard history and cross-device sync features";On=$true;G="System"}
         @{K="chkPrivacy";L="Privacy and Telemetry";D="Restores app permissions, diagnostics data collection, and tracking defaults";On=$true;G="Privacy"}
         @{K="chkCopilot";L="Copilot, Cortana and AI";D="Removes policy blocks on Windows AI and voice assistant features";On=$true;G="Privacy"}
@@ -4287,7 +4470,10 @@ function Show-MainWindow {
     # PRESETS AND RUN LOGIC
     # ================================================================
     $securityOnly = @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto")
-    $safeDefaults = $allChkNames | Where-Object { $_ -ne "chkTheme" -and $_ -ne "chkAppx" -and $_ -ne "chkSearchIndexer" }
+    $managementState = Get-PolicyManagementState
+    $script:ManagedMode = $managementState.IsManaged
+    $safeDefaults = $allChkNames | Where-Object { $_ -ne "chkTheme" -and $_ -ne "chkAppx" -and $_ -ne "chkSearchIndexer" -and $_ -ne "chkDefenderCpuCap" -and $_ -ne "chkGroupPolicy" }
+    if ($managementState.IsManaged) { $safeDefaults = @($safeDefaults | Where-Object { $_ -notin @("chkSync","chkOneDrive","chkAccount") }) }
 
     $runRestore = {
         param($selectedKeys, $doRestorePoint, $scanOnlyMode)
@@ -4549,7 +4735,13 @@ function Show-MainWindow {
     $ui.btnSelectAll.Add_Click({ foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = $true } } })
     $ui.btnSelectNone.Add_Click({ foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = $false } } })
     $ui.btnSelectSafe.Add_Click({
-        foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = ($c -ne "chkTheme" -and $c -ne "chkAppx" -and $c -ne "chkSearchIndexer") } }
+        foreach ($c in $allChkNames) {
+            if ($ui[$c]) {
+                $isSafe = ($c -ne "chkTheme" -and $c -ne "chkAppx" -and $c -ne "chkSearchIndexer" -and $c -ne "chkDefenderCpuCap" -and $c -ne "chkGroupPolicy")
+                if ($script:ManagedMode -and $c -in @("chkSync","chkOneDrive","chkAccount")) { $isSafe = $false }
+                $ui[$c].IsChecked = $isSafe
+            }
+        }
     })
 
     $ui.btnClose.Add_Click({ $window.Close() })
@@ -4634,6 +4826,23 @@ if ($CompareSnapshot) {
     exit
 }
 
+if ($PostUpdateCheck) {
+    Write-Output ((Get-PostUpdateSecurityRecheck) | ConvertTo-Json -Depth 12)
+    exit
+}
+
+if ($ExportSupportBundle) {
+    Write-Output (Export-RestoreSupportBundle -OutputPath $ExportSupportBundle)
+    exit
+}
+
+if ($RemoteComputerName) {
+    if (-not $RemoteScriptPath) { $RemoteScriptPath = $PSCommandPath }
+    $remoteKeys = if ($RestoreCategories) { @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { @("chkDefender","chkFirewall","chkWindowsUpdate","chkServices","chkTasks") }
+    Write-Output ((Invoke-RemoteRestoreBatch -ComputerName $RemoteComputerName -SelectedKeys $remoteKeys -ScriptPath $RemoteScriptPath) | Out-String)
+    exit
+}
+
 if ($RollbackLastRun) {
     Invoke-RestoreRollback
     exit
@@ -4652,6 +4861,11 @@ if ($SecurityReset) {
 
 if ($RebuildSearch) {
     Restore-SearchIndexer -Rebuild
+    exit
+}
+
+if ($RestoreTier) {
+    $null = Invoke-RestoreTier -Tier $RestoreTier
     exit
 }
 
