@@ -113,3 +113,130 @@ Describe "Restore-WindowsDefaults snapshot and AppX comparisons" {
         }
     }
 }
+
+Describe "Restore-WindowsDefaults external change imports" {
+    It "parses privacy.sexy compensation commands without executing them" {
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) ("privacy-sexy-{0}.log" -f ([guid]::NewGuid().ToString("N")))
+        try {
+            @(
+                'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /d 0',
+                'sc.exe config DiagTrack start= disabled',
+                'schtasks.exe /change /tn "\Microsoft\Windows\WindowsUpdate\Scheduled Start" /disable'
+            ) | Set-Content -LiteralPath $path
+
+            $result = Import-PrivacySexyCompensationLog -LogPath $path
+
+            $result.Success | Should -BeTrue
+            $result.Operations.Count | Should -Be 3
+            $result.RelevantCategories | Should -Contain "chkPrivacy"
+            $result.RelevantCategories | Should -Contain "chkServices"
+            $result.RelevantCategories | Should -Contain "chkTasks"
+        } finally {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "reads Chris Titus style diff lines through the same safe parser" {
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) ("winutil-diff-{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+        try {
+            @(
+                "Registry: HKLM:\SOFTWARE\Policies\Microsoft\Edge SmartScreenEnabled",
+                "Service: wuauserv disabled",
+                "AppX: Microsoft.WindowsStore removed"
+            ) | Set-Content -LiteralPath $path
+
+            $result = Import-ChrisTitusWinUtilDiff -DiffPath $path
+
+            $result.Operations.Count | Should -Be 3
+            $result.RelevantCategories | Should -Contain "chkEdge"
+            $result.RelevantCategories | Should -Contain "chkWindowsUpdate"
+            $result.RelevantCategories | Should -Contain "chkAppx"
+        } finally {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "imports reg export files and compares them as registry snapshots" {
+        $beforePath = Join-Path ([System.IO.Path]::GetTempPath()) ("before-{0}.reg" -f ([guid]::NewGuid().ToString("N")))
+        $afterPath = Join-Path ([System.IO.Path]::GetTempPath()) ("after-{0}.reg" -f ([guid]::NewGuid().ToString("N")))
+        try {
+            @(
+                'Windows Registry Editor Version 5.00',
+                '',
+                '[HKEY_CURRENT_USER\Software\RestoreTest]',
+                '"Changed"=dword:00000001',
+                '"Removed"="old"'
+            ) | Set-Content -LiteralPath $beforePath
+            @(
+                'Windows Registry Editor Version 5.00',
+                '',
+                '[HKEY_CURRENT_USER\Software\RestoreTest]',
+                '"Changed"=dword:00000002',
+                '"Added"="new"'
+            ) | Set-Content -LiteralPath $afterPath
+
+            $diff = Compare-RegExportSnapshots -BeforePath $beforePath -AfterPath $afterPath
+
+            $diff.TotalChanges | Should -Be 3
+            @($diff.Changed).Name | Should -Contain "Changed"
+            @($diff.Added).Name | Should -Contain "Added"
+            @($diff.Removed).Name | Should -Contain "Removed"
+        } finally {
+            foreach ($path in @($beforePath,$afterPath)) {
+                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+
+    It "maps a newer nested undo manifest to restoration categories" {
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) ("manifest-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        try {
+            $manifest = @{
+                version="2"
+                changes=@(@{
+                    removedApps=@("Microsoft.WindowsStore")
+                    disabledServices=@("DiagTrack")
+                    disabledTasks=@("\Microsoft\Windows\WindowsUpdate\Scheduled Start")
+                    registryChanges=@(@{Path="HKLM:\SOFTWARE\Policies\Microsoft\Edge"})
+                })
+            }
+            $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $path
+
+            $result = Import-UndoManifest -ManifestPath $path
+
+            $result.Success | Should -BeTrue
+            $result.FormatVersion | Should -Be "2"
+            $result.RelevantCategories | Should -Contain "chkAppx"
+            $result.RelevantCategories | Should -Contain "chkServices"
+            $result.RelevantCategories | Should -Contain "chkTasks"
+        } finally {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+Describe "Restore-WindowsDefaults planning helpers" {
+    It "creates an impact preview for selected categories" {
+        $health = [ordered]@{
+            Security=@{FixKeys=@("chkDefender");IssueCount=2;Details=@("a","b");Severity="Critical"}
+            Privacy=@{FixKeys=@("chkPrivacy");IssueCount=0;Details=@();Severity="OK"}
+        }
+
+        $preview = @(Get-RestoreImpactPreview -SelectedKeys @("chkDefender","chkPrivacy") -HealthReport $health)
+
+        ($preview | Where-Object FixKey -eq "chkDefender").DetectedIssueCount | Should -Be 2
+        ($preview | Where-Object FixKey -eq "chkDefender").Severity | Should -Be "Critical"
+        ($preview | Where-Object FixKey -eq "chkPrivacy").HasDetectedIssue | Should -BeFalse
+    }
+
+    It "builds a missing task re-import plan from injectable state" {
+        $matrix = @(@{Source="Test";Tools=@("TestTool");P="\Test\";N="TaskOne";Category="chkTasks"})
+        $taskProvider = { param($path,$name) throw "missing" }
+        $fileProvider = { param($path) $true }
+
+        $plan = @(Get-MissingTaskRegistrationPlan -Matrix $matrix -TaskProvider $taskProvider -FileExistsProvider $fileProvider)
+
+        $plan.Count | Should -Be 1
+        $plan[0].TaskName | Should -Be "\Test\TaskOne"
+    }
+}

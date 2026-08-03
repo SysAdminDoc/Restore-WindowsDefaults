@@ -4,7 +4,13 @@ param(
     [switch]$NoGui,
     [switch]$NoElevation,
     [string]$ExportSnapshot,
-    [string]$CompareSnapshot
+    [string]$CompareSnapshot,
+    [switch]$SecurityReset,
+    [switch]$RebuildSearch,
+    [switch]$ScheduleRestore,
+    [switch]$ResumeScheduledRestore,
+    [switch]$RollbackLastRun,
+    [string]$RestoreCategories
 )
 
 <#
@@ -50,6 +56,12 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($NoElevation) { $relaunchArgs += "-NoElevation" }
     if ($ExportSnapshot) { $relaunchArgs += @("-ExportSnapshot", "`"$ExportSnapshot`"") }
     if ($CompareSnapshot) { $relaunchArgs += @("-CompareSnapshot", "`"$CompareSnapshot`"") }
+    if ($SecurityReset) { $relaunchArgs += "-SecurityReset" }
+    if ($RebuildSearch) { $relaunchArgs += "-RebuildSearch" }
+    if ($ScheduleRestore) { $relaunchArgs += "-ScheduleRestore" }
+    if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
+    if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
+    if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
     Start-Process $ps5 -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
     exit
 }
@@ -59,6 +71,12 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($NoGui) { $relaunchArgs += "-NoGui" }
     if ($ExportSnapshot) { $relaunchArgs += @("-ExportSnapshot", "`"$ExportSnapshot`"") }
     if ($CompareSnapshot) { $relaunchArgs += @("-CompareSnapshot", "`"$CompareSnapshot`"") }
+    if ($SecurityReset) { $relaunchArgs += "-SecurityReset" }
+    if ($RebuildSearch) { $relaunchArgs += "-RebuildSearch" }
+    if ($ScheduleRestore) { $relaunchArgs += "-ScheduleRestore" }
+    if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
+    if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
+    if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
     Start-Process powershell -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
     exit
 }
@@ -511,8 +529,14 @@ function Compare-RegistrySnapshots {
         [Parameter(Mandatory=$true)]$Before,
         [Parameter(Mandatory=$true)]$After
     )
-    if ($Before -is [string]) { $Before = Import-RegistrySnapshot -InputPath $Before }
-    if ($After -is [string]) { $After = Import-RegistrySnapshot -InputPath $After }
+    if ($Before -is [string]) {
+        if ([System.IO.Path]::GetExtension($Before) -ieq ".reg") { $Before = Import-RegExportSnapshot -RegPath $Before }
+        else { $Before = Import-RegistrySnapshot -InputPath $Before }
+    }
+    if ($After -is [string]) {
+        if ([System.IO.Path]::GetExtension($After) -ieq ".reg") { $After = Import-RegExportSnapshot -RegPath $After }
+        else { $After = Import-RegistrySnapshot -InputPath $After }
+    }
     $beforeMap = @{}; $afterMap = @{}
     foreach ($entry in @($Before.Entries)) { $beforeMap["$($entry.Path)|$($entry.Name)"] = $entry }
     foreach ($entry in @($After.Entries)) { $afterMap["$($entry.Path)|$($entry.Name)"] = $entry }
@@ -604,6 +628,247 @@ function Compare-AppxPackageBaseline {
     $report | Add-Member -NotePropertyName BaselinePath -NotePropertyValue $BaselinePath
     $report | Add-Member -NotePropertyName WimPath -NotePropertyValue $WimPath
     return $report
+}
+
+# ============================================================================
+# RESTORATION DEPTH AND OPERATIONS
+# ============================================================================
+
+function Get-PolicyManagementState {
+    $domainJoined = $false
+    $computerSystem = $null
+    try {
+        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        $domainJoined = [bool]$computerSystem.PartOfDomain
+    } catch {
+        try {
+            $computerSystem = Get-WmiObject -Class Win32_ComputerSystem -ErrorAction Stop
+            $domainJoined = [bool]$computerSystem.PartOfDomain
+        } catch { }
+    }
+    $mdmPaths = @(
+        "HKLM:\SOFTWARE\Microsoft\Enrollments",
+        "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts",
+        "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device"
+    )
+    $mdmEnrolled = @($mdmPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+    return [pscustomobject][ordered]@{
+        DomainJoined=$domainJoined; MdmEnrolled=$mdmEnrolled
+        IsManaged=($domainJoined -or $mdmEnrolled)
+        ComputerName=$env:COMPUTERNAME
+    }
+}
+
+function Get-EdgePolicyState {
+    $machinePath = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
+    $userPath = "HKCU:\SOFTWARE\Policies\Microsoft\Edge"
+    $machinePolicies = @(); $userPolicies = @()
+    if (Test-Path -LiteralPath $machinePath) { $machinePolicies = @((Get-Item -LiteralPath $machinePath -ErrorAction SilentlyContinue).Property) }
+    if (Test-Path -LiteralPath $userPath) { $userPolicies = @((Get-Item -LiteralPath $userPath -ErrorAction SilentlyContinue).Property) }
+    $management = Get-PolicyManagementState
+    $hasPolicies = ($machinePolicies.Count + $userPolicies.Count) -gt 0
+    $source = if (-not $hasPolicies) { "None" }
+        elseif ($management.IsManaged -and $machinePolicies.Count) { "Managed machine policy" }
+        elseif ($machinePolicies.Count) { "Local machine policy" }
+        else { "User policy" }
+    return [pscustomobject][ordered]@{
+        Managed=($management.IsManaged -and $machinePolicies.Count -gt 0)
+        HasPolicies=$hasPolicies; Source=$source
+        MachinePolicies=@($machinePolicies); UserPolicies=@($userPolicies)
+        DomainJoined=$management.DomainJoined; MdmEnrolled=$management.MdmEnrolled
+    }
+}
+
+function Reset-WindowsUpdateChannelAndDeferrals {
+    param([switch]$ForceManaged)
+    $management = Get-PolicyManagementState
+    $policyRoots = @(
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization",
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching",
+        "HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+    )
+    if ($management.IsManaged -and -not $ForceManaged) {
+        Write-Log "Managed policy state detected; preserving policy containers and removing only explicit pause/deferral values" -Level Warning
+    } else {
+        foreach ($root in $policyRoots) { Remove-RegistryKey -Path $root -Silent }
+    }
+    $policyValues = @(
+        "NoAutoUpdate","AUOptions","UseWUServer","WUServer","WUStatusServer",
+        "DeferFeatureUpdates","DeferFeatureUpdatesPeriodInDays","DeferQualityUpdates",
+        "DeferQualityUpdatesPeriodInDays","BranchReadinessLevel","TargetReleaseVersion",
+        "TargetReleaseVersionInfo","ProductVersion","ManagePreviewBuilds",
+        "ManagePreviewBuildsPolicyValue","PauseFeatureUpdatesStartTime",
+        "PauseQualityUpdatesStartTime","PauseUpdatesStartTime","PauseUpdatesExpiryTime",
+        "FlightSettingsMaxPauseDays","ConfigureDeadlineForFeatureUpdates",
+        "ConfigureDeadlineForQualityUpdates","ConfigureDeadlineGracePeriod",
+        "ConfigureDeadlineNoAutoReboot"
+    )
+    foreach ($path in @(
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
+        "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",
+        "HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
+        "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings",
+        "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\Settings",
+        "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\PolicyState"
+    )) {
+        foreach ($name in $policyValues) { Remove-RegistryValue -Path $path -Name $name -Silent }
+    }
+    foreach ($name in @("Pause","PauseFeatureUpdates","PauseQualityUpdates","RequireDeferUpgrade","DeferFeatureUpdatesPeriodInDays","DeferQualityUpdatesPeriodInDays")) {
+        Remove-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update\$name" -Name "value" -Silent
+    }
+    Write-Log "Windows Update channel, release targeting, and deferral state reset" -Level Success
+}
+
+function Restore-SecurityCenterFullReset {
+    param([switch]$ForceManaged)
+    Write-Log "=== WINDOWS SECURITY CENTER FULL RESET ===" -Level Section
+    Restore-DefenderSettings
+    Restore-FirewallSettings
+    Restore-SmartScreenSettings
+    Restore-WindowsUpdateSettings -ForceManaged:$ForceManaged
+    Restore-WindowsSecurityUI
+    Write-Log "Windows Security Center full reset: Complete" -Level Success
+}
+
+function Restore-SearchIndexer {
+    param([switch]$Rebuild)
+    Write-Log "=== SEARCH INDEXER ===" -Level Section
+    Restore-ServiceStartup -ServiceName "WSearch" -StartupType "Automatic" -Silent
+    try {
+        $service = Get-Service -Name "WSearch" -ErrorAction SilentlyContinue
+        if ($service -and $service.Status -eq "Stopped") { Start-Service -Name "WSearch" -ErrorAction Stop }
+    } catch { Write-Log "Could not start Windows Search; reboot may be required" -Level Warning }
+    if ($Rebuild) {
+        $indexPath = "$env:ProgramData\Microsoft\Search\Data\Applications\Windows\Windows.edb"
+        if (Test-Path -LiteralPath $indexPath) {
+            try {
+                Stop-Service -Name "WSearch" -Force -ErrorAction Stop
+                $backupPath = "$indexPath.$(Get-Date -Format 'yyyyMMdd_HHmmss').bak"
+                Move-Item -LiteralPath $indexPath -Destination $backupPath -Force -ErrorAction Stop
+                Write-Log "Search index moved to $(Split-Path $backupPath -Leaf); Windows Search will rebuild it" -Level Success
+                Start-Service -Name "WSearch" -ErrorAction SilentlyContinue
+                $script:ChangesCount++
+            } catch { Write-Log "Search index rebuild was partial: $($_.Exception.Message)" -Level Warning }
+        } else { Write-Log "Search index database was not present; Windows Search will create it" -Level Info }
+    }
+    Write-Log "Search Indexer: Complete" -Level Success
+}
+
+function Restore-StoreWingetServiceChain {
+    Write-Log "=== STORE AND WINGET SERVICE CHAIN ===" -Level Section
+    @(
+        @{N="AppXSvc";T="Manual"}, @{N="ClipSVC";T="Manual"},
+        @{N="LicenseManager";T="Manual"}, @{N="InstallService";T="Manual"},
+        @{N="BITS";T="Manual"}, @{N="wuauserv";T="Manual"},
+        @{N="DoSvc";T="Automatic"}
+    ) | ForEach-Object { Restore-ServiceStartup -ServiceName $_.N -StartupType $_.T -Silent }
+    @(
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore";N="RemoveWindowsStore"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore";N="DisableStoreApps"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore";N="AutoDownload"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore";N="RequirePrivateStoreOnly"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\Appx";N="BlockNonAdminUserInstall"}
+    ) | ForEach-Object { Remove-RegistryValue -Path $_.P -Name $_.N -Silent }
+    foreach ($packageName in @("Microsoft.WindowsStore","Microsoft.DesktopAppInstaller","Microsoft.StorePurchaseApp")) {
+        foreach ($package in @(Get-AppxPackageSafe -Name $packageName -AllUsers)) {
+            $manifest = if ($package.InstallLocation) { Join-Path $package.InstallLocation "AppxManifest.xml" } else { $null }
+            if ($manifest -and (Test-Path -LiteralPath $manifest)) {
+                try {
+                    Add-AppxPackage -DisableDevelopmentMode -Register $manifest -ErrorAction Stop
+                    Write-Log "Re-registered $packageName" -Level Success
+                } catch { Write-Log "Could not re-register $packageName" -Level Warning }
+            }
+        }
+    }
+    Write-Log "Store and WinGet service chain: Complete" -Level Success
+}
+
+function Restore-DevicePrivacySliders {
+    Write-Log "=== CAMERA, MICROPHONE, AND BLUETOOTH PRIVACY ===" -Level Section
+    $capabilities = @("webcam","microphone","bluetooth","location","radios")
+    foreach ($capability in $capabilities) {
+        Remove-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Name "LetAppsAccess$capability" -Silent
+        Remove-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Name "LetAppsAccess$($capability)_UserInControlOfTheseApps" -Silent
+        Remove-RegistryValue -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$capability" -Name "Value" -Silent
+        Remove-RegistryKey -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\$capability\NonPackaged" -Silent
+    }
+    Write-Log "Device privacy sliders reset to Windows-managed defaults" -Level Success
+}
+
+function Get-AccountSignInState {
+    $azureJoined = $false; $workplaceJoined = $false; $dsregDomainJoined = $false
+    try {
+        $dsregOutput = @(& dsregcmd.exe /status 2>$null)
+        foreach ($line in $dsregOutput) {
+            if ($line -match 'AzureAdJoined\s*:\s*YES') { $azureJoined = $true }
+            if ($line -match 'WorkplaceJoined\s*:\s*YES') { $workplaceJoined = $true }
+            if ($line -match 'DomainJoined\s*:\s*YES') { $dsregDomainJoined = $true }
+        }
+    } catch { }
+    $management = Get-PolicyManagementState
+    $kind = if ($azureJoined) { "Azure AD / Microsoft account capable" }
+        elseif ($dsregDomainJoined -or $management.DomainJoined) { "Domain account" }
+        elseif ($workplaceJoined) { "Workplace account" }
+        else { "Local account or unjoined device" }
+    return [pscustomobject][ordered]@{
+        AccountKind=$kind; AzureAdJoined=$azureJoined; WorkplaceJoined=$workplaceJoined
+        DomainJoined=($dsregDomainJoined -or $management.DomainJoined)
+        UserName="$env:USERDOMAIN\$env:USERNAME"
+    }
+}
+
+function Restore-AccountSignIn {
+    Write-Log "=== ACCOUNT SIGN-IN COMPONENTS ===" -Level Section
+    $state = Get-AccountSignInState
+    Write-Log "Detected sign-in context: $($state.AccountKind) ($($state.UserName))" -Level Info
+    @(
+        @{N="wlidsvc";T="Manual"}, @{N="TokenBroker";T="Manual"},
+        @{N="NgcSvc";T="Manual"}, @{N="NgcCtnrSvc";T="Manual"},
+        @{N="UserManager";T="Automatic"}, @{N="ProfSvc";T="Automatic"}
+    ) | ForEach-Object { Restore-ServiceStartup -ServiceName $_.N -StartupType $_.T -Silent }
+    @(
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System";N="BlockUserFromShowingAccountDetailsOnSignin"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\Windows\System";N="DontDisplayNetworkSelectionUI"},
+        @{P="HKLM:\SOFTWARE\Policies\Microsoft\PassportForWork";N="Enabled"},
+        @{P="HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Settings\AllowSignInOptions";N="value"}
+    ) | ForEach-Object { Remove-RegistryValue -Path $_.P -Name $_.N -Silent }
+    Write-Log "Account sign-in components restored without changing account membership" -Level Success
+}
+
+function Get-MissingTaskRegistrationPlan {
+    param(
+        [object[]]$Matrix = $script:ScheduledTaskRestoreMatrix,
+        [scriptblock]$TaskProvider,
+        [scriptblock]$FileExistsProvider
+    )
+    $matrixReport = @(Get-ScheduledTaskRestoreMatrix -Matrix $Matrix -TaskProvider $TaskProvider)
+    $plan = @()
+    foreach ($item in @($matrixReport | Where-Object { $_.State -eq "Missing" })) {
+        $xmlPath = Join-Path "$env:WINDIR\System32\Tasks" ($item.Path.TrimStart("\") + $item.Name)
+        $exists = if ($FileExistsProvider) { & $FileExistsProvider $xmlPath } else { Test-Path -LiteralPath $xmlPath }
+        if ($exists) {
+            $plan += [pscustomobject][ordered]@{
+                TaskName=($item.Path + $item.Name); XmlPath=$xmlPath; Category=$item.Category
+                ToolSources=@($item.ToolSources)
+            }
+        }
+    }
+    return @($plan)
+}
+
+function Restore-MissingScheduledTasks {
+    param([object[]]$Matrix = $script:ScheduledTaskRestoreMatrix)
+    $plan = @(Get-MissingTaskRegistrationPlan -Matrix $Matrix)
+    foreach ($item in $plan) {
+        try {
+            & schtasks.exe /Create /TN $item.TaskName /XML $item.XmlPath /F 2>&1 | Out-Null
+            Write-Log "Re-imported missing scheduled task: $($item.TaskName)" -Level Success
+            $script:ChangesCount++
+        } catch { Write-Log "Could not re-import scheduled task $($item.TaskName)" -Level Warning }
+    }
+    if ($plan.Count -eq 0) { Write-Log "No missing task registrations found in the golden task directory" -Level Info }
+    return @($plan)
 }
 
 # ============================================================================
@@ -1413,12 +1678,17 @@ function Restore-WindowsSecurityUI {
 }
 
 function Restore-WindowsUpdateSettings {
+    param([switch]$ForceManaged)
     Write-Log "=== WINDOWS UPDATE (FULL REPAIR) ===" -Level Section
 
-    # ---- Remove ALL WU policies ----
-    Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Silent
-    Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" -Silent
-    Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching" -Silent
+    # ---- Reset update channel, release targeting, and deferral policies ----
+    $management = Get-PolicyManagementState
+    Reset-WindowsUpdateChannelAndDeferrals -ForceManaged:$ForceManaged
+    if ($ForceManaged -or -not $management.IsManaged) {
+        Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Silent
+        Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" -Silent
+        Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching" -Silent
+    }
 
     # ---- AU policy reversals ----
     @("NoAutoUpdate","AUOptions","AutoInstallMinorUpdates","NoAutoRebootWithLoggedOnUsers",
@@ -1598,13 +1868,20 @@ function Restore-WindowsUpdateSettings {
 }
 
 function Restore-EdgeSettings {
+    param([switch]$ForceManaged)
     Write-Log "=== MICROSOFT EDGE (COMPREHENSIVE) ===" -Level Section
 
-    # Remove all Edge policies (massive list)
-    Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Silent
-    Remove-RegistryKey -Path "HKCU:\SOFTWARE\Policies\Microsoft\Edge" -Silent
-    Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate" -Silent
-    Remove-RegistryKey -Path "HKCU:\SOFTWARE\Policies\Microsoft\EdgeUpdate" -Silent
+    # Preserve enterprise-managed machine policy unless explicitly overridden.
+    $edgeState = Get-EdgePolicyState
+    Write-Log "Edge policy state: $($edgeState.Source)" -Level Info
+    if ($edgeState.Managed -and -not $ForceManaged) {
+        Write-Log "Managed Edge policies preserved; use ForceManaged only for a deliberate enterprise reset" -Level Warning
+    } else {
+        Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Silent
+        Remove-RegistryKey -Path "HKCU:\SOFTWARE\Policies\Microsoft\Edge" -Silent
+        Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate" -Silent
+        Remove-RegistryKey -Path "HKCU:\SOFTWARE\Policies\Microsoft\EdgeUpdate" -Silent
+    }
 
     # Edge (Legacy)
     Remove-RegistryValue -Path "HKCU:\Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Storage\microsoft.microsoftedge_8wekyb3d8bbwe\MicrosoftEdge\Main" -Name "DoNotTrack" -Silent
@@ -2193,6 +2470,7 @@ function Restore-ScheduledTasks {
         @{P="\Microsoft\Windows\Windows Error Reporting\"; N="QueueReporting"}
     ) | ForEach-Object { Enable-ScheduledTaskSafe -TaskPath $_.P -TaskName $_.N -Silent }
 
+    Restore-MissingScheduledTasks | Out-Null
     Write-Log "Scheduled Tasks: Complete" -Level Success
 }
 
@@ -2496,6 +2774,38 @@ function Restore-BackgroundApps {
     Write-Log "Background Apps: Complete" -Level Success
 }
 
+function Get-RestoreFunctionMap {
+    return @{
+        chkPrivacy={Restore-PrivacyTelemetry}; chkCopilot={Restore-CopilotCortanaAI}
+        chkBing={Restore-BingSearchWidgets}; chkCDM={Restore-ContentDeliveryManager}
+        chkSync={Restore-SyncSettings}; chkInsider={Restore-WindowsInsiderSettings}
+        chkBgApps={Restore-BackgroundApps}; chkEnvVars={Restore-EnvironmentVariables}
+        chkNotifications={Restore-NotificationSettings}; chkOOBE={Restore-OOBESettings}
+        chkTaskbar={Restore-TaskbarUI}; chkExplorer={Restore-ExplorerSettings}
+        chkStartMenu={Restore-StartMenuSettings}; chkTheme={Restore-ThemeSettings}
+        chkContextMenus={Restore-ContextMenus}; chkMisc={Restore-MiscPolicies}
+        chkClipboard={Restore-ClipboardSettings}
+        chkWindowsUpdate={Restore-WindowsUpdateSettings}; chkErrorReport={Restore-ErrorReporting}
+        chkEdge={Restore-EdgeSettings}; chkChrome={Restore-ChromeSettings}
+        chkOffice={Restore-OfficeSettings}; chkNvidia={Restore-NvidiaTelemetry}
+        chk3rdParty={Restore-ThirdPartyServices}
+        chkDefender={Restore-DefenderSettings}; chkSmartScreen={Restore-SmartScreenSettings}
+        chkFirewall={Restore-FirewallSettings}; chkUAC={Restore-UACSettings}
+        chkSecurityUI={Restore-WindowsSecurityUI}
+        chkBiometrics={Restore-BiometricsSettings}; chkGaming={Restore-GamingSettings}
+        chkOneDrive={Restore-OneDriveSettings}; chkRemoteDesktop={Restore-RemoteDesktopSettings}
+        chkNetwork={Restore-NetworkSettings}; chkBluetooth={Restore-BluetoothSettings}
+        chkAccessibility={Restore-AccessibilitySettings}; chkInput={Restore-InputSettings}
+        chkPrinting={Restore-PrintingSettings}; chkPower={Restore-PowerSettings}
+        chkMemory={Restore-MemoryPerformance}; chkStorage={Restore-StorageSettings}
+        chkServices={Restore-Services}; chkTasks={Restore-ScheduledTasks}
+        chkHostsFile={Restore-HostsFile}; chkCrypto={Restore-CryptoProtocols}
+        chkFeatures={Restore-WindowsFeatures}; chkAppx={Restore-AppxPackages}
+        chkDevicePrivacy={Restore-DevicePrivacySliders}; chkSearchIndexer={Restore-SearchIndexer -Rebuild}
+        chkStoreChain={Restore-StoreWingetServiceChain}; chkAccount={Restore-AccountSignIn}
+    }
+}
+
 
 # ============================================================================
 # PRE-SCAN DIAGNOSTICS ENGINE (with detailed per-item findings)
@@ -2673,7 +2983,20 @@ function Get-SystemHealthReport {
     }
     if ($details.Count -gt 3) { $issues += "$($details.Count) privacy restrictions detected" }
     elseif ($details.Count -gt 0) { $issues += "$($details.Count) privacy change(s)" }
-    & $addCat "Privacy" "Privacy and Diagnostics" $issues $details $(if($details.Count -gt 3){"Medium"}elseif($details.Count){"Low"}else{"OK"}) @("chkPrivacy","chkBgApps","chkEnvVars")
+    & $addCat "Privacy" "Privacy and Diagnostics" $issues $details $(if($details.Count -gt 3){"Medium"}elseif($details.Count){"Low"}else{"OK"}) @("chkPrivacy","chkBgApps","chkEnvVars","chkDevicePrivacy")
+
+    # --- Device privacy sliders ---
+    $issues = @(); $details = @()
+    $capBase = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore"
+    foreach ($capability in @("webcam","microphone","bluetooth","location","radios")) {
+        $value = (Get-ItemProperty "$capBase\$capability" -Name "Value" -EA 0).Value
+        if ($value -eq "Deny") { $issues += "$capability blocked"; $details += "CapabilityAccessManager: $capability = Deny" }
+        $policyName = "LetAppsAccess$capability"
+        $policyObject = Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" -Name $policyName -EA 0
+        $policy = $policyObject.$policyName
+        if ($null -ne $policy) { $details += "Policy override: LetAppsAccess$capability = $policy" }
+    }
+    & $addCat "DevicePrivacy" "Device Privacy Sliders" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkDevicePrivacy")
 
     # --- Store/Apps ---
     $issues = @(); $details = @()
@@ -2706,9 +3029,12 @@ function Get-SystemHealthReport {
 
     # --- Browsers ---
     $issues = @(); $details = @()
-    if (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge") {
-        $ep = @((Get-Item "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -EA 0).Property)
-        if ($ep.Count -gt 2) { $issues += "Edge: $($ep.Count) policies"; $details += ($ep | Select-Object -First 10 | ForEach-Object { "Edge policy: $_" }) }
+    $edgeState = Get-EdgePolicyState
+    if ($edgeState.HasPolicies) {
+        $issues += "Edge: $($edgeState.MachinePolicies.Count + $edgeState.UserPolicies.Count) policies"
+        $details += "Edge policy source: $($edgeState.Source)"
+        $details += @($edgeState.MachinePolicies | Select-Object -First 10 | ForEach-Object { "Machine Edge policy: $_" })
+        $details += @($edgeState.UserPolicies | Select-Object -First 10 | ForEach-Object { "User Edge policy: $_" })
     }
     if (Test-Path "HKLM:\SOFTWARE\Policies\Google\Chrome") {
         $cp = @((Get-Item "HKLM:\SOFTWARE\Policies\Google\Chrome" -EA 0).Property)
@@ -2716,6 +3042,26 @@ function Get-SystemHealthReport {
     }
     if (Test-Path "HKLM:\SOFTWARE\Policies\Mozilla\Firefox") { $issues += "Firefox has policies"; $details += "Firefox group policies detected" }
     & $addCat "Browsers" "Browser Settings" $issues $details $(if($issues.Count){"Low"}else{"OK"}) @("chkEdge","chkChrome")
+
+    # --- Search indexer ---
+    $issues = @(); $details = @()
+    $searchService = Get-Service -Name "WSearch" -EA 0
+    if ($searchService -and $searchService.StartType -eq "Disabled") {
+        $issues += "Windows Search service disabled"; $details += "Service: WSearch = Disabled"
+    }
+    & $addCat "Search" "Search Indexer" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkSearchIndexer")
+
+    # --- Account sign-in ---
+    $issues = @(); $details = @()
+    $accountState = Get-AccountSignInState
+    foreach ($serviceName in @("wlidsvc","TokenBroker","NgcSvc","NgcCtnrSvc")) {
+        $signInService = Get-Service -Name $serviceName -EA 0
+        if ($signInService -and $signInService.StartType -eq "Disabled") {
+            $issues += "$serviceName disabled"; $details += "Service: $serviceName = Disabled"
+        }
+    }
+    $details += "Sign-in context: $($accountState.AccountKind)"
+    & $addCat "AccountSignIn" "Account Sign-in" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkAccount")
 
     # --- Taskbar/Explorer/UI ---
     $issues = @(); $details = @()
@@ -2878,6 +3224,7 @@ function Import-UndoManifest {
         RelevantCategories = @()
         Summary = ""
         ManifestData = $null
+        FormatVersion = "1"
     }
 
     if (!(Test-Path $ManifestPath)) {
@@ -2893,6 +3240,9 @@ function Import-UndoManifest {
     }
 
     $result.ManifestData = $json
+    if ($json.PSObject.Properties['version']) { $result.FormatVersion = [string]$json.version }
+    elseif ($json.PSObject.Properties['Version']) { $result.FormatVersion = [string]$json.Version }
+    elseif ($json.PSObject.Properties['schemaVersion']) { $result.FormatVersion = [string]$json.schemaVersion }
 
     # Extract AppX packages
     if ($json.PSObject.Properties['AppxPackages'] -or $json.PSObject.Properties['appx_packages'] -or $json.PSObject.Properties['removedApps']) {
@@ -2931,6 +3281,30 @@ function Import-UndoManifest {
                    elseif ($json.PSObject.Properties['registryChanges']) { $json.registryChanges }
                    else { @() }
         $result.RegistryKeys = @($regProp)
+    }
+
+    # Newer manifest formats wrap the same collections in undo/changes/actions
+    # objects. Read those containers without executing any imported operation.
+    foreach ($containerName in @("undo","Undo","changes","Changes","actions","Actions","operations","Operations","restoration","Restoration")) {
+        if (-not $json.PSObject.Properties[$containerName]) { continue }
+        foreach ($item in @($json.$containerName)) {
+            foreach ($property in @($item.PSObject.Properties)) {
+                $propertyName = $property.Name.ToLowerInvariant()
+                $propertyValue = @($property.Value)
+                if ($propertyName -match "appx|appxpackages|removedapps|packages") {
+                    $result.AppxPackages = @($result.AppxPackages) + $propertyValue
+                    if ($propertyValue.Count) { $result.RelevantCategories += "chkAppx" }
+                } elseif ($propertyName -match "service") {
+                    $result.Services = @($result.Services) + $propertyValue
+                    if ($propertyValue.Count) { $result.RelevantCategories += "chkServices" }
+                } elseif ($propertyName -match "task|scheduled") {
+                    $result.Tasks = @($result.Tasks) + $propertyValue
+                    if ($propertyValue.Count) { $result.RelevantCategories += "chkTasks" }
+                } elseif ($propertyName -match "registry|reg") {
+                    $result.RegistryKeys = @($result.RegistryKeys) + $propertyValue
+                }
+            }
+        }
     }
 
     # Map registry changes to relevant categories
@@ -2991,6 +3365,269 @@ function Import-UndoManifest {
     $result.Success = $true
 
     return $result
+}
+
+function Get-RestoreCategoryForImportedChange {
+    param([object]$Operation)
+    $text = "$($Operation.Kind) $($Operation.Path) $($Operation.Name) $($Operation.Raw)"
+    if ($Operation.Kind -eq "Task") { return "chkTasks" }
+    if ($Operation.Kind -eq "Service") {
+        if ($text -match '(?i)wuauserv|usosvc|bits|dosvc') { return "chkWindowsUpdate" }
+        return "chkServices"
+    }
+    if ($Operation.Kind -eq "AppX") { return "chkAppx" }
+    if ($text -match '(?i)edge') { return "chkEdge" }
+    if ($text -match '(?i)smartscreen') { return "chkSmartScreen" }
+    if ($text -match '(?i)defender|securityhealth|msmpeng') { return "chkDefender" }
+    if ($text -match '(?i)firewall|mpssvc|sharedaccess') { return "chkFirewall" }
+    if ($text -match '(?i)windows.?update|wuauserv|usosvc|wuas') { return "chkWindowsUpdate" }
+    if ($text -match '(?i)chrome|google') { return "chkChrome" }
+    if ($text -match '(?i)appx|store|winget|clipsvc|appsvc') { return "chkAppx" }
+    if ($text -match '(?i)scheduled.?task|schtasks|task') { return "chkTasks" }
+    if ($text -match '(?i)service|sc\.exe|diagtrack|dmwappush') { return "chkServices" }
+    if ($text -match '(?i)webcam|camera|microphone|bluetooth|location|appprivacy') { return "chkDevicePrivacy" }
+    if ($text -match '(?i)host[s]? file|drivers\\etc\\hosts') { return "chkHostsFile" }
+    if ($text -match '(?i)search|wsearch|index') { return "chkSearchIndexer" }
+    if ($text -match '(?i)account|tokenbroker|wlidsvc|hello|ngcsvc') { return "chkAccount" }
+    if ($text -match '(?i)privacy|telemetry|datacollection|cortana|copilot') { return "chkPrivacy" }
+    return "chkMisc"
+}
+
+function New-ExternalChangeImportResult {
+    param([string]$Source,[object[]]$Operations)
+    $categories = @($Operations | ForEach-Object {
+        Get-RestoreCategoryForImportedChange -Operation $_
+        $operationText = "$($_.Path) $($_.Name) $($_.Raw)"
+        if ($_.Kind -eq "Task" -and $operationText -match '(?i)windows.?update|updateorchestrator|wuauserv') { "chkWindowsUpdate" }
+    } | Select-Object -Unique)
+    $result = [pscustomobject][ordered]@{
+        Success=($Operations.Count -gt 0); Source=$Source; Operations=@($Operations)
+        RelevantCategories=@($categories); Summary=""
+    }
+    if ($Operations.Count -gt 0) {
+        $result.Summary = "$Source loaded: $($Operations.Count) change(s) mapped to $($categories.Count) restoration categor$(if($categories.Count -eq 1){'y'}else{'ies'})"
+    } else { $result.Summary = "$Source contained no recognizable restoration changes" }
+    return $result
+}
+
+function ConvertTo-ExternalChangeOperations {
+    param([string[]]$Lines,[string]$Source)
+    $operations = @()
+    foreach ($line in @($Lines)) {
+        $raw = [string]$line
+        $trimmed = $raw.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("#") -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("//")) { continue }
+        $operation = $null
+        if ($trimmed -match '(?i)^\s*reg(?:\.exe)?\s+(?<action>add|delete)\s+(?<path>"[^"]+"|\S+)(?:\s+/v\s+(?<name>"[^"]+"|\S+))?(?:\s+/d\s+(?<data>"[^"]+"|\S+))?') {
+            $operation = [pscustomobject]@{
+                Kind="Registry"; Action=$Matches.action; Path=(ConvertTo-SnapshotRegistryPath $Matches.path.Trim('"'))
+                Name=$Matches.name.Trim('"'); Value=$Matches.data.Trim('"'); Raw=$raw
+            }
+        } elseif ($trimmed -match '(?i)(Set-ItemProperty|Remove-ItemProperty)') {
+            $pathMatch = [regex]::Match($trimmed, '(?i)-(?:LiteralPath|Path)\s+(?:"([^"]+)"|''([^'']+)''|(\S+))')
+            $nameMatch = [regex]::Match($trimmed, '(?i)-Name\s+(?:"([^"]+)"|''([^'']+)''|(\S+))')
+            if ($pathMatch.Success) {
+                $pathValue = if ($pathMatch.Groups[1].Success) {$pathMatch.Groups[1].Value} elseif ($pathMatch.Groups[2].Success) {$pathMatch.Groups[2].Value} else {$pathMatch.Groups[3].Value}
+                $nameValue = if ($nameMatch.Groups[1].Success) {$nameMatch.Groups[1].Value} elseif ($nameMatch.Groups[2].Success) {$nameMatch.Groups[2].Value} else {$nameMatch.Groups[3].Value}
+                $operation = [pscustomobject]@{Kind="Registry";Action=if($trimmed -match '(?i)Remove-ItemProperty'){"delete"}else{"add"};Path=$pathValue;Name=$nameValue;Value="";Raw=$raw}
+            }
+        } elseif ($trimmed -match '(?i)\bsc(?:\.exe)?\s+config\s+(?<name>\S+).*?start\s*=\s*(?<value>\S+)') {
+            $operation = [pscustomobject]@{Kind="Service";Action="config";Path="";Name=$Matches.name;Value=$Matches.value;Raw=$raw}
+        } elseif ($trimmed -match '(?i)Set-Service\s+.*?-Name\s+(?:"(?<name>[^"]+)"|(?<name2>\S+)).*?-StartupType\s+(?<value>\S+)') {
+            $serviceName = if ($Matches.name) {$Matches.name} else {$Matches.name2}
+            $operation = [pscustomobject]@{Kind="Service";Action="config";Path="";Name=$serviceName;Value=$Matches.value;Raw=$raw}
+        } elseif ($trimmed -match '(?i)(?:schtasks(?:\.exe)?\s+/change.*?/tn\s+"?(?<name>[^"/]+)"?|(?:Enable|Disable)-ScheduledTask)') {
+            $taskName = if ($Matches.name) {$Matches.name.Trim()} else { $trimmed }
+            $operation = [pscustomobject]@{Kind="Task";Action=if($trimmed -match '(?i)disable'){"disable"}else{"enable"};Path="";Name=$taskName;Value="";Raw=$raw}
+        } elseif ($trimmed -match '(?i)(Add|Remove)-AppxPackage') {
+            $operation = [pscustomobject]@{Kind="AppX";Action=$Matches[1].ToLowerInvariant();Path="";Name=$trimmed;Value="";Raw=$raw}
+        } elseif ($trimmed -match '(?i)(HKLM:|HKCU:|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)') {
+            $operation = [pscustomobject]@{Kind="Registry";Action="unknown";Path=$trimmed;Name="";Value="";Raw=$raw}
+        } elseif ($trimmed -match '(?i)^(Registry|Service|Task|AppX)\s*[:\-]\s*(.+)$') {
+            $operation = [pscustomobject]@{Kind=$Matches[1];Action="unknown";Path="";Name=$Matches[2];Value="";Raw=$raw}
+        }
+        if ($operation) { $operations += $operation }
+    }
+    return @($operations)
+}
+
+function Import-PrivacySexyCompensationLog {
+    param([Parameter(Mandatory=$true)][string]$LogPath)
+    if (-not (Test-Path -LiteralPath $LogPath)) { return (New-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations @()) }
+    $lines = Get-Content -LiteralPath $LogPath -ErrorAction Stop
+    $operations = ConvertTo-ExternalChangeOperations -Lines $lines -Source "privacy.sexy"
+    return (New-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations $operations)
+}
+
+function Import-ChrisTitusWinUtilDiff {
+    param([Parameter(Mandatory=$true)][string]$DiffPath)
+    if (-not (Test-Path -LiteralPath $DiffPath)) { return (New-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations @()) }
+    $lines = Get-Content -LiteralPath $DiffPath -ErrorAction Stop
+    $operations = ConvertTo-ExternalChangeOperations -Lines $lines -Source "Chris Titus WinUtil"
+    return (New-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations $operations)
+}
+
+function Import-RegExportSnapshot {
+    param([Parameter(Mandatory=$true)][string]$RegPath)
+    if (-not (Test-Path -LiteralPath $RegPath)) { throw "Registry export not found: $RegPath" }
+    $entries = @(); $currentPath = $null
+    foreach ($line in @(Get-Content -LiteralPath $RegPath -ErrorAction Stop)) {
+        $trimmed = ([string]$line).Trim()
+        if ($trimmed -match '^\[(.+)\]$') {
+            $currentPath = ConvertTo-SnapshotRegistryPath $Matches[1]
+            continue
+        }
+        if (-not $currentPath -or -not $trimmed -or $trimmed.StartsWith("Windows Registry Editor") -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("-")) { continue }
+        if ($trimmed -notmatch '^(?:"([^"]*)"|@)=(.*)$') { continue }
+        $name = if ($Matches[1] -ne $null) { $Matches[1] } else { "(Default)" }
+        $encoded = $Matches[2]
+        $type = "String"; $value = $encoded
+        if ($encoded -match '(?i)^dword:([0-9a-f]{1,8})$') { $type="DWord"; $value=[Convert]::ToInt32($Matches[1],16) }
+        elseif ($encoded -match '(?i)^qword:([0-9a-f]{1,16})$') { $type="QWord"; $value=[Convert]::ToInt64($Matches[1],16) }
+        elseif ($encoded -match '(?i)^hex(?:\(\d+\))?:') { $type="Binary"; $value=$encoded }
+        elseif ($encoded -match '^"(.*)"$') { $value=$Matches[1] -replace '\\\"','"' -replace '\\\\','\' }
+        $entries += [pscustomobject]@{Path=$currentPath;Name=$name;Type=$type;Value=$value}
+    }
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:RegistrySnapshotSchemaVersion; CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
+        ComputerName=$env:COMPUTERNAME; SourcePath=$RegPath; Entries=@($entries)
+    }
+}
+
+function Compare-RegExportSnapshots {
+    param([Parameter(Mandatory=$true)][string]$BeforePath,[Parameter(Mandatory=$true)][string]$AfterPath)
+    return (Compare-RegistrySnapshots -Before (Import-RegExportSnapshot $BeforePath) -After (Import-RegExportSnapshot $AfterPath))
+}
+
+function Get-RestoreImpactPreview {
+    param([string[]]$SelectedKeys,[object]$HealthReport=$script:HealthReport)
+    $preview = @()
+    foreach ($key in @($SelectedKeys)) {
+        $matching = @($HealthReport.GetEnumerator() | Where-Object { $key -in @($_.Value.FixKeys) })
+        $issueCount = 0; $detailCount = 0; $severity = "OK"
+        foreach ($item in $matching) {
+            $issueCount += [int]$item.Value.IssueCount
+            $detailCount += @($item.Value.Details).Count
+            if ($item.Value.Severity -eq "Critical") { $severity="Critical" }
+            elseif ($item.Value.Severity -eq "High" -and $severity -notin @("Critical")) { $severity="High" }
+            elseif ($item.Value.Severity -eq "Medium" -and $severity -eq "OK") { $severity="Medium" }
+            elseif ($item.Value.Severity -eq "Low" -and $severity -eq "OK") { $severity="Low" }
+        }
+        $preview += [pscustomobject][ordered]@{
+            FixKey=$key; DetectedIssueCount=$issueCount; DetailCount=$detailCount
+            Severity=$severity; HasDetectedIssue=($issueCount -gt 0)
+        }
+    }
+    return @($preview)
+}
+
+function Get-RestoreRollbackDirectory {
+    $directory = Join-Path $env:ProgramData "Restore-WindowsDefaults\rollback"
+    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    return $directory
+}
+
+function New-RestoreRollbackSnapshot {
+    param([string[]]$SelectedKeys)
+    $serviceNames = @(
+        "WinDefend","MpsSvc","BFE","wuauserv","UsoSvc","BITS","DoSvc","WSearch",
+        "AppXSvc","ClipSVC","LicenseManager","InstallService","wlidsvc","TokenBroker",
+        "NgcSvc","NgcCtnrSvc","bthserv","WpnService","DiagTrack"
+    )
+    $serviceNames += @($script:ServiceTaskFingerprintCatalog | ForEach-Object { $_.Services })
+    $serviceNames = @($serviceNames | Select-Object -Unique)
+    $services = @()
+    foreach ($name in $serviceNames) {
+        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
+        if ($service) { $services += [pscustomobject]@{Name=$name;StartType=$service.StartType.ToString()} }
+    }
+    $tasks = @(Get-ScheduledTaskRestoreMatrix -IncludeHealthy)
+    $state = [pscustomobject][ordered]@{
+        SchemaVersion=1; CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
+        ComputerName=$env:COMPUTERNAME; SelectedKeys=@($SelectedKeys)
+        BeforeRegistry=(Get-RegistrySnapshot); Services=@($services); Tasks=@($tasks)
+    }
+    $path = Join-Path (Get-RestoreRollbackDirectory) ("rollback-{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 15), [System.Text.Encoding]::UTF8)
+    $script:LastRollbackPath = $path
+    Write-Log "Rollback snapshot saved: $(Split-Path $path -Leaf)" -Level Info
+    return $path
+}
+
+function Set-RegistrySnapshotValue {
+    param([object]$Entry)
+    if ($Entry.Name -eq "(Default)" -or $Entry.Type -eq "Binary") { return $false }
+    $value = $Entry.Value
+    if ($Entry.Type -eq "MultiString") { $value = @($value) }
+    elseif ($Entry.Type -eq "DWord") { $value = [int]$value }
+    elseif ($Entry.Type -eq "QWord") { $value = [long]$value }
+    return (Set-RegistryValue -Path $Entry.Path -Name $Entry.Name -Value $value -Type $Entry.Type -Silent)
+}
+
+function Invoke-RestoreRollback {
+    param([string]$RollbackPath)
+    if (-not $RollbackPath) {
+        $RollbackPath = @(Get-ChildItem -LiteralPath (Get-RestoreRollbackDirectory) -Filter "rollback-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+    }
+    if (-not $RollbackPath -or -not (Test-Path -LiteralPath $RollbackPath)) { throw "No rollback snapshot is available" }
+    $state = Get-Content -LiteralPath $RollbackPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $before = $state.BeforeRegistry
+    $after = Get-RegistrySnapshot
+    $beforeMap = @{}; $afterMap = @{}
+    foreach ($entry in @($before.Entries)) { $beforeMap["$($entry.Path)|$($entry.Name)"] = $entry }
+    foreach ($entry in @($after.Entries)) { $afterMap["$($entry.Path)|$($entry.Name)"] = $entry }
+    foreach ($key in $afterMap.Keys) {
+        if (-not $beforeMap.ContainsKey($key) -and $afterMap[$key].Name -ne "(Default)") {
+            Remove-RegistryValue -Path $afterMap[$key].Path -Name $afterMap[$key].Name -Silent
+        }
+    }
+    foreach ($entry in @($before.Entries)) { Set-RegistrySnapshotValue -Entry $entry | Out-Null }
+    foreach ($service in @($state.Services)) {
+        Restore-ServiceStartup -ServiceName $service.Name -StartupType $service.StartType -Silent
+    }
+    foreach ($task in @($state.Tasks)) {
+        if ($task.State -eq "Disabled") { Disable-ScheduledTask -TaskPath $task.Path -TaskName $task.Name -ErrorAction SilentlyContinue | Out-Null }
+        elseif ($task.State -eq "Enabled") { Enable-ScheduledTask -TaskPath $task.Path -TaskName $task.Name -ErrorAction SilentlyContinue | Out-Null }
+    }
+    Write-Log "Rollback restored registry, service, and task state from $(Split-Path $RollbackPath -Leaf)" -Level Success
+    return $true
+}
+
+function Register-RestoreAtNextBoot {
+    param([Parameter(Mandatory=$true)][string[]]$SelectedKeys,[switch]$CreateRestorePoint)
+    if ($SelectedKeys.Count -eq 0) { throw "At least one restore category is required" }
+    $directory = Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled"
+    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    $statePath = Join-Path $directory ("restore-{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+    $state = [pscustomobject][ordered]@{
+        SchemaVersion=1; CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
+        SelectedKeys=@($SelectedKeys); CreateRestorePoint=[bool]$CreateRestorePoint
+    }
+    [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
+    $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    if (-not (Test-Path -LiteralPath $runOncePath)) { New-Item -Path $runOncePath -Force | Out-Null }
+    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -NoGui -ResumeScheduledRestore"
+    Set-ItemProperty -Path $runOncePath -Name "RestoreWindowsDefaults" -Value $command -Type String -Force
+    Write-Log "Restore scheduled for next boot: $(Split-Path $statePath -Leaf)" -Level Success
+    return $statePath
+}
+
+function Invoke-ScheduledRestore {
+    $statePath = @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled") -Filter "restore-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+    if (-not $statePath) { throw "No scheduled restore state is available" }
+    $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+    Remove-ItemProperty -Path $runOncePath -Name "RestoreWindowsDefaults" -ErrorAction SilentlyContinue
+    $null = New-RestoreRollbackSnapshot -SelectedKeys $state.SelectedKeys
+    $map = Get-RestoreFunctionMap
+    foreach ($key in @($state.SelectedKeys)) {
+        if (-not $map.ContainsKey($key)) { Write-Log "Scheduled category not recognized: $key" -Level Warning; continue }
+        $script:CurrentCategory = $key
+        & $map[$key]
+    }
+    $script:CurrentCategory = ""
+    Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
+    Write-Log "Scheduled restore completed" -Level Success
 }
 
 # ============================================================================
@@ -3142,6 +3779,7 @@ function Show-MainWindow {
         @{K="chkErrorReport";L="Error Reporting";D="Restores crash reporting and Windows Error Reporting service";On=$true;G="System"}
         @{K="chkPrinting";L="Printing";D="Restores Print Spooler service and print notification service";On=$true;G="System"}
         @{K="chkMisc";L="Misc System Policies";D="Snipping Tool, Copilot autolaunch, location, Maps, DEP";On=$true;G="System"}
+        @{K="chkSearchIndexer";L="Rebuild Search Index";D="Restarts Windows Search and rebuilds its local index database";On=$false;G="System"}
         @{K="chkClipboard";L="Clipboard History and Sync";D="Restores clipboard history and cross-device sync features";On=$true;G="System"}
         @{K="chkPrivacy";L="Privacy and Telemetry";D="Restores app permissions, diagnostics data collection, and tracking defaults";On=$true;G="Privacy"}
         @{K="chkCopilot";L="Copilot, Cortana and AI";D="Removes policy blocks on Windows AI and voice assistant features";On=$true;G="Privacy"}
@@ -3151,6 +3789,7 @@ function Show-MainWindow {
         @{K="chkSync";L="Settings Sync";D="Restores theme, password, language sync across your devices";On=$true;G="Privacy"}
         @{K="chkNotifications";L="Notifications";D="Restores toast notifications, lock screen alerts, and badge counts";On=$true;G="Privacy"}
         @{K="chkEnvVars";L="Developer Telemetry";D="Removes .NET CLI and PowerShell telemetry opt-out variables";On=$true;G="Privacy"}
+        @{K="chkDevicePrivacy";L="Camera, Microphone and Bluetooth Privacy";D="Removes debloat policy locks from device privacy sliders";On=$true;G="Privacy"}
         @{K="chkTaskbar";L="Taskbar Layout";D="Restores Task View, Widgets, Chat, and People icons on taskbar";On=$true;G="LookFeel"}
         @{K="chkExplorer";L="File Explorer";D="Restores This PC folders, recent files, OneDrive icon, ribbon";On=$true;G="LookFeel"}
         @{K="chkStartMenu";L="Start Menu";D="Restores app tracking, recommendations, and layout suggestions";On=$true;G="LookFeel"}
@@ -3164,6 +3803,8 @@ function Show-MainWindow {
         @{K="chkNvidia";L="NVIDIA Telemetry";D="Restores NVIDIA telemetry tasks and scheduled services";On=$true;G="Apps"}
         @{K="chk3rdParty";L="Third-Party App Services";D="Restores Adobe, Dropbox, Razer, Logitech, CCleaner, WMP services";On=$true;G="Apps"}
         @{K="chkAppx";L="Reinstall Removed Windows Apps";D="Tries to restore Calculator, Photos, Store, etc. May take 5+ min";On=$false;G="Apps"}
+        @{K="chkStoreChain";L="Store and WinGet Services";D="Repairs Store licensing, AppX deployment, BITS, and WinGet dependencies";On=$true;G="Apps"}
+        @{K="chkAccount";L="Account Sign-in Components";D="Repairs Microsoft account, Windows Hello, and token broker services without changing account type";On=$true;G="Apps"}
         @{K="chkBluetooth";L="Bluetooth";D="Restores Bluetooth services and audio gateway";On=$true;G="Hardware"}
         @{K="chkBiometrics";L="Biometrics (Windows Hello)";D="Restores fingerprint and face recognition service";On=$true;G="Hardware"}
         @{K="chkGaming";L="Gaming and Xbox";D="Restores Xbox services, Game Bar, and Game DVR";On=$true;G="Hardware"}
@@ -3177,33 +3818,8 @@ function Show-MainWindow {
     )
     $allChkNames = $categories | ForEach-Object { $_.K }
 
-    $funcMap = @{
-        chkPrivacy={Restore-PrivacyTelemetry}; chkCopilot={Restore-CopilotCortanaAI}
-        chkBing={Restore-BingSearchWidgets}; chkCDM={Restore-ContentDeliveryManager}
-        chkSync={Restore-SyncSettings}; chkInsider={Restore-WindowsInsiderSettings}
-        chkBgApps={Restore-BackgroundApps}; chkEnvVars={Restore-EnvironmentVariables}
-        chkNotifications={Restore-NotificationSettings}; chkOOBE={Restore-OOBESettings}
-        chkTaskbar={Restore-TaskbarUI}; chkExplorer={Restore-ExplorerSettings}
-        chkStartMenu={Restore-StartMenuSettings}; chkTheme={Restore-ThemeSettings}
-        chkContextMenus={Restore-ContextMenus}; chkMisc={Restore-MiscPolicies}
-        chkClipboard={Restore-ClipboardSettings}
-        chkWindowsUpdate={Restore-WindowsUpdateSettings}; chkErrorReport={Restore-ErrorReporting}
-        chkEdge={Restore-EdgeSettings}; chkChrome={Restore-ChromeSettings}
-        chkOffice={Restore-OfficeSettings}; chkNvidia={Restore-NvidiaTelemetry}
-        chk3rdParty={Restore-ThirdPartyServices}
-        chkDefender={Restore-DefenderSettings}; chkSmartScreen={Restore-SmartScreenSettings}
-        chkFirewall={Restore-FirewallSettings}; chkUAC={Restore-UACSettings}
-        chkSecurityUI={Restore-WindowsSecurityUI}
-        chkBiometrics={Restore-BiometricsSettings}; chkGaming={Restore-GamingSettings}
-        chkOneDrive={Restore-OneDriveSettings}; chkRemoteDesktop={Restore-RemoteDesktopSettings}
-        chkNetwork={Restore-NetworkSettings}; chkBluetooth={Restore-BluetoothSettings}
-        chkAccessibility={Restore-AccessibilitySettings}; chkInput={Restore-InputSettings}
-        chkPrinting={Restore-PrintingSettings}; chkPower={Restore-PowerSettings}
-        chkMemory={Restore-MemoryPerformance}; chkStorage={Restore-StorageSettings}
-        chkServices={Restore-Services}; chkTasks={Restore-ScheduledTasks}
-        chkHostsFile={Restore-HostsFile}; chkCrypto={Restore-CryptoProtocols}
-        chkFeatures={Restore-WindowsFeatures}; chkAppx={Restore-AppxPackages}
-    }
+    $funcMap = Get-RestoreFunctionMap
+    $script:RestoreFunctionMap = $funcMap
     $friendlyMap = @{}; $categories | ForEach-Object { $friendlyMap[$_.K] = $_.L }
 
     # ================================================================
@@ -3371,6 +3987,7 @@ function Show-MainWindow {
             <Border Grid.Row="2" Background="#161b22" Padding="14,8" BorderBrush="#30363d" BorderThickness="0,1,0,0">
                 <DockPanel>
                     <CheckBox x:Name="chkAutoRestoreC" Content="Create restore point first" IsChecked="True" DockPanel.Dock="Left" VerticalAlignment="Center"/>
+                    <Button x:Name="btnScheduleCustom" Content="Schedule Next Reboot" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="12,8" Margin="0,0,6,0"/>
                     <Button x:Name="btnRunCustom" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="16,8" Background="#238636" Foreground="White" BorderBrush="#238636">
                         <TextBlock Text="Run Selected Fixes" FontWeight="SemiBold"/></Button>
                 </DockPanel>
@@ -3387,6 +4004,7 @@ function Show-MainWindow {
             <Border Grid.Row="1" Background="#0d1117" Padding="20,8">
                 <StackPanel>
                     <ProgressBar x:Name="progressBar" Height="6" Minimum="0" Maximum="100" Value="0" Background="#21262d" Foreground="#238636" BorderThickness="0"/>
+                    <Slider x:Name="timelineScrubber" Minimum="1" Maximum="1" Value="1" TickFrequency="1" IsSnapToTickEnabled="True" Visibility="Collapsed" IsEnabled="False" Margin="0,6,0,0"/>
                     <DockPanel Margin="0,4,0,0">
                         <TextBlock x:Name="txtProgressPercent" Text="0%" Foreground="#8b949e" FontSize="11"/>
                         <TextBlock x:Name="txtProgressStep" Text="" Foreground="#484f58" FontSize="11" DockPanel.Dock="Right" HorizontalAlignment="Right"/>
@@ -3421,6 +4039,7 @@ function Show-MainWindow {
                         <Button x:Name="btnReboot" Visibility="Collapsed" Padding="14,8" Background="#238636" Foreground="White" BorderBrush="#238636">
                             <TextBlock Text="Reboot Now" FontWeight="SemiBold"/></Button>
                         <Button x:Name="btnLater" Content="Close (Reboot Later)" Visibility="Collapsed" Padding="14,8" Margin="6,0,0,0"/>
+                        <Button x:Name="btnRollback" Content="Rollback This Run" Visibility="Collapsed" Padding="14,8" Margin="6,0,0,0"/>
                         <Button x:Name="btnExportReport" Content="Export Report" Visibility="Collapsed" Padding="14,8" Margin="6,0,0,0"/>
                         <Button x:Name="btnViewLog" Content="Open Log File" Visibility="Collapsed" Padding="14,8" Margin="6,0,0,0"/>
                     </StackPanel>
@@ -3457,9 +4076,9 @@ function Show-MainWindow {
         'btnFixAll', 'btnFixDetected', 'btnFixSecurity', 'btnCustom', 'btnScanOnly',
         'chkAutoRestore', 'btnClose',
         'btnBack', 'btnSelectAll', 'btnSelectNone', 'btnSelectSafe',
-        'chkContainer', 'chkAutoRestoreC', 'btnRunCustom',
-        'txtProgressTitle', 'txtProgressSub', 'progressBar', 'txtProgressPercent', 'txtProgressStep',
-        'txtConsole', 'txtStatus', 'btnReboot', 'btnLater', 'btnViewLog',
+        'chkContainer', 'chkAutoRestoreC', 'btnRunCustom', 'btnScheduleCustom',
+        'txtProgressTitle', 'txtProgressSub', 'progressBar', 'timelineScrubber', 'txtProgressPercent', 'txtProgressStep',
+        'txtConsole', 'txtStatus', 'btnReboot', 'btnLater', 'btnRollback', 'btnViewLog',
         'btnImportManifest', 'quickScanPanel', 'quickScanStats',
         'manifestBanner', 'txtManifestSummary',
         'categoryResultsPanel', 'categoryResultsList',
@@ -3471,6 +4090,16 @@ function Show-MainWindow {
     }
     $script:ConsoleBox = $ui.txtConsole
     $script:ConsoleWindow = $window
+    $ui.timelineScrubber.Add_ValueChanged({
+        if ($script:RestoreTimelineLabels -and $script:RestoreTimelineLabels.Count -gt 0) {
+            $timelineIndex = [Math]::Max(0, [Math]::Min($script:RestoreTimelineLabels.Count - 1, [Math]::Round($ui.timelineScrubber.Value) - 1))
+            $timelineKey = $script:RestoreTimelineKeys[$timelineIndex]
+            $timelineLabel = $script:RestoreTimelineLabels[$timelineIndex]
+            $timelineStatus = $script:RestoreTimelineResults[$timelineKey]
+            if (-not $timelineStatus) { $timelineStatus = "Pending" }
+            $ui.txtProgressStep.Text = "Timeline: $timelineLabel - $timelineStatus"
+        }
+    })
 
     # ================================================================
     # POPULATE ALL DYNAMIC CONTENT PROGRAMMATICALLY (safe from XML)
@@ -3658,19 +4287,27 @@ function Show-MainWindow {
     # PRESETS AND RUN LOGIC
     # ================================================================
     $securityOnly = @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto")
-    $safeDefaults = $allChkNames | Where-Object { $_ -ne "chkTheme" -and $_ -ne "chkAppx" }
+    $safeDefaults = $allChkNames | Where-Object { $_ -ne "chkTheme" -and $_ -ne "chkAppx" -and $_ -ne "chkSearchIndexer" }
 
     $runRestore = {
         param($selectedKeys, $doRestorePoint, $scanOnlyMode)
         $ui.pageHome.Visibility = "Collapsed"
         $ui.pageCustom.Visibility = "Collapsed"
         $ui.pageProgress.Visibility = "Visible"
+        $script:RestoreTimelineKeys = @($selectedKeys)
+        $script:RestoreTimelineLabels = @($selectedKeys | ForEach-Object { $friendlyMap[$_] })
+        $script:RestoreTimelineResults = @{}
 
         if ($scanOnlyMode) {
             $ui.txtProgressTitle.Text = "Scanning (preview mode)..."
             $ui.txtProgressSub.Text = "No changes will be made"
         }
         $window.Dispatcher.Invoke([action]{}, "Render")
+
+        if (-not $scanOnlyMode) {
+            try { $null = New-RestoreRollbackSnapshot -SelectedKeys $selectedKeys }
+            catch { Write-Log "Could not create rollback snapshot: $($_.Exception.Message)" -Level Warning }
+        }
 
         # Restore point
         if ($doRestorePoint -and !$scanOnlyMode) {
@@ -3698,6 +4335,13 @@ function Show-MainWindow {
         if ($scanOnlyMode) {
             Write-Log "PREVIEW MODE: No actual changes will be made." -Level Section
             Write-Log "" -Level Info
+            $impactPreview = @(Get-RestoreImpactPreview -SelectedKeys $selectedKeys -HealthReport $script:HealthReport)
+            Write-Log "Pre-flight impact preview:" -Level Section
+            foreach ($impact in $impactPreview) {
+                $impactLabel = $friendlyMap[$impact.FixKey]; if (-not $impactLabel) { $impactLabel = $impact.FixKey }
+                Write-Log "$impactLabel - $($impact.DetectedIssueCount) detected issue(s), $($impact.DetailCount) detail(s), severity $($impact.Severity)" -Level Info
+            }
+            Write-Log "" -Level Info
             foreach ($key in $selectedKeys) {
                 $fn = $friendlyMap[$key]; if (!$fn) { $fn = $key }
                 Write-Log "Would restore: $fn" -Level Info
@@ -3717,6 +4361,11 @@ function Show-MainWindow {
 
         # ---- ACTUAL RESTORATION ----
         $ui.progressBar.Maximum = $selectedKeys.Count
+        $ui.timelineScrubber.Minimum = 1
+        $ui.timelineScrubber.Maximum = [Math]::Max(1, $selectedKeys.Count)
+        $ui.timelineScrubber.Value = 1
+        $ui.timelineScrubber.Visibility = "Visible"
+        $ui.timelineScrubber.IsEnabled = $true
         $ui.categoryResultsPanel.Visibility = "Visible"
         $total = $selectedKeys.Count; $i = 0
 
@@ -3785,6 +4434,8 @@ function Show-MainWindow {
                 "Already OK" { $catStatus.Text = "FIXED"; $catStatus.Foreground = $bc.ConvertFromString("#3fb950") }
                 default      { $catStatus.Text = "SKIPPED"; $catStatus.Foreground = $bc.ConvertFromString("#484f58") }
             }
+            $script:RestoreTimelineResults[$key] = $script:CategoryResults[$fn].Status
+            $ui.timelineScrubber.Value = $i
             $catSP.Children.Add($catStatus) | Out-Null
             $ui.categoryResultsList.Children.Add($catSP) | Out-Null
 
@@ -3829,6 +4480,7 @@ function Show-MainWindow {
         $ui.txtProgressPercent.Text = "Complete"; $ui.txtProgressStep.Text = ""
         $ui.txtStatus.Text = "Please reboot to finish applying changes"
         $ui.btnReboot.Visibility = "Visible"; $ui.btnLater.Visibility = "Visible"
+        $ui.btnRollback.Visibility = "Visible"
         $ui.btnExportReport.Visibility = "Visible"; $ui.btnViewLog.Visibility = "Visible"
         $window.Dispatcher.Invoke([action]{}, "Render")
     }
@@ -3880,10 +4532,24 @@ function Show-MainWindow {
         if ($r -eq "Yes") { & $runRestore $sel $ui.chkAutoRestoreC.IsChecked $false }
     })
 
+    $ui.btnScheduleCustom.Add_Click({
+        $sel = @()
+        foreach ($chk in $allChkNames) { if ($ui[$chk] -and $ui[$chk].IsChecked) { $sel += $chk } }
+        if (!$sel.Count) {
+            [System.Windows.MessageBox]::Show("Select at least one category.", "Nothing Selected", "OK", "Information"); return
+        }
+        try {
+            $scheduledPath = Register-RestoreAtNextBoot -SelectedKeys $sel -CreateRestorePoint:$ui.chkAutoRestoreC.IsChecked
+            [System.Windows.MessageBox]::Show("The selected restore will run once at the next boot.`n`nState: $scheduledPath", "Restore Scheduled", "OK", "Information")
+        } catch {
+            [System.Windows.MessageBox]::Show("Could not schedule restore: $($_.Exception.Message)", "Schedule Error", "OK", "Error")
+        }
+    })
+
     $ui.btnSelectAll.Add_Click({ foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = $true } } })
     $ui.btnSelectNone.Add_Click({ foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = $false } } })
     $ui.btnSelectSafe.Add_Click({
-        foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = ($c -ne "chkTheme" -and $c -ne "chkAppx") } }
+        foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = ($c -ne "chkTheme" -and $c -ne "chkAppx" -and $c -ne "chkSearchIndexer") } }
     })
 
     $ui.btnClose.Add_Click({ $window.Close() })
@@ -3892,6 +4558,15 @@ function Show-MainWindow {
         if ($r -eq "OK") { $window.Close(); Restart-Computer -Force }
     })
     $ui.btnLater.Add_Click({ $window.Close() })
+    $ui.btnRollback.Add_Click({
+        try {
+            Invoke-RestoreRollback -RollbackPath $script:LastRollbackPath
+            $ui.txtStatus.Text = "Rollback complete; reboot if a restored service requires it"
+            [System.Windows.MessageBox]::Show("The registry, service, and task state captured before this run was restored.", "Rollback Complete", "OK", "Information")
+        } catch {
+            [System.Windows.MessageBox]::Show("Rollback failed: $($_.Exception.Message)", "Rollback Error", "OK", "Error")
+        }
+    })
     $ui.btnViewLog.Add_Click({ if (Test-Path $script:LogPath) { Start-Process notepad.exe $script:LogPath } })
 
     # ---- Import Manifest button ----
@@ -3956,6 +4631,46 @@ if ($CompareSnapshot) {
     $currentSnapshot = Get-RegistrySnapshot
     $diff = Compare-RegistrySnapshots -Before $CompareSnapshot -After $currentSnapshot
     Write-Output ($diff | ConvertTo-Json -Depth 12)
+    exit
+}
+
+if ($RollbackLastRun) {
+    Invoke-RestoreRollback
+    exit
+}
+
+if ($ResumeScheduledRestore) {
+    Invoke-ScheduledRestore
+    exit
+}
+
+if ($SecurityReset) {
+    $null = New-RestoreRollbackSnapshot -SelectedKeys @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkSecurityUI")
+    Restore-SecurityCenterFullReset
+    exit
+}
+
+if ($RebuildSearch) {
+    Restore-SearchIndexer -Rebuild
+    exit
+}
+
+if ($ScheduleRestore) {
+    $scheduledKeys = if ($RestoreCategories) { @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+        else { @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkServices","chkTasks") }
+    Register-RestoreAtNextBoot -SelectedKeys $scheduledKeys -CreateRestorePoint
+    exit
+}
+
+if ($RestoreCategories) {
+    $directKeys = @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $directMap = Get-RestoreFunctionMap
+    $null = New-RestoreRollbackSnapshot -SelectedKeys $directKeys
+    foreach ($directKey in $directKeys) {
+        if ($directMap.ContainsKey($directKey)) { $script:CurrentCategory = $directKey; & $directMap[$directKey] }
+        else { Write-Log "Restore category not recognized: $directKey" -Level Warning }
+    }
+    $script:CurrentCategory = ""
     exit
 }
 
