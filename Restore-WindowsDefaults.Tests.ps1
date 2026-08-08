@@ -419,3 +419,168 @@ Describe "Restore-WindowsDefaults action plans" {
         }
     }
 }
+
+Describe "Restore-WindowsDefaults rollback journals" {
+    It "writes an atomic v2 journal with operation and whole-file integrity" {
+        $journalPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-journal-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        $plan = [pscustomobject]@{
+            SchemaVersion=1; ToolVersion=$script:Version; PlanHash=('a' * 64); Profile=[pscustomobject]@{Status="Ready"}
+            Operations=@([pscustomobject]@{
+                OperationId="op-0001"; CategoryKey="chkTest"; Kind="RegistryValue"; Action="Set"; Target="HKCU:\Software\RwdJournalTest\Value"
+                Scope="CurrentUser"; Risk="Low"; Before=[pscustomobject]@{Exists=$false;KeyExists=$false;Path="HKCU:\Software\RwdJournalTest";Name="Value";Type=$null;Value=$null}
+                After=[pscustomobject]@{Exists=$true;Path="HKCU:\Software\RwdJournalTest";Name="Value";Type="DWord";Value=1}
+                RollbackAction="Restore before state"; Exact=$true; CanExecute=$true; Reason=$null; Source="test"; Dependency="test"; Verification="value exists"; Metadata=$null
+            })
+        }
+        try {
+            $created = New-RestoreRollbackJournal -ActionPlan $plan -SelectedKeys @("chkTest") -OutputPath $journalPath -BeforeRegistry ([pscustomobject]@{SchemaVersion=1;Entries=@()})
+            $created | Should -Be $journalPath
+            $journal = Read-RestoreRollbackJournal -Path $journalPath
+
+            $journal.SchemaVersion | Should -Be 2
+            $journal.State | Should -Be "Prepared"
+            $journal.PlanHash | Should -Be ('a' * 64)
+            $journal.Integrity.Algorithm | Should -Be "SHA256"
+            $journal.Integrity.JournalHash | Should -Match '^[a-f0-9]{64}$'
+            $journal.Operations[0].OperationId | Should -Be "op-0001"
+            $journal.Operations[0].OperationHash | Should -Match '^[a-f0-9]{64}$'
+            @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetDirectoryName($journalPath)) -Filter (([System.IO.Path]::GetFileName($journalPath)) + ".tmp-*") -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath ([System.IO.Path]::GetDirectoryName($journalPath)) -Filter (([System.IO.Path]::GetFileName($journalPath)) + ".bak-*") -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+        } finally {
+            if (Test-Path -LiteralPath $journalPath) { Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "round-trips a registry value and removes a key created by the plan" {
+        $keyPath = "HKCU:\Software\RwdJournalRegistry-$([guid]::NewGuid().ToString('N'))"
+        $journalPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-registry-journal-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        $plan = [pscustomobject]@{
+            PlanHash=('b' * 64); Profile=[pscustomobject]@{Status="Ready"}
+            Operations=@([pscustomobject]@{
+                OperationId="op-0001"; CategoryKey="chkTest"; Kind="RegistryValue"; Action="Set"; Target="$keyPath\Value"; Scope="CurrentUser"; Risk="Low"
+                Before=[pscustomobject]@{Exists=$false;KeyExists=$false;Path=$keyPath;Name="Value";Type=$null;Value=$null}
+                After=[pscustomobject]@{Exists=$true;Path=$keyPath;Name="Value";Type="DWord";Value=7}
+                RollbackAction="Restore before state"; Exact=$true; CanExecute=$true; Reason=$null; Source="test"; Dependency="test"; Verification="value exists"; Metadata=$null
+            })
+        }
+        $oldSnapshotPaths = $script:RegistrySnapshotPaths
+        $script:RegistrySnapshotPaths = @()
+        try {
+            New-RestoreRollbackJournal -ActionPlan $plan -SelectedKeys @("chkTest") -OutputPath $journalPath -BeforeRegistry ([pscustomobject]@{SchemaVersion=1;Entries=@()}) | Out-Null
+            $execution = Invoke-RestoreActionPlan -ActionPlan $plan -CategoryKey "chkTest"
+            $execution.Errors | Should -Be 0
+            (Get-ItemProperty -LiteralPath $keyPath -Name "Value").Value | Should -Be 7
+            Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $journalPath -State "Committed" | Out-Null
+
+            $rollback = Invoke-RestoreRollback -RollbackPath $journalPath
+            $rollback.Success | Should -BeTrue
+            $rollback.State | Should -Be "RolledBack"
+            (Test-Path -LiteralPath $keyPath) | Should -BeFalse
+            (Read-RestoreRollbackJournal -Path $journalPath).Operations[0].JournalStatus | Should -Be "RolledBack"
+            (Read-RestoreRollbackJournal -Path $journalPath).Operations[0].RollbackStatus | Should -Be "RolledBack"
+        } finally {
+            $script:RegistrySnapshotPaths = $oldSnapshotPaths
+            if (Test-Path -LiteralPath $keyPath) { Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $journalPath) { Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "round-trips supported inline file bytes" {
+        $filePath = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-file-{0}.txt" -f ([guid]::NewGuid().ToString("N")))
+        $journalPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-file-journal-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        $beforeText = "before content`r`n"
+        $afterText = "after content`r`n"
+        [System.IO.File]::WriteAllText($filePath, $beforeText, [System.Text.UTF8Encoding]::new($false))
+        $oldSnapshotPaths = $script:RegistrySnapshotPaths
+        $script:RegistrySnapshotPaths = @()
+        try {
+            $script:ActionPlanCapture = $true
+            $script:CapturedActionOperations = New-Object System.Collections.Generic.List[object]
+            $script:CurrentCategory = "chkTest"
+            Invoke-RestoreTextFileMutation -Path $filePath -Content $afterText -Scope "CurrentUser" -Silent | Should -BeFalse
+            $captured = $script:CapturedActionOperations[0]
+            $script:ActionPlanCapture = $false
+            $script:CurrentCategory = ""
+            $plan = [pscustomobject]@{PlanHash=('c' * 64);Profile=[pscustomobject]@{Status="Ready"};Operations=@([pscustomobject]@{
+                OperationId="op-0001"; CategoryKey="chkTest"; Kind=$captured.Kind; Action=$captured.Action; Target=$captured.Target; Scope=$captured.Scope; Risk="Low"
+                Before=$captured.Before; After=$captured.After; RollbackAction=$captured.RollbackAction; Exact=$true; CanExecute=$true; Reason=$captured.Reason; Source="test"; Dependency="test"; Verification=$captured.Verification; Metadata=$captured.Metadata
+            })}
+            New-RestoreRollbackJournal -ActionPlan $plan -SelectedKeys @("chkTest") -OutputPath $journalPath -BeforeRegistry ([pscustomobject]@{SchemaVersion=1;Entries=@()}) | Out-Null
+            $execution = Invoke-RestoreActionPlan -ActionPlan $plan -CategoryKey "chkTest"
+            $execution.Errors | Should -Be 0
+            [System.IO.File]::ReadAllText($filePath) | Should -Be $afterText
+            Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $journalPath -State "Committed" | Out-Null
+
+            $rollback = Invoke-RestoreRollback -RollbackPath $journalPath
+            $rollback.Success | Should -BeTrue
+            [System.IO.File]::ReadAllText($filePath) | Should -Be $beforeText
+        } finally {
+            $script:RegistrySnapshotPaths = $oldSnapshotPaths
+            $script:ActionPlanCapture = $false
+            $script:CurrentCategory = ""
+            if (Test-Path -LiteralPath $filePath) { Remove-Item -LiteralPath $filePath -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $journalPath) { Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "rejects a tampered journal before touching the restored state" {
+        $keyPath = "HKCU:\Software\RwdJournalTamper-$([guid]::NewGuid().ToString('N'))"
+        $journalPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-tamper-journal-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        $plan = [pscustomobject]@{
+            PlanHash=('d' * 64); Profile=[pscustomobject]@{Status="Ready"}
+            Operations=@([pscustomobject]@{
+                OperationId="op-0001"; CategoryKey="chkTest"; Kind="RegistryValue"; Action="Set"; Target="$keyPath\Value"; Scope="CurrentUser"; Risk="Low"
+                Before=[pscustomobject]@{Exists=$false;KeyExists=$false;Path=$keyPath;Name="Value";Type=$null;Value=$null}
+                After=[pscustomobject]@{Exists=$true;Path=$keyPath;Name="Value";Type="DWord";Value=9}
+                RollbackAction="Restore before state"; Exact=$true; CanExecute=$true; Reason=$null; Source="test"; Dependency="test"; Verification="value exists"; Metadata=$null
+            })
+        }
+        $oldSnapshotPaths = $script:RegistrySnapshotPaths
+        $script:RegistrySnapshotPaths = @()
+        try {
+            New-RestoreRollbackJournal -ActionPlan $plan -SelectedKeys @("chkTest") -OutputPath $journalPath -BeforeRegistry ([pscustomobject]@{SchemaVersion=1;Entries=@()}) | Out-Null
+            Invoke-RestoreActionPlan -ActionPlan $plan -CategoryKey "chkTest" | Out-Null
+            (Get-ItemProperty -LiteralPath $keyPath -Name "Value").Value | Should -Be 9
+            Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $journalPath -State "Committed" | Out-Null
+            $tampered = Get-Content -LiteralPath $journalPath -Raw | ConvertFrom-Json
+            $tampered.PlanHash = ('e' * 64)
+            $tampered | ConvertTo-Json -Depth 50 | Set-Content -LiteralPath $journalPath -Encoding UTF8
+
+            { Read-RestoreRollbackJournal -Path $journalPath } | Should -Throw
+            { Invoke-RestoreRollback -RollbackPath $journalPath } | Should -Throw
+            (Get-ItemProperty -LiteralPath $keyPath -Name "Value").Value | Should -Be 9
+        } finally {
+            $script:RegistrySnapshotPaths = $oldSnapshotPaths
+            if (Test-Path -LiteralPath $keyPath) { Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $journalPath) { Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "resumes a prepared journal and commits its pending operation" {
+        $keyPath = "HKCU:\Software\RwdJournalResume-$([guid]::NewGuid().ToString('N'))"
+        $journalPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-resume-journal-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        $plan = [pscustomobject]@{
+            PlanHash=('f' * 64); Profile=[pscustomobject]@{Status="Ready"}
+            Operations=@([pscustomobject]@{
+                OperationId="op-0001"; CategoryKey="chkTest"; Kind="RegistryValue"; Action="Set"; Target="$keyPath\Value"; Scope="CurrentUser"; Risk="Low"
+                Before=[pscustomobject]@{Exists=$false;KeyExists=$false;Path=$keyPath;Name="Value";Type=$null;Value=$null}
+                After=[pscustomobject]@{Exists=$true;Path=$keyPath;Name="Value";Type="DWord";Value=11}
+                RollbackAction="Restore before state"; Exact=$true; CanExecute=$true; Reason=$null; Source="test"; Dependency="test"; Verification="value exists"; Metadata=$null
+            })
+        }
+        $oldSnapshotPaths = $script:RegistrySnapshotPaths
+        $script:RegistrySnapshotPaths = @()
+        try {
+            New-RestoreRollbackJournal -ActionPlan $plan -SelectedKeys @("chkTest") -OutputPath $journalPath -BeforeRegistry ([pscustomobject]@{SchemaVersion=1;Entries=@()}) | Out-Null
+            $resumed = Resume-RestoreRollbackJournal -JournalPath $journalPath
+            $resumed.Success | Should -BeTrue
+            $resumed.State | Should -Be "Committed"
+            (Get-ItemProperty -LiteralPath $keyPath -Name "Value").Value | Should -Be 11
+            (Read-RestoreRollbackJournal -Path $journalPath).Operations[0].JournalStatus | Should -Be "Completed"
+        } finally {
+            $script:RegistrySnapshotPaths = $oldSnapshotPaths
+            if (Test-Path -LiteralPath $keyPath) { Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $journalPath) { Remove-Item -LiteralPath $journalPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}

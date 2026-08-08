@@ -8,6 +8,7 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 - Added versioned `-WhatIf`/`-PlanPath` action plans with capability decisions, registry/service/task state where statically known, operation hashes, and explicit review boundaries for remaining category-level operations.
 - Routed fully represented registry, service, and scheduled-task operations through `ShouldProcess`-aware mutation primitives and the versioned plan executor.
 - Made mapped category restore paths capture exact registry, service, task, file, AppX, environment, optional-feature, native-command, and restore-point operations before execution, with stale-state precondition checks shared by CLI and GUI.
+- Replaced run snapshots with v2 atomic rollback journals containing per-operation state, SHA-256 integrity, resumable execution, tamper refusal, inverse adapters, and legacy snapshot compatibility.
 
 ## [v4.4.0] - 2026-08-03
 

@@ -26,7 +26,7 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 - **Debloat fingerprinting** - Detects evidence from O&O ShutUp10, WPD, ThisIsWin11, Sophia Script, and Win10Privacy without executing their code
 - **Baseline inventory** - Exports and compares registry/AppX state, including provisioned-package and offline-WIM comparisons
 - **Managed-device safety** - Detects domain/MDM policy ownership and preserves managed policy containers unless explicitly overridden
-- **Operational recovery** - Adds security reset, Search index rebuild, Store/WinGet repair, privacy-slider repair, rollback snapshots, and next-boot restore scheduling
+- **Operational recovery** - Adds security reset, Search index rebuild, Store/WinGet repair, privacy-slider repair, integrity-checked rollback journals, and next-boot restore scheduling
 - **Deployment wrappers** - Read-only compliance and optional remediation entry points for Intune and Configuration Manager
 - **HTML report export** - Save a detailed dark-themed report of everything restored with before/after states
 - **Safe by default** - Creates a System Restore point before making changes
@@ -68,6 +68,8 @@ The same script supports non-GUI workflows for automation and diagnostics:
 .\Restore-WindowsDefaults.ps1 -NoGui -CompareSnapshot .\before.json
 .\Restore-WindowsDefaults.ps1 -NoGui -WhatIf -RestoreCategories chkDefender,chkWindowsUpdate
 .\Restore-WindowsDefaults.ps1 -NoGui -PlanPath .\restore-plan.json -RestoreCategories chkDefender,chkWindowsUpdate
+.\Restore-WindowsDefaults.ps1 -NoGui -RollbackLastRun
+.\Restore-WindowsDefaults.ps1 -NoGui -ResumeRestoreJournal
 
 # Run a bounded restore tier or a targeted operational workflow
 .\Restore-WindowsDefaults.ps1 -RestoreTier Quick
@@ -172,6 +174,7 @@ After restoration completes, click **Export Report** to save a detailed HTML rep
 - **Detailed Logging** - Complete log saved to Desktop with timestamps
 - **Preview Mode** - See exactly what would change before committing
 - **Versioned action plans** - Export scoped operations with before/after state, risk, rollback metadata, capability decisions, and a plan hash
+- **Integrity-checked rollback** - Each restore run keeps an atomic journal under `%ProgramData%\Restore-WindowsDefaults\rollback`; interrupted runs can resume, and tampered journals are refused before mutation
 - **Graceful Errors** - Continues through errors, reports them at the end
 - **Category Results** - FIXED, PARTIAL, FAILED, SKIPPED indicators show exactly what happened
 

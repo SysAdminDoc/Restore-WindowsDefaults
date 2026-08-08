@@ -9,6 +9,7 @@ param(
     [switch]$RebuildSearch,
     [switch]$ScheduleRestore,
     [switch]$ResumeScheduledRestore,
+    [switch]$ResumeRestoreJournal,
     [switch]$RollbackLastRun,
     [string]$RestoreCategories,
     [ValidateSet("Quick","Full","Nuclear")][string]$RestoreTier,
@@ -54,6 +55,12 @@ $script:ActionPlanSchemaVersion = 1
 $script:LastActionPlan = $null
 $script:ActionPlanCapture = $false
 $script:CapturedActionOperations = New-Object System.Collections.Generic.List[object]
+$script:RollbackJournalSchemaVersion = 2
+$script:RollbackJournalMaxEntries = 10
+$script:RollbackJournalMaxBytes = 50MB
+$script:RollbackInlineFileBytes = 4MB
+$script:ActiveRollbackJournalPath = $null
+$script:ActiveRollbackJournal = $null
 $script:LogPath = "$env:USERPROFILE\Desktop\WindowsRestore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:ChangesCount = 0
 $script:ErrorsCount = 0
@@ -79,6 +86,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($RebuildSearch) { $relaunchArgs += "-RebuildSearch" }
     if ($ScheduleRestore) { $relaunchArgs += "-ScheduleRestore" }
     if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
+    if ($ResumeRestoreJournal) { $relaunchArgs += "-ResumeRestoreJournal" }
     if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
     if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
     if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
@@ -103,6 +111,7 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($RebuildSearch) { $relaunchArgs += "-RebuildSearch" }
     if ($ScheduleRestore) { $relaunchArgs += "-ScheduleRestore" }
     if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
+    if ($ResumeRestoreJournal) { $relaunchArgs += "-ResumeRestoreJournal" }
     if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
     if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
     if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
@@ -266,7 +275,7 @@ function Set-RegistryValue {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord", [switch]$Silent)
     try {
-        $before = if (Test-Path $Path) { Get-RestoreRegistryPlanState -Path $Path -Name $Name } else { [pscustomobject]@{Exists=$false;Path=$Path;Name=$Name;Type=$null;Value=$null} }
+        $before = Get-RestoreRegistryPlanState -Path $Path -Name $Name
         if ($script:ActionPlanCapture) {
             Add-RestoreActionPlanOperation -Kind "RegistryValue" -Action "Set" -Target "$Path\$Name" -Before $before -After ([pscustomobject]@{Exists=$true;Path=$Path;Name=$Name;Type=$Type;Value=$Value}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" })
             return $false
@@ -341,10 +350,11 @@ function Restore-ServiceStartup {
     try {
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($script:ActionPlanCapture) {
-            $exists = $null -ne $svc
-            $currentType = if($exists){$svc.StartType.ToString()}else{$null}
+            $before = Get-RestoreServicePlanState -ServiceName $ServiceName
+            $exists = [bool]$before.Exists
+            $currentType = $before.StartType
             $needsChange = $exists -and $currentType -ine $StartupType
-            Add-RestoreActionPlanOperation -Kind "Service" -Action $(if($needsChange){"SetStartupType"}else{"NoOp"}) -Target "Service:$ServiceName" -Before ([pscustomobject]@{Exists=$exists;StartType=$currentType}) -After ([pscustomobject]@{Exists=$true;StartType=$StartupType}) -Scope "Machine" -RollbackAction "Restore captured service startup type" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Service is not installed"}else{"Service startup type already matches"}) -Verification "Service startup type equals $StartupType"
+            Add-RestoreActionPlanOperation -Kind "Service" -Action $(if($needsChange){"SetStartupType"}else{"NoOp"}) -Target "Service:$ServiceName" -Before $before -After ([pscustomobject][ordered]@{Exists=$true;Name=$ServiceName;StartType=$StartupType;Status=$null;ServiceState=$null;StartName=$before.StartName;PathName=$before.PathName;DelayedAutoStart=$before.DelayedAutoStart}) -Scope "Machine" -RollbackAction "Restore captured service configuration" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Service is not installed"}else{"Service startup type already matches"}) -Verification "Service startup type equals $StartupType"
             return $false
         }
         if ($svc) {
@@ -368,10 +378,11 @@ function Enable-ScheduledTaskSafe {
     try {
         $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($script:ActionPlanCapture) {
-            $exists = $null -ne $task
-            $state = if($exists -and $task.State){$task.State.ToString()}else{$null}
+            $before = Get-RestoreScheduledTaskPlanState -TaskPath $TaskPath -TaskName $TaskName
+            $exists = [bool]$before.Exists
+            $state = $before.State
             $needsChange = $exists -and $state -eq "Disabled"
-            Add-RestoreActionPlanOperation -Kind "ScheduledTask" -Action $(if($needsChange){"Enable"}else{"NoOp"}) -Target "Task:$TaskPath$TaskName" -Before ([pscustomobject]@{Exists=$exists;State=$state}) -After ([pscustomobject]@{Exists=$true;State="Enabled"}) -Scope "Machine" -RollbackAction "Restore captured task state" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Scheduled task is not installed"}else{"Scheduled task is already enabled"}) -Verification "Scheduled task is enabled"
+            Add-RestoreActionPlanOperation -Kind "ScheduledTask" -Action $(if($needsChange){"Enable"}else{"NoOp"}) -Target "Task:$TaskPath$TaskName" -Before $before -After ([pscustomobject][ordered]@{Exists=$true;Path=$TaskPath;Name=$TaskName;State="Enabled";Xml=$before.Xml;XmlSha256=$before.XmlSha256}) -Scope "Machine" -RollbackAction "Restore captured task configuration and state" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Scheduled task is not installed"}else{"Scheduled task is already enabled"}) -Verification "Scheduled task is enabled"
             return $false
         }
         if ($task) {
@@ -389,20 +400,93 @@ function Enable-ScheduledTaskSafe {
     return $false
 }
 
+function Get-RestoreSha256 {
+    param([Parameter(Mandatory=$true)][byte[]]$Bytes)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return (([BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace "-", "").ToLowerInvariant()) }
+    finally { $sha.Dispose() }
+}
+
+function Get-RestoreJsonSha256 {
+    param([Parameter(Mandatory=$true)][object]$Value)
+    $json = $Value | ConvertTo-Json -Depth 50 -Compress
+    return (Get-RestoreSha256 -Bytes ([Text.Encoding]::UTF8.GetBytes($json)))
+}
+
+function Get-RestoreServicePlanState {
+    param([Parameter(Mandatory=$true)][string]$ServiceName)
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    $cimService = $null
+    try {
+        $escapedName = $ServiceName.Replace("'", "''")
+        $cimService = Get-CimInstance -ClassName Win32_Service -Filter "Name='$escapedName'" -ErrorAction Stop | Select-Object -First 1
+    } catch { Write-Verbose "Could not read CIM service state for $ServiceName" }
+    if (-not $service -and -not $cimService) {
+        return [pscustomobject][ordered]@{
+            Exists=$false; Name=$ServiceName; Status=$null; ServiceState=$null; StartType=$null
+            StartName=$null; PathName=$null; DelayedAutoStart=$null
+        }
+    }
+    return [pscustomobject][ordered]@{
+        Exists=$true; Name=$ServiceName
+        Status=if($service -and $service.Status){$service.Status.ToString()}else{$null}
+        ServiceState=if($cimService){[string]$cimService.State}else{if($service -and $service.Status){$service.Status.ToString()}else{$null}}
+        StartType=if($service -and $service.StartType){$service.StartType.ToString()}else{if($cimService){[string]$cimService.StartMode}else{$null}}
+        StartName=if($cimService){[string]$cimService.StartName}else{$null}
+        PathName=if($cimService){[string]$cimService.PathName}else{$null}
+        DelayedAutoStart=if($cimService -and $cimService.PSObject.Properties["DelayedAutoStart"]){[bool]$cimService.DelayedAutoStart}else{$null}
+    }
+}
+
+function Get-RestoreScheduledTaskPlanState {
+    param([Parameter(Mandatory=$true)][string]$TaskPath,[Parameter(Mandatory=$true)][string]$TaskName)
+    $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
+    if (-not $task) {
+        return [pscustomobject][ordered]@{Exists=$false;Path=$TaskPath;Name=$TaskName;State=$null;Xml=$null;XmlSha256=$null}
+    }
+    $xml = $null
+    try { $xml = (@(Export-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop) -join "`n") } catch { Write-Verbose "Could not export scheduled task XML for $TaskPath$TaskName" }
+    $rawState = if($task.State){$task.State.ToString()}else{$null}
+    return [pscustomobject][ordered]@{
+        Exists=$true; Path=$TaskPath; Name=$TaskName; State=if($rawState -eq "Disabled"){"Disabled"}else{"Enabled"}; RawState=$rawState
+        Xml=$xml; XmlSha256=if($xml){Get-RestoreSha256 -Bytes ([Text.Encoding]::UTF8.GetBytes($xml))}else{$null}
+    }
+}
+
+function Get-RestoreAppxPlanState {
+    param([Parameter(Mandatory=$true)][string]$PackageName,[string]$Scope="CurrentUser")
+    $allUsers = $Scope -in @("AllUsers","Provisioned")
+    $packages = @(Get-AppxPackageSafe -Name $PackageName -AllUsers:$allUsers | Where-Object { $_ })
+    $summaries = @($packages | ForEach-Object {
+        [pscustomobject][ordered]@{
+            Name=[string]$_.Name; FullName=[string]$_.PackageFullName; Version=[string]$_.Version
+            InstallLocation=[string]$_.InstallLocation; PackageFamilyName=[string]$_.PackageFamilyName
+        }
+    })
+    return [pscustomobject][ordered]@{
+        PackageName=$PackageName; Scope=$Scope; Installed=($summaries.Count -gt 0); Packages=$summaries
+    }
+}
+
 function Get-RestoreFilePlanState {
     param([Parameter(Mandatory=$true)][string]$Path)
     try {
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         $hash = $null
+        $contentBase64 = $null
         if (-not $item.PSIsContainer) {
-            try { $hash = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { }
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($Path)
+                $hash = Get-RestoreSha256 -Bytes $bytes
+                if ($bytes.Length -le $script:RollbackInlineFileBytes) { $contentBase64 = [Convert]::ToBase64String($bytes) }
+            } catch { Write-Verbose "Could not hash or inline file bytes for $Path" }
         }
         return [pscustomobject][ordered]@{
             Exists=$true; Path=$Path; IsDirectory=[bool]$item.PSIsContainer; Length=if($item.PSIsContainer){$null}else{[int64]$item.Length}
-            LastWriteTimeUtc=$item.LastWriteTimeUtc.ToString("o"); Sha256=$hash
+            LastWriteTimeUtc=$item.LastWriteTimeUtc.ToString("o"); Sha256=$hash; ContentBase64=$contentBase64
         }
     } catch {
-        return [pscustomobject][ordered]@{ Exists=$false; Path=$Path; IsDirectory=$false; Length=$null; LastWriteTimeUtc=$null; Sha256=$null }
+        return [pscustomobject][ordered]@{ Exists=$false; Path=$Path; IsDirectory=$false; Length=$null; LastWriteTimeUtc=$null; Sha256=$null; ContentBase64=$null }
     }
 }
 
@@ -472,7 +556,7 @@ function Invoke-RestoreTextFileMutation {
         }
         if ($script:WhatIfRequested -or $sameContent) { return $false }
         if (-not $PSCmdlet.ShouldProcess($Path, "write planned text file content")) { return $false }
-        [System.IO.File]::WriteAllText($Path, $Content, [System.Text.Encoding]::UTF8)
+        [System.IO.File]::WriteAllBytes($Path, $contentBytes)
         if (-not $Silent) { Write-Log "Wrote text file: $Path" -Level Success }
         $script:ChangesCount++
         return $true
@@ -495,7 +579,8 @@ function Invoke-RestoreServiceControl {
         $status = if($exists){$service.Status.ToString()}else{$null}
         $needsChange = $exists -and (($Action -eq "Start" -and $status -eq "Stopped") -or ($Action -eq "Stop" -and $status -ne "Stopped"))
         if ($script:ActionPlanCapture) {
-            Add-RestoreActionPlanOperation -Kind "ServiceControl" -Action $(if($needsChange){$Action}else{"NoOp"}) -Target "Service:$ServiceName" -Before ([pscustomobject]@{Exists=$exists;Status=$status}) -After ([pscustomobject]@{Exists=$true;Status=if($Action -eq "Start"){"Running"}else{"Stopped"}}) -Scope "Machine" -RollbackAction "Restore captured service running state" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Service is not installed"}else{"Service already has the requested running state"}) -Verification "Service status is $(if($Action -eq "Start"){"Running"}else{"Stopped"})"
+            $before = Get-RestoreServicePlanState -ServiceName $ServiceName
+            Add-RestoreActionPlanOperation -Kind "ServiceControl" -Action $(if($needsChange){$Action}else{"NoOp"}) -Target "Service:$ServiceName" -Before $before -After ([pscustomobject][ordered]@{Exists=$true;Name=$ServiceName;Status=if($Action -eq "Start"){"Running"}else{"Stopped"};ServiceState=if($Action -eq "Start"){"Running"}else{"Stopped"}}) -Scope "Machine" -RollbackAction "Restore captured service running state" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Service is not installed"}else{"Service already has the requested running state"}) -Verification "Service status is $(if($Action -eq "Start"){"Running"}else{"Stopped"})"
             return $false
         }
         if ($script:WhatIfRequested -or -not $needsChange) { return $false }
@@ -527,10 +612,11 @@ function Invoke-RestoreScheduledTaskState {
         if ([string]::IsNullOrWhiteSpace($TaskPath) -or [string]::IsNullOrWhiteSpace($TaskName)) { throw "Scheduled task path and name are required" }
         $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
         $exists = $null -ne $task
-        $state = if($exists -and $task.State){$task.State.ToString()}else{$null}
+        $state = if($exists){(Get-RestoreScheduledTaskPlanState -TaskPath $TaskPath -TaskName $TaskName).State}else{$null}
         $needsChange = $exists -and (($Action -eq "Enable" -and $state -eq "Disabled") -or ($Action -eq "Disable" -and $state -ne "Disabled"))
         if ($script:ActionPlanCapture) {
-            Add-RestoreActionPlanOperation -Kind "ScheduledTask" -Action $(if($needsChange){$Action}else{"NoOp"}) -Target "Task:$TaskPath$TaskName" -Before ([pscustomobject]@{Exists=$exists;State=$state}) -After ([pscustomobject]@{Exists=$true;State=if($Action -eq "Enable"){"Enabled"}else{"Disabled"}}) -Scope "Machine" -RollbackAction "Restore captured task state" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Scheduled task is not installed"}else{"Scheduled task already has the requested state"}) -Verification "Scheduled task is $(if($Action -eq "Enable"){"enabled"}else{"disabled"})"
+            $before = Get-RestoreScheduledTaskPlanState -TaskPath $TaskPath -TaskName $TaskName
+            Add-RestoreActionPlanOperation -Kind "ScheduledTask" -Action $(if($needsChange){$Action}else{"NoOp"}) -Target "Task:$TaskPath$TaskName" -Before $before -After ([pscustomobject][ordered]@{Exists=$true;Path=$TaskPath;Name=$TaskName;State=if($Action -eq "Enable"){"Enabled"}else{"Disabled"};Xml=$before.Xml;XmlSha256=$before.XmlSha256}) -Scope "Machine" -RollbackAction "Restore captured task configuration and state" -CanExecute:$needsChange -Reason $(if($needsChange){$null}elseif(-not $exists){"Scheduled task is not installed"}else{"Scheduled task already has the requested state"}) -Verification "Scheduled task is $(if($Action -eq "Enable"){"enabled"}else{"disabled"})"
             return $false
         }
         if ($script:WhatIfRequested -or -not $needsChange) { return $false }
@@ -589,9 +675,10 @@ function Invoke-RestoreAppxRegistration {
         [switch]$Silent
     )
     $target = if($ManifestPath){"$PackageName ($ManifestPath)"}else{"$PackageName ($PackageFamilyName)"}
-    $installedBefore = @((Get-AppxPackageSafe -Name $PackageName)).Count -gt 0
-    $before = [pscustomobject][ordered]@{PackageName=$PackageName;Installed=$installedBefore;ManifestPath=$ManifestPath;PackageFamilyName=$PackageFamilyName}
-    $after = [pscustomobject][ordered]@{PackageName=$PackageName;Installed=$true;Scope=$Scope}
+    $before = Get-RestoreAppxPlanState -PackageName $PackageName -Scope $Scope
+    $before | Add-Member -NotePropertyName ManifestPath -NotePropertyValue $ManifestPath
+    $before | Add-Member -NotePropertyName PackageFamilyName -NotePropertyValue $PackageFamilyName
+    $after = [pscustomobject][ordered]@{PackageName=$PackageName;Installed=$true;Scope=$Scope;ManifestPath=$ManifestPath;PackageFamilyName=$PackageFamilyName}
     if ($script:ActionPlanCapture) {
         Add-RestoreActionPlanOperation -Kind "AppX" -Action "Register" -Target $target -Before $before -After $after -Scope $Scope -RollbackAction "Restore captured AppX package state" -Risk "High" -Verification "Package is present in the requested scope" -Metadata ([pscustomobject]@{PackageName=$PackageName;ManifestPath=$ManifestPath;PackageFamilyName=$PackageFamilyName;Scope=$Scope})
         return [pscustomobject]@{Success=$false;Planned=$true;Target=$target}
@@ -3564,8 +3651,11 @@ function Invoke-RestoreSelection {
         Write-Log "Skipped $($evaluation.Key): $($evaluation.Reason)" -Level Warning
     }
     $runnable = @($evaluations | Where-Object CanMutate)
+    $rollbackJournal = $null
     if ($CreateRollbackSnapshot -and $runnable.Count -gt 0) {
-        $null = New-RestoreRollbackSnapshot -SelectedKeys @($runnable.Key)
+        $journalPath = New-RestoreRollbackJournal -ActionPlan $actionPlan -SelectedKeys @($runnable.Key)
+        if (-not $journalPath) { throw "Could not prepare the rollback journal; no restore operations were executed" }
+        $rollbackJournal = $script:ActiveRollbackJournal
     }
     foreach ($evaluation in $runnable) {
         $key = $evaluation.Key
@@ -3599,6 +3689,10 @@ function Invoke-RestoreSelection {
         }
     }
     $script:CurrentCategory = ""
+    if ($rollbackJournal) {
+        $journalState = if (@($results.Values | Where-Object { $_.Errors -gt 0 }).Count -gt 0) { "Failed" } else { "Committed" }
+        Update-RestoreRollbackJournal -Journal $rollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State $journalState | Out-Null
+    }
     $resultValues = @($results.Values)
     $exitCode = if (@($resultValues | Where-Object Status -eq "Error").Count -gt 0) { 1 } elseif (@($resultValues | Where-Object { $_.Status -eq "Skipped" }).Count -gt 0) { 2 } else { 0 }
     $script:CapabilityExitCode = $exitCode
@@ -3606,15 +3700,18 @@ function Invoke-RestoreSelection {
         SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
         Profile=$machineProfile; ActionPlanHash=$actionPlan.PlanHash; ActionPlanStatus=$actionPlan.Status
         Categories=$resultValues; ExitCode=$exitCode
+        RollbackPath=if($rollbackJournal){$script:ActiveRollbackJournalPath}else{$null}
+        RollbackJournalState=if($rollbackJournal){$rollbackJournal.State}else{$null}
         Status=if ($exitCode -eq 0) { "Completed" } elseif ($exitCode -eq 2) { "CapabilityBlocked" } else { "Failed" }
     }
 }
 
 function Get-RestoreRegistryPlanState {
     param([Parameter(Mandatory=$true)][string]$Path,[Parameter(Mandatory=$true)][string]$Name)
-    $missing = [pscustomobject][ordered]@{ Exists=$false; Path=$Path; Name=$Name; Type=$null; Value=$null }
+    $keyExists = Test-Path -LiteralPath $Path
+    $missing = [pscustomobject][ordered]@{ Exists=$false; KeyExists=$keyExists; Path=$Path; Name=$Name; Type=$null; Value=$null }
     try {
-        if (-not (Test-Path -LiteralPath $Path)) { return $missing }
+        if (-not $keyExists) { return $missing }
         $properties = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
         if (-not $properties.PSObject.Properties[$Name]) { return $missing }
         $value = $properties.$Name
@@ -3623,9 +3720,9 @@ function Get-RestoreRegistryPlanState {
             elseif ($value -is [long] -or $value -is [int64]) { "QWord" }
             elseif ($value -is [int] -or $value -is [int32] -or $value -is [bool]) { "DWord" }
             else { "String" }
-        return [pscustomobject][ordered]@{ Exists=$true; Path=$Path; Name=$Name; Type=$valueType; Value=$value }
+        return [pscustomobject][ordered]@{ Exists=$true; KeyExists=$true; Path=$Path; Name=$Name; Type=$valueType; Value=$value }
     } catch {
-        return [pscustomobject][ordered]@{ Exists=$null; Path=$Path; Name=$Name; Type=$null; Value=$null; ReadError=$_.Exception.Message }
+        return [pscustomobject][ordered]@{ Exists=$null; KeyExists=$keyExists; Path=$Path; Name=$Name; Type=$null; Value=$null; ReadError=$_.Exception.Message }
     }
 }
 
@@ -3662,22 +3759,24 @@ function Test-RestoreActionPlanPrecondition {
                 if ($current.Exists -and $Operation.Before.Sha256 -and $current.Sha256 -ne $Operation.Before.Sha256) { return [pscustomobject]@{Matches=$false;Reason="File source hash changed"} }
             }
             "Service" {
-                $service = Get-Service -Name ($Operation.Target -replace '^Service:', '') -ErrorAction SilentlyContinue
-                if (($null -ne $service) -ne [bool]$Operation.Before.Exists) { return [pscustomobject]@{Matches=$false;Reason="Service existence changed"} }
-                if ($service -and $service.StartType.ToString() -ne [string]$Operation.Before.StartType) { return [pscustomobject]@{Matches=$false;Reason="Service startup type changed"} }
+                $serviceState = Get-RestoreServicePlanState -ServiceName ($Operation.Target -replace '^Service:', '')
+                if ([bool]$serviceState.Exists -ne [bool]$Operation.Before.Exists) { return [pscustomobject]@{Matches=$false;Reason="Service existence changed"} }
+                if ($serviceState.Exists -and $Operation.Before.StartType -and $serviceState.StartType -ne [string]$Operation.Before.StartType) { return [pscustomobject]@{Matches=$false;Reason="Service startup type changed"} }
+                if ($serviceState.Exists -and $Operation.Before.PathName -and $serviceState.PathName -ne [string]$Operation.Before.PathName) { return [pscustomobject]@{Matches=$false;Reason="Service executable configuration changed"} }
             }
             "ServiceControl" {
-                $service = Get-Service -Name ($Operation.Target -replace '^Service:', '') -ErrorAction SilentlyContinue
-                if (($null -ne $service) -ne [bool]$Operation.Before.Exists) { return [pscustomobject]@{Matches=$false;Reason="Service existence changed"} }
-                if ($service -and $service.Status.ToString() -ne [string]$Operation.Before.Status) { return [pscustomobject]@{Matches=$false;Reason="Service running state changed"} }
+                $serviceState = Get-RestoreServicePlanState -ServiceName ($Operation.Target -replace '^Service:', '')
+                if ([bool]$serviceState.Exists -ne [bool]$Operation.Before.Exists) { return [pscustomobject]@{Matches=$false;Reason="Service existence changed"} }
+                if ($serviceState.Exists -and $Operation.Before.Status -and $serviceState.Status -ne [string]$Operation.Before.Status) { return [pscustomobject]@{Matches=$false;Reason="Service running state changed"} }
             }
             "ScheduledTask" {
                 $taskTarget = $Operation.Target -replace '^Task:', ''
                 $separator = $taskTarget.LastIndexOf('\')
                 if ($separator -ge 0) {
-                    $task = Get-ScheduledTask -TaskPath $taskTarget.Substring(0, $separator + 1) -TaskName $taskTarget.Substring($separator + 1) -ErrorAction SilentlyContinue
-                    if (($null -ne $task) -ne [bool]$Operation.Before.Exists) { return [pscustomobject]@{Matches=$false;Reason="Scheduled task existence changed"} }
-                    if ($task -and $task.State.ToString() -ne [string]$Operation.Before.State) { return [pscustomobject]@{Matches=$false;Reason="Scheduled task state changed"} }
+                    $taskState = Get-RestoreScheduledTaskPlanState -TaskPath $taskTarget.Substring(0, $separator + 1) -TaskName $taskTarget.Substring($separator + 1)
+                    if ([bool]$taskState.Exists -ne [bool]$Operation.Before.Exists) { return [pscustomobject]@{Matches=$false;Reason="Scheduled task existence changed"} }
+                    if ($taskState.Exists -and $Operation.Before.State -and $taskState.State -ne [string]$Operation.Before.State) { return [pscustomobject]@{Matches=$false;Reason="Scheduled task state changed"} }
+                    if ($taskState.Exists -and $Operation.Before.XmlSha256 -and $taskState.XmlSha256 -ne [string]$Operation.Before.XmlSha256) { return [pscustomobject]@{Matches=$false;Reason="Scheduled task XML changed"} }
                 }
             }
             "EnvironmentVariable" {
@@ -3690,8 +3789,9 @@ function Test-RestoreActionPlanPrecondition {
             }
             "AppX" {
                 if ($Operation.Before.PackageName) {
-                    $installed = @((Get-AppxPackageSafe -Name $Operation.Before.PackageName)).Count -gt 0
-                    if ($installed -ne [bool]$Operation.Before.Installed) { return [pscustomobject]@{Matches=$false;Reason="AppX package presence changed"} }
+                    $scope = if($Operation.Before.Scope){[string]$Operation.Before.Scope}else{if($Operation.After.Scope){[string]$Operation.After.Scope}else{"CurrentUser"}}
+                    $appxState = Get-RestoreAppxPlanState -PackageName $Operation.Before.PackageName -Scope $scope
+                    if ($appxState.Installed -ne [bool]$Operation.Before.Installed) { return [pscustomobject]@{Matches=$false;Reason="AppX package presence changed"} }
                 }
             }
             "OptionalFeature" {
@@ -3976,19 +4076,38 @@ function Invoke-RestoreActionPlanOperation {
 function Invoke-RestoreActionPlan {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param([Parameter(Mandatory=$true)][object]$ActionPlan,[string]$CategoryKey)
-    $operations = @($ActionPlan.Operations | Where-Object { $_.CanExecute -and ($null -eq $CategoryKey -or $_.CategoryKey -eq $CategoryKey) })
+    $allOperations = @($ActionPlan.Operations)
+    $operations = @($allOperations | Where-Object {
+        $_.CanExecute -and ([string]::IsNullOrWhiteSpace($CategoryKey) -or $_.CategoryKey -eq $CategoryKey) -and
+        (-not $_.PSObject.Properties["JournalStatus"] -or $_.JournalStatus -notin @("Completed","VerifiedNoChange","RolledBack","RollbackUnsupported","RollbackConflict"))
+    })
     $changed = 0
     $errors = 0
+    $operationIndex = 0
     foreach ($operation in $operations) {
         $script:CurrentCategory = if ($CategoryKey) { $CategoryKey } else { $operation.CategoryKey }
         $beforeChanges = $script:ChangesCount
+        $journalOperation = @()
+        if ($script:ActiveRollbackJournal) { $journalOperation = @($script:ActiveRollbackJournal.Operations | Where-Object { [string]$_.OperationId -eq [string]$operation.OperationId } | Select-Object -First 1) }
+        if ($journalOperation.Count -eq 1) {
+            Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State "Executing" -OperationId $operation.OperationId -OperationStatus "Running" -NextOperationIndex $operationIndex | Out-Null
+        }
         try {
             $null = Invoke-RestoreActionPlanOperation -Operation $operation
+            $operationChanged = [int]($script:ChangesCount - $beforeChanges) -gt 0
+            if ($journalOperation.Count -eq 1) {
+                $journalStatus = if ($operationChanged) { "Completed" } else { "VerifiedNoChange" }
+                Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $script:ActiveRollbackJournalPath -OperationId $operation.OperationId -OperationStatus $journalStatus -Changed:$operationChanged -ErrorMessage $null -NextOperationIndex ($operationIndex + 1) | Out-Null
+            }
         } catch {
             $errors++
             Write-Log "Plan operation $($operation.OperationId) failed: $($_.Exception.Message)" -Level Error
+            if ($journalOperation.Count -eq 1) {
+                Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State "Failed" -OperationId $operation.OperationId -OperationStatus "Failed" -Changed:([int]($script:ChangesCount - $beforeChanges) -gt 0) -ErrorMessage $_.Exception.Message -NextOperationIndex ($operationIndex + 1) | Out-Null
+            }
         }
         $changed += [int]($script:ChangesCount - $beforeChanges)
+        $operationIndex++
     }
     if ($CategoryKey) { $script:CurrentCategory = "" }
     return [pscustomobject][ordered]@{CategoryKey=$CategoryKey; OperationCount=$operations.Count; Changed=$changed; Errors=$errors; Status=if($errors -gt 0 -and $changed -gt 0){"Partial"}elseif($errors -gt 0){"Error"}elseif($changed -gt 0){"Changed"}else{"Already OK"}}
@@ -4286,7 +4405,7 @@ function Get-SystemHealthReport {
     foreach ($tc in $taskChecks) {
         try { $t = Get-ScheduledTask -TaskPath $tc.P -TaskName $tc.N -EA Stop
             if ($t.State -eq 'Disabled') { $details += "Disabled: $($tc.N)" }
-        } catch { }
+        } catch { Write-Verbose "Could not inspect old rollback journal $($candidate.FullName)" }
     }
     if ($details.Count -gt 0) { $issues += "$($details.Count) maintenance tasks disabled" }
     & $addCat "Tasks" "Scheduled Tasks" $issues $details $(if($details.Count -gt 2){"Medium"}elseif($details.Count){"Low"}else{"OK"}) @("chkTasks")
@@ -4718,82 +4837,556 @@ function Get-RestoreImpactPreview {
 }
 
 function Get-RestoreRollbackDirectory {
+    [CmdletBinding()]
+    param([switch]$Create)
     $directory = Join-Path $env:ProgramData "Restore-WindowsDefaults\rollback"
-    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    if ($Create -and -not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
     return $directory
+}
+
+function Get-RestoreRollbackOperationHash {
+    param([Parameter(Mandatory=$true)][object]$Operation)
+    $content = [ordered]@{
+        OperationId=$Operation.OperationId; CategoryKey=$Operation.CategoryKey; Kind=$Operation.Kind
+        Action=$Operation.Action; Target=$Operation.Target; Scope=$Operation.Scope; Before=$Operation.Before
+        After=$Operation.After; RollbackAction=$Operation.RollbackAction; Exact=$Operation.Exact
+        CanExecute=$Operation.CanExecute; Reason=$Operation.Reason; Source=$Operation.Source
+        Risk=$Operation.Risk; Dependency=$Operation.Dependency; Verification=$Operation.Verification
+        Metadata=$Operation.Metadata
+    }
+    return (Get-RestoreJsonSha256 -Value ([pscustomobject]$content))
+}
+
+function ConvertTo-RestoreRollbackJournalOperation {
+    param([Parameter(Mandatory=$true)][object]$Operation)
+    $journalOperation = [pscustomobject][ordered]@{
+        OperationId=$Operation.OperationId; CategoryKey=$Operation.CategoryKey; Kind=$Operation.Kind
+        Action=$Operation.Action; Target=$Operation.Target; Scope=$Operation.Scope; Before=$Operation.Before
+        After=$Operation.After; RollbackAction=$Operation.RollbackAction; Exact=[bool]$Operation.Exact
+        CanExecute=[bool]$Operation.CanExecute; Reason=$Operation.Reason; Source=$Operation.Source
+        Risk=$Operation.Risk; Dependency=$Operation.Dependency; Verification=$Operation.Verification
+        Metadata=$Operation.Metadata; OperationHash=$null
+        JournalStatus="Pending"; Attempt=0; StartedAtUtc=$null; CompletedAtUtc=$null
+        Changed=$false; Error=$null; RollbackStatus="Pending"; RollbackError=$null
+    }
+    $journalOperation.OperationHash = Get-RestoreRollbackOperationHash -Operation $journalOperation
+    return $journalOperation
+}
+
+function Get-RestoreRollbackIntegrityPayload {
+    param([Parameter(Mandatory=$true)][object]$Journal)
+    $payload = [ordered]@{}
+    foreach ($property in @($Journal.PSObject.Properties)) {
+        if ($property.Name -ne "Integrity") { $payload[$property.Name] = $property.Value }
+    }
+    return [pscustomobject]$payload
+}
+
+function Set-RestoreRollbackJournalIntegrity {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Journal)
+    if (-not $PSCmdlet.ShouldProcess("rollback journal", "refresh integrity hash")) { return $Journal }
+    $Journal.Integrity = [pscustomobject][ordered]@{
+        Algorithm="SHA256"; JournalHash=(Get-RestoreJsonSha256 -Value (Get-RestoreRollbackIntegrityPayload -Journal $Journal))
+    }
+    return $Journal
+}
+
+function Write-RestoreAtomicJson {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][object]$Value,
+        [int]$Depth=50
+    )
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if ($script:WhatIfRequested) { return $null }
+    if (-not $PSCmdlet.ShouldProcess($fullPath, "atomically write JSON state")) { return $null }
+    $parent = Split-Path -Parent $fullPath
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    $tempPath = "$fullPath.tmp-$([guid]::NewGuid().ToString('N'))"
+    $backupPath = "$fullPath.bak-$([guid]::NewGuid().ToString('N'))"
+    try {
+        $json = $Value | ConvertTo-Json -Depth $Depth
+        [System.IO.File]::WriteAllText($tempPath, $json, [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+            [System.IO.File]::Replace($tempPath, $fullPath, $backupPath, $true)
+        } else {
+            [System.IO.File]::Move($tempPath, $fullPath)
+        }
+        return $fullPath
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $backupPath) { Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Invoke-RestoreRollbackJournalCleanup {
+    param([string]$ActivePath)
+    $directory = Get-RestoreRollbackDirectory
+    if (-not (Test-Path -LiteralPath $directory)) { return }
+    $journals = @(Get-ChildItem -LiteralPath $directory -Filter "journal-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($journals.Count -le $script:RollbackJournalMaxEntries) { return }
+    foreach ($candidate in @($journals | Select-Object -Skip $script:RollbackJournalMaxEntries)) {
+        if ($ActivePath -and ([System.IO.Path]::GetFullPath($candidate.FullName) -ieq [System.IO.Path]::GetFullPath($ActivePath))) { continue }
+        try {
+            $raw = [System.IO.File]::ReadAllText($candidate.FullName)
+            $journal = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($journal.State -in @("Committed","RolledBack")) { Remove-Item -LiteralPath $candidate.FullName -Force -ErrorAction Stop }
+        } catch { Write-Verbose "Could not inspect old rollback journal $($candidate.FullName)" }
+    }
+}
+
+function New-RestoreRollbackJournal {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory=$true)][object]$ActionPlan,
+        [string[]]$SelectedKeys,
+        [string]$OutputPath,
+        [object]$BeforeRegistry
+    )
+    if (-not $ActionPlan.Operations) { throw "An action plan with operations is required to create a rollback journal" }
+    $directory = Get-RestoreRollbackDirectory
+    $planHash = [string]$ActionPlan.PlanHash
+    $hashPrefix = if ($planHash.Length -ge 12) { $planHash.Substring(0, 12) } else { "unhashed" }
+    $path = if ($OutputPath) { [System.IO.Path]::GetFullPath($OutputPath) } else {
+        Join-Path $directory ("journal-{0}-{1}-{2}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"), $hashPrefix, ([guid]::NewGuid().ToString("N").Substring(0, 8)))
+    }
+    if ($script:WhatIfRequested) { return $null }
+    if (-not $PSCmdlet.ShouldProcess($path, "prepare an integrity-checked rollback journal")) { return $null }
+    $capturedRegistry = if ($PSBoundParameters.ContainsKey("BeforeRegistry")) { $BeforeRegistry } else { Get-RegistrySnapshot }
+    $journalOperations = New-Object System.Collections.Generic.List[object]
+    foreach ($operation in @($ActionPlan.Operations)) { $journalOperations.Add((ConvertTo-RestoreRollbackJournalOperation -Operation $operation)) }
+    $now = (Get-Date).ToUniversalTime().ToString("o")
+    $journal = [pscustomobject][ordered]@{
+        SchemaVersion=$script:RollbackJournalSchemaVersion; ToolVersion=$script:Version; JournalId=([guid]::NewGuid().ToString())
+        State="Prepared"; CreatedAtUtc=$now; UpdatedAtUtc=$now; PlanHash=$planHash
+        SelectedKeys=@($SelectedKeys); Profile=$ActionPlan.Profile; BeforeRegistry=$capturedRegistry
+        Operations=@($journalOperations.ToArray()); NextOperationIndex=0
+        CleanupPolicy=[pscustomobject][ordered]@{KeepLast=$script:RollbackJournalMaxEntries;NeverDeleteActive=$true;DeleteStates=@("Committed","RolledBack")}
+        Integrity=$null
+    }
+    Set-RestoreRollbackJournalIntegrity -Journal $journal | Out-Null
+    $written = Write-RestoreAtomicJson -Path $path -Value $journal -Depth 50
+    if (-not $written) { return $null }
+    $script:LastRollbackPath = $written
+    $script:ActiveRollbackJournalPath = $written
+    $script:ActiveRollbackJournal = $journal
+    Invoke-RestoreRollbackJournalCleanup -ActivePath $written
+    Write-Log "Rollback journal prepared: $(Split-Path $written -Leaf)" -Level Info
+    return $written
 }
 
 function New-RestoreRollbackSnapshot {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param([string[]]$SelectedKeys)
-    $serviceNames = @(
-        "WinDefend","MpsSvc","BFE","wuauserv","UsoSvc","BITS","DoSvc","WSearch",
-        "AppXSvc","ClipSVC","LicenseManager","InstallService","wlidsvc","TokenBroker",
-        "NgcSvc","NgcCtnrSvc","bthserv","WpnService","DiagTrack"
-    )
-    $serviceNames += @($script:ServiceTaskFingerprintCatalog | ForEach-Object { $_.Services })
-    $serviceNames = @($serviceNames | Select-Object -Unique)
-    $services = @()
-    foreach ($name in $serviceNames) {
-        $service = Get-Service -Name $name -ErrorAction SilentlyContinue
-        if ($service) { $services += [pscustomobject]@{Name=$name;StartType=$service.StartType.ToString()} }
-    }
-    $tasks = @(Get-ScheduledTaskRestoreMatrix -IncludeHealthy)
-    $state = [pscustomobject][ordered]@{
-        SchemaVersion=1; CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
-        ComputerName=$env:COMPUTERNAME; SelectedKeys=@($SelectedKeys)
-        BeforeRegistry=(Get-RegistrySnapshot); Services=@($services); Tasks=@($tasks)
-    }
-    $path = Join-Path (Get-RestoreRollbackDirectory) ("rollback-{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-    if (-not $PSCmdlet.ShouldProcess($path, "write rollback snapshot and prune older snapshots")) { return $null }
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 15), [System.Text.Encoding]::UTF8)
-    $oldSnapshots = @(Get-ChildItem -LiteralPath (Get-RestoreRollbackDirectory) -Filter "rollback-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -Skip 10)
-    foreach ($oldSnapshot in $oldSnapshots) { Remove-Item -LiteralPath $oldSnapshot.FullName -Force -ErrorAction SilentlyContinue }
-    $script:LastRollbackPath = $path
-    Write-Log "Rollback snapshot saved: $(Split-Path $path -Leaf)" -Level Info
-    return $path
+    $plan = Get-RestoreActionPlan -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested
+    return (New-RestoreRollbackJournal -ActionPlan $plan -SelectedKeys $SelectedKeys)
 }
 
 function Set-RegistrySnapshotValue {
     [CmdletBinding(SupportsShouldProcess=$true)]
     [OutputType([bool])]
     param([object]$Entry)
-    if ($Entry.Name -eq "(Default)" -or $Entry.Type -eq "Binary") { return $false }
+    if ($Entry.Name -eq "(Default)") { return $false }
     if (-not $PSCmdlet.ShouldProcess("$($Entry.Path)\$($Entry.Name)", "restore registry value")) { return $false }
     $value = $Entry.Value
-    if ($Entry.Type -eq "MultiString") { $value = @($value) }
+    if ($Entry.Type -eq "MultiString") { $value = @($value | ForEach-Object { [string]$_ }) }
     elseif ($Entry.Type -eq "DWord") { $value = [int]$value }
     elseif ($Entry.Type -eq "QWord") { $value = [long]$value }
+    elseif ($Entry.Type -eq "Binary") { $value = [byte[]]@($value | ForEach-Object { [byte]$_ }) }
     return (Set-RegistryValue -Path $Entry.Path -Name $Entry.Name -Value $value -Type $Entry.Type -Silent)
 }
 
-function Invoke-RestoreRollback {
-    param([string]$RollbackPath)
-    if (-not $RollbackPath) {
-        $RollbackPath = @(Get-ChildItem -LiteralPath (Get-RestoreRollbackDirectory) -Filter "rollback-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+function ConvertTo-RestoreLegacyRollbackJournal {
+    param([Parameter(Mandatory=$true)][object]$LegacyState)
+    $now = (Get-Date).ToUniversalTime().ToString("o")
+    $journal = [pscustomobject][ordered]@{
+        SchemaVersion=$script:RollbackJournalSchemaVersion; ToolVersion=$script:Version; JournalId=([guid]::NewGuid().ToString())
+        State="Committed"; CreatedAtUtc=if($LegacyState.CreatedAt){[string]$LegacyState.CreatedAt}else{$now}; UpdatedAtUtc=$now
+        PlanHash="legacy-snapshot"; SelectedKeys=@($LegacyState.SelectedKeys); Profile=$null
+        BeforeRegistry=$LegacyState.BeforeRegistry; Operations=@(); NextOperationIndex=0
+        CleanupPolicy=[pscustomobject][ordered]@{KeepLast=$script:RollbackJournalMaxEntries;NeverDeleteActive=$true;DeleteStates=@("Committed","RolledBack")}
+        Integrity=$null; LegacySnapshot=$true; Services=@($LegacyState.Services); Tasks=@($LegacyState.Tasks)
     }
-    if (-not $RollbackPath -or -not (Test-Path -LiteralPath $RollbackPath)) { throw "No rollback snapshot is available" }
-    $state = Get-Content -LiteralPath $RollbackPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    $before = $state.BeforeRegistry
+    Set-RestoreRollbackJournalIntegrity -Journal $journal | Out-Null
+    return $journal
+}
+
+function Read-RestoreRollbackJournal {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "Rollback journal not found: $fullPath" }
+    $file = Get-Item -LiteralPath $fullPath -ErrorAction Stop
+    if ($file.Length -gt $script:RollbackJournalMaxBytes) { throw "Rollback journal exceeds the maximum supported size" }
+    try { $journal = [System.IO.File]::ReadAllText($fullPath) | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "Rollback journal is not valid JSON: $($_.Exception.Message)" }
+    if ($journal.SchemaVersion -eq 1 -and $journal.PSObject.Properties["BeforeRegistry"]) {
+        $converted = ConvertTo-RestoreLegacyRollbackJournal -LegacyState $journal
+        $script:LastRollbackPath = $fullPath
+        return $converted
+    }
+    if ([int]$journal.SchemaVersion -ne $script:RollbackJournalSchemaVersion) { throw "Unsupported rollback journal schema: $($journal.SchemaVersion)" }
+    foreach ($required in @("JournalId","State","PlanHash","BeforeRegistry","Operations","Integrity")) {
+        if (-not $journal.PSObject.Properties[$required]) { throw "Rollback journal is missing $required" }
+    }
+    if ([string]$journal.Integrity.Algorithm -ne "SHA256" -or [string]::IsNullOrWhiteSpace([string]$journal.Integrity.JournalHash)) {
+        throw "Rollback journal integrity metadata is missing or unsupported"
+    }
+    $calculatedJournalHash = Get-RestoreJsonSha256 -Value (Get-RestoreRollbackIntegrityPayload -Journal $journal)
+    if ($calculatedJournalHash -ne [string]$journal.Integrity.JournalHash) { throw "Rollback journal integrity verification failed" }
+    $validStates = @("Prepared","Executing","Committed","Failed","RollingBack","RolledBack","RollbackPartial","RollbackFailed")
+    if ([string]$journal.State -notin $validStates) { throw "Rollback journal has an invalid state: $($journal.State)" }
+    $seenOperationIds = @{}
+    foreach ($operation in @($journal.Operations)) {
+        if ([string]::IsNullOrWhiteSpace([string]$operation.OperationId) -or $seenOperationIds.ContainsKey([string]$operation.OperationId)) { throw "Rollback journal contains a duplicate or missing operation ID" }
+        $seenOperationIds[[string]$operation.OperationId] = $true
+        if ([string]$operation.OperationHash -ne (Get-RestoreRollbackOperationHash -Operation $operation)) { throw "Rollback journal operation integrity verification failed for $($operation.OperationId)" }
+    }
+    $script:LastRollbackPath = $fullPath
+    return $journal
+}
+
+function Update-RestoreRollbackJournal {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [object]$Journal=$script:ActiveRollbackJournal,
+        [string]$JournalPath=$script:ActiveRollbackJournalPath,
+        [string]$State,
+        [string]$OperationId,
+        [string]$OperationStatus,
+        [bool]$Changed,
+        [string]$ErrorMessage,
+        [int]$NextOperationIndex=-1
+    )
+    if (-not $Journal) { return $null }
+    if (-not $JournalPath) { $JournalPath = $script:ActiveRollbackJournalPath }
+    if (-not $JournalPath) { throw "Rollback journal path is not available" }
+    if (-not $PSCmdlet.ShouldProcess($JournalPath, "update rollback journal state")) { return $Journal }
+    if ($State) { $Journal.State = $State }
+    if ($OperationId) {
+        $operation = @($Journal.Operations | Where-Object { [string]$_.OperationId -eq $OperationId } | Select-Object -First 1)
+        if ($operation.Count -ne 1) { throw "Rollback journal operation not found: $OperationId" }
+        $operation = $operation[0]
+        if ($OperationStatus) {
+            $operation.JournalStatus = $OperationStatus
+            if ($OperationStatus -in @("RollbackRunning","RolledBack","RollbackUnsupported","RollbackFailed","RollbackConflict")) { $operation.RollbackStatus = $OperationStatus }
+            if ($OperationStatus -eq "Running") {
+                $operation.Attempt = [int]$operation.Attempt + 1
+                $operation.StartedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+            }
+            if ($OperationStatus -in @("Completed","VerifiedNoChange","Failed","RollbackRunning","RolledBack","RollbackUnsupported","RollbackFailed","RollbackConflict")) {
+                $operation.CompletedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+            }
+        }
+        if ($PSBoundParameters.ContainsKey("Changed")) { $operation.Changed = [bool]$Changed }
+        if ($PSBoundParameters.ContainsKey("ErrorMessage")) { $operation.Error = $ErrorMessage }
+        if ($OperationStatus -in @("RollbackRunning","RolledBack","RollbackUnsupported","RollbackFailed","RollbackConflict") -and $PSBoundParameters.ContainsKey("ErrorMessage")) { $operation.RollbackError = $ErrorMessage }
+    }
+    if ($NextOperationIndex -ge 0) { $Journal.NextOperationIndex = $NextOperationIndex }
+    $Journal.UpdatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+    Set-RestoreRollbackJournalIntegrity -Journal $Journal | Out-Null
+    $written = Write-RestoreAtomicJson -Path $JournalPath -Value $Journal -Depth 50
+    if (-not $written) { return $null }
+    $script:ActiveRollbackJournalPath = $written
+    $script:ActiveRollbackJournal = $Journal
+    $script:LastRollbackPath = $written
+    return $Journal
+}
+
+function Test-RestoreRollbackPostcondition {
+    param([Parameter(Mandatory=$true)][object]$Operation)
+    if (-not $Operation.After) { return [pscustomobject]@{Matches=$true;Reason=$null} }
+    $properties = [ordered]@{}
+    foreach ($property in @($Operation.PSObject.Properties)) { $properties[$property.Name] = $property.Value }
+    $properties.Before = $Operation.After
+    try { return (Test-RestoreActionPlanPrecondition -Operation ([pscustomobject]$properties)) }
+    catch { return [pscustomobject]@{Matches=$false;Reason="Could not verify postcondition: $($_.Exception.Message)"} }
+}
+
+function Invoke-RestoreFileState {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][string]$Path,[Parameter(Mandatory=$true)][object]$State)
+    if (-not $State.Exists) {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        return (Invoke-RestoreFileMutation -Action Remove -Path $Path -Silent)
+    }
+    if ($State.IsDirectory) {
+        if (Test-Path -LiteralPath $Path -PathType Container) { return $false }
+        if (Test-Path -LiteralPath $Path) { Invoke-RestoreFileMutation -Action Remove -Path $Path -Silent | Out-Null }
+        if (-not $PSCmdlet.ShouldProcess($Path, "restore directory state")) { return $false }
+        New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+        $script:ChangesCount++
+        return $true
+    }
+    if (-not $State.ContentBase64) { throw "Rollback does not have inline bytes for file state: $Path" }
+    $bytes = [Convert]::FromBase64String([string]$State.ContentBase64)
+    if (-not $PSCmdlet.ShouldProcess($Path, "restore file bytes")) { return $false }
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    [System.IO.File]::WriteAllBytes($Path, $bytes)
+    $script:ChangesCount++
+    return $true
+}
+
+function Invoke-RestoreScheduledTaskRegistration {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][string]$TaskPath,[Parameter(Mandatory=$true)][string]$TaskName,[Parameter(Mandatory=$true)][string]$Xml)
+    if (-not $PSCmdlet.ShouldProcess("Task:$TaskPath$TaskName", "restore scheduled task XML")) { return $false }
+    Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -Xml $Xml -Force -ErrorAction Stop | Out-Null
+    $script:ChangesCount++
+    return $true
+}
+
+function Invoke-RestoreAppxRemoval {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][string]$PackageName,[string]$Scope="CurrentUser")
+    $allUsers = $Scope -in @("AllUsers","Provisioned")
+    $packages = @(Get-AppxPackageSafe -Name $PackageName -AllUsers:$allUsers | Where-Object { $_ })
+    if ($packages.Count -eq 0) { return $false }
+    if (-not $PSCmdlet.ShouldProcess("$PackageName ($Scope)", "remove AppX package")) { return $false }
+    foreach ($package in $packages) {
+        if ($allUsers) { Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop }
+        else { Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop }
+    }
+    $script:ChangesCount++
+    return $true
+}
+
+function Invoke-RestoreOptionalFeatureState {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][string]$FeatureName,[string]$State)
+    if ([string]::IsNullOrWhiteSpace($State) -or $State -eq "Missing") { throw "Optional feature state cannot be restored: $FeatureName" }
+    $feature = Get-WindowsOptionalFeature -FeatureName $FeatureName -Online -ErrorAction SilentlyContinue
+    if (-not $feature) { throw "Optional feature is unavailable: $FeatureName" }
+    $currentState = [string]$feature.State
+    if ($State -eq "Enabled") {
+        if ($currentState -eq "Enabled") { return $false }
+        if (-not $PSCmdlet.ShouldProcess($FeatureName, "enable optional Windows feature")) { return $false }
+        Enable-WindowsOptionalFeature -FeatureName $FeatureName -Online -NoRestart -LogLevel Errors -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
+    } else {
+        if ($currentState -ne "Enabled") { return $false }
+        if (-not $PSCmdlet.ShouldProcess($FeatureName, "disable optional Windows feature")) { return $false }
+        Disable-WindowsOptionalFeature -FeatureName $FeatureName -Online -NoRestart -WarningAction SilentlyContinue -ErrorAction Stop | Out-Null
+    }
+    $script:ChangesCount++
+    return $true
+}
+
+function Invoke-RestoreLegacyRollback {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Journal)
+    $before = $Journal.BeforeRegistry
+    if ($before -and $before.Entries) {
+        $after = Get-RegistrySnapshot
+        $beforeMap = @{}; $afterMap = @{}
+        foreach ($entry in @($before.Entries)) { $beforeMap["$($entry.Path)|$($entry.Name)"] = $entry }
+        foreach ($entry in @($after.Entries)) { $afterMap["$($entry.Path)|$($entry.Name)"] = $entry }
+        foreach ($key in $afterMap.Keys) {
+            if (-not $beforeMap.ContainsKey($key) -and $afterMap[$key].Name -ne "(Default)") {
+                Remove-RegistryValue -Path $afterMap[$key].Path -Name $afterMap[$key].Name -Silent | Out-Null
+            }
+        }
+        foreach ($entry in @($before.Entries)) { Set-RegistrySnapshotValue -Entry $entry | Out-Null }
+    }
+    foreach ($service in @($Journal.Services)) {
+        if ($service.StartType) { Restore-ServiceStartup -ServiceName $service.Name -StartupType $service.StartType -Silent | Out-Null }
+    }
+    foreach ($task in @($Journal.Tasks)) {
+        $taskPath = if($task.Path){[string]$task.Path}else{[string]$task.TaskPath}
+        $taskName = if($task.Name){[string]$task.Name}else{[string]$task.TaskName}
+        if ($task.State -eq "Disabled") { Invoke-RestoreScheduledTaskState -Action Disable -TaskPath $taskPath -TaskName $taskName -Silent | Out-Null }
+        elseif ($task.State -eq "Enabled") { Invoke-RestoreScheduledTaskState -Action Enable -TaskPath $taskPath -TaskName $taskName -Silent | Out-Null }
+    }
+    return $true
+}
+
+function Invoke-RestoreRegistrySnapshotReconciliation {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$BeforeRegistry)
+    $errors = 0
     $after = Get-RegistrySnapshot
     $beforeMap = @{}; $afterMap = @{}
-    foreach ($entry in @($before.Entries)) { $beforeMap["$($entry.Path)|$($entry.Name)"] = $entry }
+    foreach ($entry in @($BeforeRegistry.Entries)) { $beforeMap["$($entry.Path)|$($entry.Name)"] = $entry }
     foreach ($entry in @($after.Entries)) { $afterMap["$($entry.Path)|$($entry.Name)"] = $entry }
     foreach ($key in $afterMap.Keys) {
         if (-not $beforeMap.ContainsKey($key) -and $afterMap[$key].Name -ne "(Default)") {
-            Remove-RegistryValue -Path $afterMap[$key].Path -Name $afterMap[$key].Name -Silent
+            try { Remove-RegistryValue -Path $afterMap[$key].Path -Name $afterMap[$key].Name -Silent | Out-Null } catch { $errors++ }
         }
     }
-    foreach ($entry in @($before.Entries)) { Set-RegistrySnapshotValue -Entry $entry | Out-Null }
-    foreach ($service in @($state.Services)) {
-        Restore-ServiceStartup -ServiceName $service.Name -StartupType $service.StartType -Silent
+    foreach ($entry in @($BeforeRegistry.Entries)) {
+        try { Set-RegistrySnapshotValue -Entry $entry | Out-Null } catch { $errors++ }
     }
-    foreach ($task in @($state.Tasks)) {
-        if ($task.State -eq "Disabled") { Disable-ScheduledTask -TaskPath $task.Path -TaskName $task.Name -ErrorAction SilentlyContinue | Out-Null }
-        elseif ($task.State -eq "Enabled") { Enable-ScheduledTask -TaskPath $task.Path -TaskName $task.Name -ErrorAction SilentlyContinue | Out-Null }
+    return $errors
+}
+
+function Invoke-RestoreJournalInverseOperation {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Operation)
+    $postcondition = Test-RestoreRollbackPostcondition -Operation $Operation
+    if (-not $postcondition.Matches) { return [pscustomobject]@{Status="RollbackConflict";Changed=$false;Reason=$postcondition.Reason} }
+    try {
+        switch ($Operation.Kind) {
+            "RegistryValue" {
+                if ($Operation.Before.Exists) {
+                    return [pscustomobject]@{Status="RolledBack";Changed=(Set-RegistrySnapshotValue -Entry $Operation.Before);Reason=$null}
+                }
+                $changed = Remove-RegistryValue -Path $Operation.Before.Path -Name $Operation.Before.Name -Silent
+                if ($Operation.Before.PSObject.Properties["KeyExists"] -and -not $Operation.Before.KeyExists -and (Test-Path -LiteralPath $Operation.Before.Path)) {
+                    $changed = (Remove-RegistryKey -Path $Operation.Before.Path -Silent) -or $changed
+                }
+                return [pscustomobject]@{Status="RolledBack";Changed=$changed;Reason=$null}
+            }
+            "RegistryKey" {
+                if ($Operation.Before.Exists) {
+                    return [pscustomobject]@{Status="RolledBack";Changed=(New-RestoreRegistryKey -Path $Operation.Before.Path -Silent);Reason=$null}
+                }
+                return [pscustomobject]@{Status="RolledBack";Changed=(Remove-RegistryKey -Path $Operation.Before.Path -Silent);Reason=$null}
+            }
+            "Service" {
+                if (-not $Operation.Before.Exists) { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="The service did not exist before the run"} }
+                $changed = Restore-ServiceStartup -ServiceName ($Operation.Target -replace '^Service:', '') -StartupType $Operation.Before.StartType -Silent
+                if ($Operation.Before.Status -and $Operation.Before.Status -notin @("Unknown","Stopped","Running")) { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$changed;Reason="Unknown service state"} }
+                if ($Operation.Before.Status -and $Operation.Before.Status -in @("Stopped","Running")) {
+                    $desiredAction = if ($Operation.Before.Status -eq "Stopped") { "Stop" } else { "Start" }
+                    $changed = (Invoke-RestoreServiceControl -Action $desiredAction -ServiceName ($Operation.Target -replace '^Service:', '') -Silent) -or $changed
+                }
+                return [pscustomobject]@{Status="RolledBack";Changed=$changed;Reason=$null}
+            }
+            "ServiceControl" {
+                if (-not $Operation.Before.Exists) { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="The service did not exist before the run"} }
+                if (-not $Operation.Before.Status -or $Operation.Before.Status -notin @("Stopped","Running")) { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="The original service state is unavailable"} }
+                $desiredAction = if ($Operation.Before.Status -eq "Stopped") { "Stop" } else { "Start" }
+                return [pscustomobject]@{Status="RolledBack";Changed=(Invoke-RestoreServiceControl -Action $desiredAction -ServiceName ($Operation.Target -replace '^Service:', '') -Silent);Reason=$null}
+            }
+            "ScheduledTask" {
+                $taskPath = if($Operation.Before.Path){[string]$Operation.Before.Path}else{(($Operation.Target -replace '^Task:', '') -replace '\\[^\\]+$','\\')}
+                $taskName = if($Operation.Before.Name){[string]$Operation.Before.Name}else{($Operation.Target -replace '^Task:', '') -replace '^.*\\',''}
+                if (-not $Operation.Before.Exists) { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="The scheduled task did not exist before the run"} }
+                $current = Get-RestoreScheduledTaskPlanState -TaskPath $taskPath -TaskName $taskName
+                $changed = $false
+                if (-not $current.Exists -and $Operation.Before.Xml) {
+                    $changed = Invoke-RestoreScheduledTaskRegistration -TaskPath $taskPath -TaskName $taskName -Xml $Operation.Before.Xml
+                }
+                if ($Operation.Before.Xml -and $current.Exists -and $current.XmlSha256 -ne $Operation.Before.XmlSha256) {
+                    $changed = (Invoke-RestoreScheduledTaskRegistration -TaskPath $taskPath -TaskName $taskName -Xml $Operation.Before.Xml) -or $changed
+                }
+                if ($Operation.Before.State -eq "Disabled") {
+                    $changed = (Invoke-RestoreScheduledTaskState -Action Disable -TaskPath $taskPath -TaskName $taskName -Silent) -or $changed
+                } elseif ($Operation.Before.State) {
+                    $changed = (Invoke-RestoreScheduledTaskState -Action Enable -TaskPath $taskPath -TaskName $taskName -Silent) -or $changed
+                }
+                return [pscustomobject]@{Status="RolledBack";Changed=$changed;Reason=$null}
+            }
+            "File" {
+                if ($Operation.Action -in @("Rename","Move")) {
+                    $source = [string]$Operation.After.Path
+                    $destination = [string]$Operation.Before.Path
+                    return [pscustomobject]@{Status="RolledBack";Changed=(Invoke-RestoreFileMutation -Action Move -Path $source -Destination $destination -Silent);Reason=$null}
+                }
+                if ($Operation.Action -eq "Copy") {
+                    return [pscustomobject]@{Status="RolledBack";Changed=(Invoke-RestoreFileMutation -Action Remove -Path $Operation.After.Path -Silent);Reason=$null}
+                }
+                return [pscustomobject]@{Status="RolledBack";Changed=(Invoke-RestoreFileState -Path $Operation.Before.Path -State $Operation.Before);Reason=$null}
+            }
+            "AppX" {
+                if ($Operation.Before.Installed) { return [pscustomobject]@{Status="RolledBack";Changed=$false;Reason=$null} }
+                $scope = if($Operation.Before.Scope){[string]$Operation.Before.Scope}else{[string]$Operation.After.Scope}
+                return [pscustomobject]@{Status="RolledBack";Changed=(Invoke-RestoreAppxRemoval -PackageName $Operation.Before.PackageName -Scope $scope);Reason=$null}
+            }
+            "OptionalFeature" {
+                return [pscustomobject]@{Status="RolledBack";Changed=(Invoke-RestoreOptionalFeatureState -FeatureName $Operation.Target -State $Operation.Before.State);Reason=$null}
+            }
+            "EnvironmentVariable" {
+                $separator = $Operation.Target.IndexOf(':')
+                if ($separator -le 0) { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="Environment-variable scope is invalid"} }
+                $scope = $Operation.Target.Substring(0, $separator); $name = $Operation.Target.Substring($separator + 1)
+                $remove = $null -eq $Operation.Before.Value
+                return [pscustomobject]@{Status="RolledBack";Changed=(Invoke-RestoreEnvironmentVariable -Name $name -Scope $scope -Value $Operation.Before.Value -Remove:$remove -Silent);Reason=$null}
+            }
+            "NativeCommand" { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="Native command has no safe automatic inverse"} }
+            "RestorePoint" { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="Windows restore points are rolled back by System Restore"} }
+            default { return [pscustomobject]@{Status="RollbackUnsupported";Changed=$false;Reason="No inverse adapter exists for $($Operation.Kind)"} }
+        }
+    } catch {
+        return [pscustomobject]@{Status="RollbackFailed";Changed=$false;Reason=$_.Exception.Message}
     }
-    Write-Log "Rollback restored registry, service, and task state from $(Split-Path $RollbackPath -Leaf)" -Level Success
-    return $true
+}
+
+function Invoke-RestoreRollback {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([string]$RollbackPath)
+    if (-not $RollbackPath) {
+        $directory = Get-RestoreRollbackDirectory
+        $RollbackPath = @(
+            @(Get-ChildItem -LiteralPath $directory -Filter "journal-*.json" -File -ErrorAction SilentlyContinue) +
+            @(Get-ChildItem -LiteralPath $directory -Filter "rollback-*.json" -File -ErrorAction SilentlyContinue)
+        ) | Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+    if (-not $RollbackPath) { throw "No rollback journal is available" }
+    $journal = Read-RestoreRollbackJournal -Path $RollbackPath
+    $script:ActiveRollbackJournalPath = [System.IO.Path]::GetFullPath($RollbackPath)
+    $script:ActiveRollbackJournal = $journal
+    if ($journal.LegacySnapshot) {
+        if (-not $PSCmdlet.ShouldProcess($RollbackPath, "restore the legacy rollback snapshot")) { return $false }
+        $legacyResult = Invoke-RestoreLegacyRollback -Journal $journal
+        Write-Log "Legacy rollback snapshot restored from $(Split-Path $RollbackPath -Leaf)" -Level Success
+        return $legacyResult
+    }
+    if ($journal.State -eq "RolledBack") { return [pscustomobject]@{Success=$true;State="RolledBack";JournalPath=$RollbackPath;Errors=0;Unsupported=0} }
+    if (-not $PSCmdlet.ShouldProcess($RollbackPath, "rollback the verified journal")) { return $false }
+    Update-RestoreRollbackJournal -Journal $journal -JournalPath $RollbackPath -State "RollingBack" | Out-Null
+    $errors = 0; $unsupported = @($journal.Operations | Where-Object { $_.JournalStatus -eq "RollbackUnsupported" }).Count
+    $operations = @($journal.Operations | Where-Object {
+        $_.JournalStatus -in @("Running","Completed","Failed","RollbackFailed","RollbackConflict") -and
+        ($_.Changed -or $_.JournalStatus -in @("Running","Failed","RollbackFailed","RollbackConflict"))
+    } | Sort-Object { [int]([regex]::Match([string]$_.OperationId, '\d+$').Value) } -Descending)
+    foreach ($operation in $operations) {
+        Update-RestoreRollbackJournal -Journal $journal -JournalPath $RollbackPath -OperationId $operation.OperationId -OperationStatus "RollbackRunning" | Out-Null
+        $inverse = Invoke-RestoreJournalInverseOperation -Operation $operation
+        if ($inverse.Status -eq "RolledBack") {
+            Update-RestoreRollbackJournal -Journal $journal -JournalPath $RollbackPath -OperationId $operation.OperationId -OperationStatus "RolledBack" -Changed:$inverse.Changed -ErrorMessage $inverse.Reason | Out-Null
+        } elseif ($inverse.Status -eq "RollbackUnsupported" -or $inverse.Status -eq "RollbackConflict") {
+            $unsupported++
+            Update-RestoreRollbackJournal -Journal $journal -JournalPath $RollbackPath -OperationId $operation.OperationId -OperationStatus $inverse.Status -Changed:$inverse.Changed -ErrorMessage $inverse.Reason | Out-Null
+        } else {
+            $errors++
+            Update-RestoreRollbackJournal -Journal $journal -JournalPath $RollbackPath -OperationId $operation.OperationId -OperationStatus "RollbackFailed" -Changed:$inverse.Changed -ErrorMessage $inverse.Reason | Out-Null
+        }
+    }
+    if ($journal.BeforeRegistry) {
+        $errors += [int](Invoke-RestoreRegistrySnapshotReconciliation -BeforeRegistry $journal.BeforeRegistry)
+        try {
+            $registryDiff = Compare-RegistrySnapshot -Before $journal.BeforeRegistry -After (Get-RegistrySnapshot)
+            if ([int]$registryDiff.TotalChanges -gt 0) { $errors++ }
+        } catch { $errors++ }
+    }
+    $finalState = if ($errors -gt 0) { "RollbackFailed" } elseif ($unsupported -gt 0) { "RollbackPartial" } else { "RolledBack" }
+    Update-RestoreRollbackJournal -Journal $journal -JournalPath $RollbackPath -State $finalState | Out-Null
+    Write-Log "Rollback journal ${finalState}: $(Split-Path $RollbackPath -Leaf)" -Level $(if($finalState -eq "RolledBack"){"Success"}else{"Warning"})
+    return [pscustomobject]@{Success=($finalState -eq "RolledBack");State=$finalState;JournalPath=$RollbackPath;Errors=$errors;Unsupported=$unsupported}
+}
+
+function Resume-RestoreRollbackJournal {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([string]$JournalPath)
+    if (-not $JournalPath) {
+        $JournalPath = @(Get-ChildItem -LiteralPath (Get-RestoreRollbackDirectory) -Filter "journal-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
+    }
+    if (-not $JournalPath) { throw "No rollback journal is available to resume" }
+    $journal = Read-RestoreRollbackJournal -Path $JournalPath
+    if ($journal.LegacySnapshot) { throw "Legacy rollback snapshots cannot be resumed; use -RollbackLastRun" }
+    if ($journal.State -eq "Committed") { return [pscustomobject]@{Success=$true;State="Committed";JournalPath=$JournalPath;Errors=0} }
+    if ($journal.State -in @("RolledBack","RollbackPartial","RollbackFailed")) { throw "Rollback journal cannot be resumed from state $($journal.State)" }
+    if (-not $PSCmdlet.ShouldProcess($JournalPath, "resume the verified rollback journal")) { return $false }
+    $script:ActiveRollbackJournalPath = [System.IO.Path]::GetFullPath($JournalPath)
+    $script:ActiveRollbackJournal = $journal
+    Update-RestoreRollbackJournal -Journal $journal -JournalPath $JournalPath -State "Executing" | Out-Null
+    $result = Invoke-RestoreActionPlan -ActionPlan $journal
+    $finalState = if ($result.Errors -gt 0) { "Failed" } else { "Committed" }
+    Update-RestoreRollbackJournal -Journal $journal -JournalPath $JournalPath -State $finalState | Out-Null
+    return [pscustomobject]@{Success=($result.Errors -eq 0);State=$finalState;JournalPath=$JournalPath;Errors=[int]$result.Errors;Changed=[int]$result.Changed}
 }
 
 function Register-RestoreAtNextBoot {
@@ -5627,6 +6220,7 @@ function Show-MainWindow {
             Write-Log "Capability gate: $($blockedCapability.Key) will not run - $($blockedCapability.Reason)" -Level Warning
         }
         $actionPlan = Get-RestoreActionPlan -SelectedKeys $selectedKeys -HealthReport $script:HealthReport -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -CreateRestorePoint:(($doRestorePoint -and -not $scanOnlyMode))
+        $rollbackJournal = $null
 
         if ($scanOnlyMode) {
             $ui.txtProgressTitle.Text = "Scanning (preview mode)..."
@@ -5635,8 +6229,17 @@ function Show-MainWindow {
         $window.Dispatcher.Invoke([action]{}, "Render")
 
         if (-not $scanOnlyMode -and $runnableKeys.Count -gt 0) {
-            try { $null = New-RestoreRollbackSnapshot -SelectedKeys $runnableKeys }
-            catch { Write-Log "Could not create rollback snapshot: $($_.Exception.Message)" -Level Warning }
+            try {
+                $journalPath = New-RestoreRollbackJournal -ActionPlan $actionPlan -SelectedKeys $runnableKeys
+                if (-not $journalPath) { throw "journal write was skipped" }
+                $rollbackJournal = $script:ActiveRollbackJournal
+            } catch {
+                Write-Log "Could not create rollback journal: $($_.Exception.Message)" -Level Error
+                $ui.txtStatus.Text = "Restore stopped before any changes: rollback journal unavailable"
+                $ui.btnLater.Content = "Close"; $ui.btnLater.Visibility = "Visible"
+                $window.Dispatcher.Invoke([action]{}, "Render")
+                return
+            }
         }
 
         # Restore point is an explicit operation in the same versioned plan.
@@ -5794,6 +6397,13 @@ function Show-MainWindow {
             $window.Dispatcher.Invoke([action]{}, "Render")
         }
         $script:CurrentCategory = ""
+
+        if ($rollbackJournal) {
+            $journalErrors = @($script:CategoryResults.Values | Where-Object { $_.Errors -gt 0 }).Count
+            $journalOperationErrors = @($rollbackJournal.Operations | Where-Object { $_.JournalStatus -eq "Failed" }).Count
+            $journalState = if ($journalErrors -gt 0 -or $journalOperationErrors -gt 0) { "Failed" } else { "Committed" }
+            Update-RestoreRollbackJournal -Journal $rollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State $journalState | Out-Null
+        }
 
         # ---- SUMMARY ----
         Write-Log "" -Level Info
@@ -6041,6 +6651,12 @@ if ($RemoteComputerName) {
 if ($RollbackLastRun) {
     Invoke-RestoreRollback
     exit
+}
+
+if ($ResumeRestoreJournal) {
+    $resumeResult = Resume-RestoreRollbackJournal
+    Write-Output ($resumeResult | ConvertTo-Json -Depth 30)
+    exit (if($resumeResult.Success){0}else{1})
 }
 
 if ($ResumeScheduledRestore) {
