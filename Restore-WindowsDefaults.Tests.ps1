@@ -318,3 +318,41 @@ Describe "Restore-WindowsDefaults capability gates" {
         ($evaluations | Where-Object Key -eq "chkTheme").CanMutate | Should -BeTrue
     }
 }
+
+Describe "Restore-WindowsDefaults action plans" {
+    BeforeAll {
+        $planManagement = [pscustomobject]@{ IsManaged=$false; IsKnown=$true; DomainJoined=$false; MdmEnrolled=$false }
+        $planProvider = {
+            [pscustomobject]@{
+                ProductName="Windows 11 Pro"; ProductFamily="Windows 11"; EditionID="Professional"
+                DisplayVersion="25H2"; CurrentBuild=26100; Architecture="AMD64"; Locale="en-US"
+                IsWindows=$true; IsOnline=$true; PowerShellMajor=5; IsWindowsPowerShell=$true; IsAdministrator=$true
+            }
+        }
+        $planProfile = Get-RestoreMachineProfile -OperatingSystemProvider $planProvider -ManagementState $planManagement
+    }
+
+    It "emits a versioned plan with exact registry state and review boundaries" {
+        $plan = Get-RestoreActionPlan -SelectedKeys @("chkDefender") -MachineProfile $planProfile
+
+        $plan.SchemaVersion | Should -Be 1
+        $plan.Status | Should -Be "ReviewRequired"
+        $plan.ExecutionAllowed | Should -BeFalse
+        $plan.PlanHash | Should -Match '^[a-f0-9]{64}$'
+        $plan.ExactOperationCount | Should -BeGreaterThan 0
+        $plan.OpaqueOperationCount | Should -Be 1
+        @($plan.Operations | Where-Object Kind -eq "RegistryValue").Count | Should -BeGreaterThan 0
+        ($plan.Operations | Where-Object Kind -eq "RegistryValue" | Select-Object -First 1).PSObject.Properties.Name | Should -Contain "Before"
+    }
+
+    It "keeps an unknown profile non-executable in the plan" {
+        $unknownProvider = { [pscustomobject]@{ ProductName="Windows 11 Pro"; IsWindows=$true; IsOnline=$true } }
+        $unknownProfile = Get-RestoreMachineProfile -OperatingSystemProvider $unknownProvider -ManagementState $planManagement
+        $plan = Get-RestoreActionPlan -SelectedKeys @("chkDefender") -MachineProfile $unknownProfile
+
+        $plan.Status | Should -Be "Blocked"
+        $plan.ExecutionAllowed | Should -BeFalse
+        @($plan.Operations | Where-Object Kind -eq "CapabilityGate").Count | Should -Be 1
+        @($plan.Operations | Where-Object CanExecute).Count | Should -Be 0
+    }
+}

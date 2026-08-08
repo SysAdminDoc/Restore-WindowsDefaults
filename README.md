@@ -66,6 +66,8 @@ The same script supports non-GUI workflows for automation and diagnostics:
 # Capture and compare a versioned registry snapshot
 .\Restore-WindowsDefaults.ps1 -NoGui -ExportSnapshot .\before.json
 .\Restore-WindowsDefaults.ps1 -NoGui -CompareSnapshot .\before.json
+.\Restore-WindowsDefaults.ps1 -NoGui -WhatIf -RestoreCategories chkDefender,chkWindowsUpdate
+.\Restore-WindowsDefaults.ps1 -NoGui -PlanPath .\restore-plan.json -RestoreCategories chkDefender,chkWindowsUpdate
 
 # Run a bounded restore tier or a targeted operational workflow
 .\Restore-WindowsDefaults.ps1 -RestoreTier Quick
@@ -169,6 +171,7 @@ After restoration completes, click **Export Report** to save a detailed HTML rep
 - **Non-destructive** - Only restores settings to Windows defaults, doesn't delete user data
 - **Detailed Logging** - Complete log saved to Desktop with timestamps
 - **Preview Mode** - See exactly what would change before committing
+- **Versioned action plans** - Export scoped operations with before/after state, risk, rollback metadata, capability decisions, and a plan hash
 - **Graceful Errors** - Continues through errors, reports them at the end
 - **Category Results** - FIXED, PARTIAL, FAILED, SKIPPED indicators show exactly what happened
 

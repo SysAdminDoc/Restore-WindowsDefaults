@@ -5,6 +5,7 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 ## [Unreleased]
 
 - Added fail-closed capability gates with versioned machine profiles, per-category OS/build/architecture/runtime declarations, managed-policy ownership decisions, CLI capability reports, and Intune/SCCM reporting.
+- Added versioned `-WhatIf`/`-PlanPath` action plans with capability decisions, registry/service/task state where statically known, operation hashes, and explicit review boundaries for remaining category-level operations.
 
 ## [v4.4.0] - 2026-08-03
 
