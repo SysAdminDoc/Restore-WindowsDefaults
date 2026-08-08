@@ -175,8 +175,12 @@ After restoration completes, click **Export Report** to save a detailed HTML rep
 ## Requirements
 
 - Windows 10 or Windows 11
+- Windows 10 build 10240 or newer, or Windows 11 build 22000 or newer
+- x86, x64, or ARM64 Windows architecture
 - PowerShell 5.1 (included with Windows)
 - Administrator privileges
+
+Before any restore, the tool records the product family, build, edition, architecture, locale, PowerShell runtime, elevation state, and domain/MDM management signals. Unknown or unsupported profiles, and categories owned by organization policy, are skipped without mutation. Use `-CapabilityReport` to export the machine profile and per-category gate decisions for automation.
 
 ## FAQ
 

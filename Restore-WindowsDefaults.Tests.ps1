@@ -260,3 +260,61 @@ Describe "Restore-WindowsDefaults planning helpers" {
         $map.ContainsKey("chkDefenderCpuCap") | Should -BeTrue
     }
 }
+
+Describe "Restore-WindowsDefaults capability gates" {
+    BeforeAll {
+        $capabilityManagement = [pscustomobject]@{ IsManaged=$false; IsKnown=$true; DomainJoined=$false; MdmEnrolled=$false }
+        $capabilityProvider = {
+            [pscustomobject]@{
+                ProductName="Windows 11 Pro"; ProductFamily="Windows 11"; EditionID="Professional"
+                DisplayVersion="25H2"; CurrentBuild=26100; Architecture="AMD64"; Locale="en-US"
+                IsWindows=$true; IsOnline=$true; PowerShellMajor=5; IsWindowsPowerShell=$true; IsAdministrator=$true
+            }
+        }
+    }
+
+    It "records a complete machine profile for a supported build" {
+        $profile = Get-RestoreMachineProfile -OperatingSystemProvider $capabilityProvider -ManagementState $capabilityManagement
+
+        $profile.Status | Should -Be "Ready"
+        $profile.ProductFamily | Should -Be "Windows 11"
+        $profile.Build | Should -Be 26100
+        $profile.Architecture | Should -Be "x64"
+        $profile.Locale | Should -Be "en-US"
+        $profile.Management.IsKnown | Should -BeTrue
+    }
+
+    It "declares capabilities for every restore function map entry" {
+        $map = Get-RestoreFunctionMap
+        $catalog = Get-RestoreCapabilityCatalog -FunctionMap $map
+
+        $catalog.Keys.Count | Should -Be $map.Keys.Count
+        foreach ($key in $map.Keys) {
+            $catalog.Contains($key) | Should -BeTrue
+            @($catalog[$key].SupportedProductFamilies).Count | Should -BeGreaterThan 0
+            @($catalog[$key].SupportedArchitectures).Count | Should -BeGreaterThan 0
+            $catalog[$key].RequiresAdministrator | Should -BeTrue
+        }
+    }
+
+    It "fails closed when the machine profile is incomplete" {
+        $unknownProvider = { [pscustomobject]@{ ProductName="Windows 11 Pro"; IsWindows=$true; IsOnline=$true } }
+        $profile = Get-RestoreMachineProfile -OperatingSystemProvider $unknownProvider -ManagementState $capabilityManagement
+        $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @("chkDefender","chkTheme") -MachineProfile $profile)
+
+        $profile.Status | Should -Be "Unknown"
+        @($evaluations | Where-Object CanMutate).Count | Should -Be 0
+        @($evaluations | Where-Object Status -eq "Unknown").Count | Should -Be 2
+        ($evaluations | Select-Object -First 1).Reason | Should -Match "unknown"
+    }
+
+    It "preserves organization-owned categories by default" {
+        $managed = [pscustomobject]@{ IsManaged=$true; IsKnown=$true; DomainJoined=$true; MdmEnrolled=$false }
+        $profile = Get-RestoreMachineProfile -OperatingSystemProvider $capabilityProvider -ManagementState $managed
+        $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @("chkWindowsUpdate","chkTheme") -MachineProfile $profile)
+
+        ($evaluations | Where-Object Key -eq "chkWindowsUpdate").Status | Should -Be "OrganizationOwned"
+        ($evaluations | Where-Object Key -eq "chkWindowsUpdate").CanMutate | Should -BeFalse
+        ($evaluations | Where-Object Key -eq "chkTheme").CanMutate | Should -BeTrue
+    }
+}

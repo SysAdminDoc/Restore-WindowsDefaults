@@ -14,6 +14,8 @@ param(
     [ValidateSet("Quick","Full","Nuclear")][string]$RestoreTier,
     [switch]$PostUpdateCheck,
     [string]$ExportSupportBundle,
+    [switch]$CapabilityReport,
+    [switch]$AllowManagedPolicy,
     [string[]]$RemoteComputerName,
     [string]$RemoteScriptPath
 )
@@ -40,6 +42,11 @@ param(
 # ============================================================================
 
 $script:Version = "4.4.0"
+$script:CapabilitySchemaVersion = 1
+$script:CapabilityProfile = $null
+$script:CapabilityEvaluations = @()
+$script:CapabilityExitCode = 0
+$script:ManagedPolicyOverrideRequested = [bool]$AllowManagedPolicy
 $script:LogPath = "$env:USERPROFILE\Desktop\WindowsRestore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:ChangesCount = 0
 $script:ErrorsCount = 0
@@ -70,6 +77,8 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
     if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
     if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
+    if ($CapabilityReport) { $relaunchArgs += "-CapabilityReport" }
+    if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
     if ($RemoteComputerName) { $relaunchArgs += @("-RemoteComputerName", "`"$($RemoteComputerName -join ',')`"") }
     if ($RemoteScriptPath) { $relaunchArgs += @("-RemoteScriptPath", "`"$RemoteScriptPath`"") }
     Start-Process $ps5 -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
@@ -90,6 +99,8 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
     if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
     if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
+    if ($CapabilityReport) { $relaunchArgs += "-CapabilityReport" }
+    if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
     if ($RemoteComputerName) { $relaunchArgs += @("-RemoteComputerName", "`"$($RemoteComputerName -join ',')`"") }
     if ($RemoteScriptPath) { $relaunchArgs += @("-RemoteScriptPath", "`"$RemoteScriptPath`"") }
     Start-Process powershell -Verb RunAs -ArgumentList ($relaunchArgs -join " ")
@@ -699,20 +710,35 @@ function Compare-AppxPackageBaseline {
 
 function Get-PolicyManagementState {
     $domainJoined = $false
-    $computerSystem = $null
+    $domainKnown = $false
+    $queryErrors = New-Object System.Collections.Generic.List[string]
     try {
         $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
         $domainJoined = [bool]$computerSystem.PartOfDomain
-    } catch { Write-Verbose "Could not query domain membership through CIM" }
+        $domainKnown = $true
+    } catch {
+        $queryErrors.Add("Domain membership query failed: $($_.Exception.Message)")
+    }
     $mdmPaths = @(
         "HKLM:\SOFTWARE\Microsoft\Enrollments",
         "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts",
         "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device"
     )
-    $mdmEnrolled = @($mdmPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+    $mdmSignals = @()
+    foreach ($mdmPath in $mdmPaths) {
+        try {
+            if (Test-Path -LiteralPath $mdmPath) { $mdmSignals += $mdmPath }
+        } catch { $queryErrors.Add("Management signal query failed for $mdmPath") }
+    }
+    $mdmEnrolled = $mdmSignals.Count -gt 0
     return [pscustomobject][ordered]@{
+        SchemaVersion=$script:CapabilitySchemaVersion
         DomainJoined=$domainJoined; MdmEnrolled=$mdmEnrolled
         IsManaged=($domainJoined -or $mdmEnrolled)
+        IsKnown=($domainKnown -and $queryErrors.Count -eq 0)
+        Signals=@($mdmSignals)
+        QueryErrors=@($queryErrors)
+        Ownership=if ($domainJoined -or $mdmEnrolled) { "Organization" } else { "Local" }
         ComputerName=$env:COMPUTERNAME
     }
 }
@@ -2876,6 +2902,302 @@ function Get-RestoreFunctionMap {
     }
 }
 
+function ConvertTo-RestoreArchitecture {
+    param([object]$Value)
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) { return $null }
+    if ($text -match '^(AMD64|x64|64-bit)$') { return "x64" }
+    if ($text -match '^(x86|i386|32-bit)$') { return "x86" }
+    if ($text -match '^(ARM64|aarch64)$') { return "arm64" }
+    return $text.ToLowerInvariant()
+}
+
+function Get-RestoreMachineProfile {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$OperatingSystemProvider,
+        [object]$ManagementState
+    )
+
+    $validationIssues = New-Object System.Collections.Generic.List[string]
+    $os = $null
+    if ($OperatingSystemProvider) {
+        try { $os = & $OperatingSystemProvider } catch { $validationIssues.Add("Operating system provider failed: $($_.Exception.Message)") }
+    } else {
+        $currentVersionPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        try {
+            $version = Get-ItemProperty -LiteralPath $currentVersionPath -ErrorAction Stop
+            $cim = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+            $os = [pscustomobject][ordered]@{
+                ProductName=$version.ProductName; ProductFamily=$null; EditionID=$version.EditionID
+                DisplayVersion=$version.DisplayVersion; ReleaseId=$version.ReleaseId
+                CurrentBuild=$version.CurrentBuild; CurrentBuildNumber=$version.CurrentBuildNumber
+                UBR=$version.UBR; Architecture=$cim.OSArchitecture; Locale=$cim.MUILanguages | Select-Object -First 1
+                IsWindows=$true; IsOnline=$true
+            }
+        } catch {
+            $validationIssues.Add("Windows version inventory failed: $($_.Exception.Message)")
+        }
+    }
+
+    if (-not $os) { $os = [pscustomobject]@{} }
+    $productName = if ($os.PSObject.Properties['ProductName']) { [string]$os.ProductName } else { $null }
+    $productFamily = if ($os.PSObject.Properties['ProductFamily'] -and $os.ProductFamily) { [string]$os.ProductFamily } else {
+        if ($productName -match 'Windows\s+11') { "Windows 11" }
+        elseif ($productName -match 'Windows\s+10') { "Windows 10" }
+        else { $null }
+    }
+    $edition = $null
+    foreach ($editionProperty in @('Edition','EditionID','InstallationType')) {
+        if ($os.PSObject.Properties[$editionProperty] -and -not [string]::IsNullOrWhiteSpace([string]$os.$editionProperty)) {
+            $edition = [string]$os.$editionProperty
+            break
+        }
+    }
+    $build = $null
+    foreach ($buildProperty in @('Build','CurrentBuild','CurrentBuildNumber')) {
+        if ($os.PSObject.Properties[$buildProperty] -and $null -ne $os.$buildProperty) {
+            $candidate = 0
+            if ([int]::TryParse(([string]$os.$buildProperty), [ref]$candidate)) { $build = $candidate; break }
+        }
+    }
+    $revision = 0
+    if ($os.PSObject.Properties['UBR']) { [int]::TryParse(([string]$os.UBR), [ref]$revision) | Out-Null }
+    $architecture = $null
+    foreach ($architectureProperty in @('Architecture','OSArchitecture')) {
+        if ($os.PSObject.Properties[$architectureProperty] -and $os.$architectureProperty) {
+            $architecture = ConvertTo-RestoreArchitecture $os.$architectureProperty
+            break
+        }
+    }
+    $locale = if ($os.PSObject.Properties['Locale'] -and $os.Locale) { [string]$os.Locale } else {
+        try { (Get-Culture).Name } catch { $null }
+    }
+    $operatingSystemIsWindows = if ($os.PSObject.Properties['IsWindows']) { [bool]$os.IsWindows } else { $true }
+    $isOnline = if ($os.PSObject.Properties['IsOnline']) { [bool]$os.IsOnline } else { $true }
+    $powershellMajor = if ($os.PSObject.Properties['PowerShellMajor']) { [int]$os.PowerShellMajor } else { [int]$PSVersionTable.PSVersion.Major }
+    $isWindowsPowerShell = if ($os.PSObject.Properties['IsWindowsPowerShell']) { [bool]$os.IsWindowsPowerShell } else { $PSVersionTable.PSEdition -eq "Desktop" }
+    $isAdministrator = if ($os.PSObject.Properties['IsAdministrator']) { [bool]$os.IsAdministrator } else {
+        try {
+            $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+            $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+            [bool]$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        } catch { $false }
+    }
+
+    if (-not $productFamily) { $validationIssues.Add("Windows product family is unknown") }
+    if ($null -eq $build) { $validationIssues.Add("Windows build is unknown") }
+    if ([string]::IsNullOrWhiteSpace($edition)) { $validationIssues.Add("Windows edition is unknown") }
+    if ([string]::IsNullOrWhiteSpace($architecture)) { $validationIssues.Add("OS architecture is unknown") }
+    if ([string]::IsNullOrWhiteSpace($locale)) { $validationIssues.Add("OS locale is unknown") }
+    if (-not $operatingSystemIsWindows) { $validationIssues.Add("The current operating system is not Windows") }
+
+    $management = if ($ManagementState) { $ManagementState } else { Get-PolicyManagementState }
+    $managementKnown = if ($management.PSObject.Properties['IsKnown']) { [bool]$management.IsKnown } else {
+        $null -ne $management.IsManaged
+    }
+    if (-not $managementKnown) { $validationIssues.Add("Management ownership could not be determined") }
+
+    $status = "Ready"
+    if (-not $operatingSystemIsWindows -or ($productFamily -and $productFamily -notin @("Windows 10", "Windows 11"))) { $status = "Unsupported" }
+    elseif ($validationIssues.Count -gt 0) { $status = "Unknown" }
+
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:CapabilitySchemaVersion
+        CapturedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
+        Status=$status; ValidationIssues=@($validationIssues)
+        ProductName=$productName; ProductFamily=$productFamily; Edition=$edition
+        DisplayVersion=if ($os.PSObject.Properties['DisplayVersion']) { [string]$os.DisplayVersion } else { $null }
+        ReleaseId=if ($os.PSObject.Properties['ReleaseId']) { [string]$os.ReleaseId } else { $null }
+        Build=$build; BuildRevision=$revision
+        Architecture=$architecture; Locale=$locale
+        IsWindows=$operatingSystemIsWindows; IsOnline=$isOnline
+        PowerShellMajor=$powershellMajor; IsWindowsPowerShell=$isWindowsPowerShell
+        IsAdministrator=$isAdministrator; Management=$management
+    }
+}
+
+function Get-RestoreCapabilityCatalog {
+    [CmdletBinding()]
+    param([hashtable]$FunctionMap)
+    if (-not $FunctionMap) { $FunctionMap = Get-RestoreFunctionMap }
+    $managedPolicyKeys = @(
+        "chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkUAC","chkSecurityUI",
+        "chkCrypto","chkNetwork","chkHostsFile","chkServices","chkTasks","chkFeatures",
+        "chkPrivacy","chkCopilot","chkEdge","chkOneDrive","chkSync","chkGroupPolicy",
+        "chkAppx","chkStoreChain","chkAccount"
+    )
+    $userScopedKeys = @("chkPrivacy","chkSync","chkNotifications","chkBgApps","chkEnvVars","chkDevicePrivacy","chkTaskbar","chkExplorer","chkStartMenu","chkTheme","chkClipboard","chkOneDrive","chkAccount")
+    $highRiskKeys = @("chkDefender","chkFirewall","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto","chkFeatures","chkAppx","chkGroupPolicy","chkHostsFile")
+    $catalog = [ordered]@{}
+    foreach ($key in @($FunctionMap.Keys | Sort-Object)) {
+        $managed = $key -in $managedPolicyKeys
+        $catalog[$key] = [pscustomobject][ordered]@{
+            CapabilityId=$key; CategoryKey=$key
+            SupportedProductFamilies=@("Windows 10","Windows 11")
+            SupportedEditions=@("All")
+            SupportedArchitectures=@("x86","x64","arm64")
+            MinimumBuildByFamily=@{"Windows 10"=10240; "Windows 11"=22000}
+            RequiresPowerShellMajor=5; RequiresWindowsPowerShell=$true
+            RequiresAdministrator=$true; RequiresOnline=$true
+            ManagedPolicyAction=if ($managed) { "Skip" } else { "Allow" }
+            PolicyOwnership=if ($managed) { "Organization" } else { "LocalDefault" }
+            Scope=if ($key -in $userScopedKeys) { "CurrentUser" } else { "MachineAndUser" }
+            Risk=if ($key -in $highRiskKeys) { "High" } else { "Medium" }
+        }
+    }
+    return $catalog
+}
+
+function Get-RestoreCapabilityEvaluation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string[]]$SelectedKeys,
+        [object]$MachineProfile,
+        [switch]$AllowManagedPolicy
+    )
+    if (-not $MachineProfile) { $MachineProfile = Get-RestoreMachineProfile }
+    $catalog = Get-RestoreCapabilityCatalog
+    $evaluations = @()
+    foreach ($key in @($SelectedKeys | Select-Object -Unique)) {
+        $reasons = New-Object System.Collections.Generic.List[string]
+        $definition = $catalog[$key]
+        $status = "Supported"
+        if (-not $definition) {
+            $status = "Unsupported"
+            $reasons.Add("Restore category is not declared in the capability catalog")
+        } elseif ($MachineProfile.Status -eq "Unsupported") {
+            $status = "Unsupported"
+            foreach ($profileIssue in @($MachineProfile.ValidationIssues)) { $reasons.Add([string]$profileIssue) }
+        } elseif ($MachineProfile.Status -ne "Ready") {
+            $status = "Unknown"
+            foreach ($profileIssue in @($MachineProfile.ValidationIssues)) { $reasons.Add([string]$profileIssue) }
+        }
+        if ($definition -and $status -eq "Supported") {
+            if ($MachineProfile.ProductFamily -notin @($definition.SupportedProductFamilies)) {
+                $status = "Unsupported"; $reasons.Add("OS product family '$($MachineProfile.ProductFamily)' is not supported")
+            }
+            $minimumBuild = $definition.MinimumBuildByFamily[$MachineProfile.ProductFamily]
+            if ($null -eq $MachineProfile.Build -or $MachineProfile.Build -lt $minimumBuild) {
+                $status = if ($null -eq $MachineProfile.Build) { "Unknown" } else { "Unsupported" }
+                $buildReason = if ($null -eq $MachineProfile.Build) { "OS build is unknown" } else { "OS build $($MachineProfile.Build) is below the supported minimum $minimumBuild" }
+                $reasons.Add($buildReason)
+            }
+            if ($MachineProfile.Edition -notin @($definition.SupportedEditions) -and "All" -notin @($definition.SupportedEditions)) {
+                $status = "Unsupported"; $reasons.Add("OS edition '$($MachineProfile.Edition)' is not supported")
+            }
+            if ($MachineProfile.Architecture -notin @($definition.SupportedArchitectures)) {
+                $status = if ($MachineProfile.Architecture) { "Unsupported" } else { "Unknown" }
+                $architectureReason = if ($MachineProfile.Architecture) { "Architecture '$($MachineProfile.Architecture)' is not supported" } else { "OS architecture is unknown" }
+                $reasons.Add($architectureReason)
+            }
+            if ($definition.RequiresPowerShellMajor -and $MachineProfile.PowerShellMajor -lt $definition.RequiresPowerShellMajor) {
+                $status = "Unsupported"; $reasons.Add("PowerShell $($definition.RequiresPowerShellMajor)+ is required")
+            }
+            if ($definition.RequiresWindowsPowerShell -and -not $MachineProfile.IsWindowsPowerShell) {
+                $status = "Unsupported"; $reasons.Add("Windows PowerShell 5.1 is required")
+            }
+            if ($definition.RequiresAdministrator -and -not $MachineProfile.IsAdministrator) {
+                $status = "Unsupported"; $reasons.Add("Administrator privileges are required")
+            }
+            if ($definition.RequiresOnline -and -not $MachineProfile.IsOnline) {
+                $status = "Unsupported"; $reasons.Add("Online Windows state is required")
+            }
+            if ($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['IsKnown'] -and -not $MachineProfile.Management.IsKnown) {
+                $status = "Unknown"; $reasons.Add("Management ownership could not be determined")
+            } elseif ($MachineProfile.Management -and $MachineProfile.Management.IsManaged -and $definition.ManagedPolicyAction -eq "Skip") {
+                if ($AllowManagedPolicy) { $reasons.Add("Managed policy override explicitly requested") }
+                else { $status = "OrganizationOwned"; $reasons.Add("Organization-owned policy state is preserved by default") }
+            }
+        }
+        $evaluations += [pscustomobject][ordered]@{
+            Key=$key; CapabilityId=if($definition){$definition.CapabilityId}else{$key}
+            Status=$status; CanMutate=($status -eq "Supported")
+            Reason=($reasons -join "; "); Reasons=@($reasons)
+            Scope=if($definition){$definition.Scope}else{"Unknown"}
+            Risk=if($definition){$definition.Risk}else{"Unknown"}
+            PolicyOwnership=if($definition){$definition.PolicyOwnership}else{"Unknown"}
+            Definition=$definition; Profile=$MachineProfile
+        }
+    }
+    return @($evaluations)
+}
+
+function Get-RestoreCapabilityReport {
+    [CmdletBinding()]
+    param(
+        [string[]]$SelectedKeys,
+        [object]$MachineProfile,
+        [switch]$AllowManagedPolicy
+    )
+    if (-not $MachineProfile) { $MachineProfile = Get-RestoreMachineProfile }
+    $keys = if ($SelectedKeys -and $SelectedKeys.Count -gt 0) { @($SelectedKeys | Select-Object -Unique) } else { @((Get-RestoreFunctionMap).Keys | Sort-Object) }
+    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $MachineProfile -AllowManagedPolicy:$AllowManagedPolicy)
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
+        GeneratedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
+        Profile=$MachineProfile; Categories=$evaluations
+        SupportedCount=@($evaluations | Where-Object CanMutate).Count
+        BlockedCount=@($evaluations | Where-Object { -not $_.CanMutate }).Count
+        Status=if (@($evaluations | Where-Object { -not $_.CanMutate }).Count -eq 0) { "Ready" } else { "Blocked" }
+    }
+}
+
+function Invoke-RestoreSelection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string[]]$SelectedKeys,
+        [switch]$CreateRollbackSnapshot,
+        [switch]$AllowManagedPolicy
+    )
+    $keys = @($SelectedKeys | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $map = Get-RestoreFunctionMap
+    $machineProfile = Get-RestoreMachineProfile
+    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy)
+    $script:CapabilityProfile = $machineProfile
+    $script:CapabilityEvaluations = $evaluations
+    $results = [ordered]@{}
+    foreach ($evaluation in $evaluations | Where-Object { -not $_.CanMutate }) {
+        $results[$evaluation.Key] = [pscustomobject][ordered]@{
+            Key=$evaluation.Key; Status="Skipped"; Changed=0; Errors=0
+            CapabilityStatus=$evaluation.Status; Reason=$evaluation.Reason
+        }
+        Write-Log "Skipped $($evaluation.Key): $($evaluation.Reason)" -Level Warning
+    }
+    $runnable = @($evaluations | Where-Object CanMutate)
+    if ($CreateRollbackSnapshot -and $runnable.Count -gt 0) {
+        $null = New-RestoreRollbackSnapshot -SelectedKeys @($runnable.Key)
+    }
+    foreach ($evaluation in $runnable) {
+        $key = $evaluation.Key
+        $script:CurrentCategory = $key
+        $script:CategoryResults[$key] = @{Status="Running"; Changed=0; Errors=0}
+        $beforeChanges = $script:ChangesCount
+        try {
+            & $map[$key]
+            $changed = [int]$script:CategoryResults[$key].Changed
+            $errors = [int]$script:CategoryResults[$key].Errors
+            $status = if ($errors -gt 0 -and $changed -gt 0) { "Partial" } elseif ($errors -gt 0) { "Error" } elseif ($changed -gt 0) { "Fixed" } else { "Already OK" }
+            $script:CategoryResults[$key].Status = $status
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;Reason=$null}
+        } catch {
+            $script:CategoryResults[$key].Status = "Error"
+            $script:CategoryResults[$key].Errors++
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;Reason=$_.Exception.Message}
+            Write-Log "Error in $key : $($_.Exception.Message)" -Level Error
+        }
+    }
+    $script:CurrentCategory = ""
+    $resultValues = @($results.Values)
+    $exitCode = if (@($resultValues | Where-Object Status -eq "Error").Count -gt 0) { 1 } elseif (@($resultValues | Where-Object { $_.Status -eq "Skipped" }).Count -gt 0) { 2 } else { 0 }
+    $script:CapabilityExitCode = $exitCode
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
+        Profile=$machineProfile; Categories=$resultValues; ExitCode=$exitCode
+        Status=if ($exitCode -eq 0) { "Completed" } elseif ($exitCode -eq 2) { "CapabilityBlocked" } else { "Failed" }
+    }
+}
+
 
 # ============================================================================
 # PRE-SCAN DIAGNOSTICS ENGINE (with detailed per-item findings)
@@ -3572,8 +3894,11 @@ function Compare-RegExportSnapshot {
 function Get-RestoreImpactPreview {
     param([string[]]$SelectedKeys,[object]$HealthReport=$script:HealthReport)
     $preview = @()
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+    $capabilityMap = @{}
+    foreach ($evaluation in $capabilityEvaluations) { $capabilityMap[$evaluation.Key] = $evaluation }
     foreach ($key in @($SelectedKeys)) {
-        $matching = @($HealthReport.GetEnumerator() | Where-Object { $key -in @($_.Value.FixKeys) })
+        $matching = if ($HealthReport) { @($HealthReport.GetEnumerator() | Where-Object { $key -in @($_.Value.FixKeys) }) } else { @() }
         $issueCount = 0; $detailCount = 0; $severity = "OK"
         foreach ($item in $matching) {
             $issueCount += [int]$item.Value.IssueCount
@@ -3586,6 +3911,11 @@ function Get-RestoreImpactPreview {
         $preview += [pscustomobject][ordered]@{
             FixKey=$key; DetectedIssueCount=$issueCount; DetailCount=$detailCount
             Severity=$severity; HasDetectedIssue=($issueCount -gt 0)
+            CapabilityStatus=if ($capabilityMap[$key]) { $capabilityMap[$key].Status } else { "Unknown" }
+            CanMutate=if ($capabilityMap[$key]) { [bool]$capabilityMap[$key].CanMutate } else { $false }
+            CapabilityReason=if ($capabilityMap[$key]) { $capabilityMap[$key].Reason } else { "Category is not declared in the capability catalog" }
+            Scope=if ($capabilityMap[$key]) { $capabilityMap[$key].Scope } else { "Unknown" }
+            Risk=if ($capabilityMap[$key]) { $capabilityMap[$key].Risk } else { "Unknown" }
         }
     }
     return @($preview)
@@ -3673,6 +4003,11 @@ function Invoke-RestoreRollback {
 function Register-RestoreAtNextBoot {
     param([Parameter(Mandatory=$true)][string[]]$SelectedKeys,[switch]$CreateRestorePoint)
     if ($SelectedKeys.Count -eq 0) { throw "At least one restore category is required" }
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+    $blockedCapabilities = @($capabilityEvaluations | Where-Object { -not $_.CanMutate })
+    if ($blockedCapabilities.Count -gt 0) {
+        throw ("Capability gate blocked scheduling: " + (($blockedCapabilities | ForEach-Object { "$($_.Key): $($_.Reason)" }) -join "; "))
+    }
     $directory = Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled"
     if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
     $statePath = Join-Path $directory ("restore-{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
@@ -3693,16 +4028,15 @@ function Invoke-ScheduledRestore {
     $statePath = @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled") -Filter "restore-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
     if (-not $statePath) { throw "No scheduled restore state is available" }
     $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @($state.SelectedKeys) -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+    $blockedCapabilities = @($capabilityEvaluations | Where-Object { -not $_.CanMutate })
+    if ($blockedCapabilities.Count -gt 0) {
+        throw ("Capability gate blocked scheduled restore: " + (($blockedCapabilities | ForEach-Object { "$($_.Key): $($_.Reason)" }) -join "; "))
+    }
     $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
     Remove-ItemProperty -Path $runOncePath -Name "RestoreWindowsDefaults" -ErrorAction SilentlyContinue
-    $null = New-RestoreRollbackSnapshot -SelectedKeys $state.SelectedKeys
-    $map = Get-RestoreFunctionMap
-    foreach ($key in @($state.SelectedKeys)) {
-        if (-not $map.ContainsKey($key)) { Write-Log "Scheduled category not recognized: $key" -Level Warning; continue }
-        $script:CurrentCategory = $key
-        & $map[$key]
-    }
-    $script:CurrentCategory = ""
+    $result = Invoke-RestoreSelection -SelectedKeys @($state.SelectedKeys) -CreateRollbackSnapshot -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested
+    if ($result.ExitCode -ne 0) { throw "Scheduled restore did not complete successfully (exit code $($result.ExitCode))" }
     Remove-Item -LiteralPath $statePath -Force -ErrorAction SilentlyContinue
     Write-Log "Scheduled restore completed" -Level Success
 }
@@ -3793,11 +4127,7 @@ function Invoke-RestoreTier {
         "Full" { @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto","chkNetwork","chkHostsFile","chkServices","chkTasks","chkFeatures","chkErrorReport","chkPrinting","chkMisc","chkPrivacy","chkCopilot","chkBing","chkCDM","chkBgApps","chkSync","chkNotifications","chkEnvVars","chkDevicePrivacy","chkTaskbar","chkExplorer","chkStartMenu","chkContextMenus","chkOOBE","chkEdge","chkChrome","chkOffice","chkOneDrive","chkNvidia","chk3rdParty","chkStoreChain","chkAccount","chkBluetooth","chkBiometrics","chkGaming","chkRemoteDesktop","chkAccessibility","chkInput","chkPower","chkMemory","chkStorage","chkInsider") }
         "Nuclear" { @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto","chkNetwork","chkHostsFile","chkServices","chkTasks","chkFeatures","chkErrorReport","chkPrinting","chkMisc","chkPrivacy","chkCopilot","chkBing","chkCDM","chkBgApps","chkSync","chkNotifications","chkEnvVars","chkDevicePrivacy","chkTaskbar","chkExplorer","chkStartMenu","chkContextMenus","chkOOBE","chkEdge","chkChrome","chkOffice","chkOneDrive","chkNvidia","chk3rdParty","chkStoreChain","chkAccount","chkBluetooth","chkBiometrics","chkGaming","chkRemoteDesktop","chkAccessibility","chkInput","chkPower","chkMemory","chkStorage","chkInsider","chkAppx") }
     }
-    $null = New-RestoreRollbackSnapshot -SelectedKeys $tierKeys
-    $map = Get-RestoreFunctionMap
-    foreach ($key in $tierKeys) { if ($map.ContainsKey($key)) { $script:CurrentCategory=$key; & $map[$key] } }
-    $script:CurrentCategory = ""
-    return @($tierKeys)
+    return (Invoke-RestoreSelection -SelectedKeys $tierKeys -CreateRollbackSnapshot -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
 }
 
 function Invoke-RemoteRestoreBatch {
@@ -4488,6 +4818,13 @@ function Show-MainWindow {
         $script:RestoreTimelineKeys = @($selectedKeys)
         $script:RestoreTimelineLabels = @($selectedKeys | ForEach-Object { $friendlyMap[$_] })
         $script:RestoreTimelineResults = @{}
+        $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $selectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+        $capabilityMap = @{}
+        foreach ($capabilityEvaluation in $capabilityEvaluations) { $capabilityMap[$capabilityEvaluation.Key] = $capabilityEvaluation }
+        $runnableKeys = @($capabilityEvaluations | Where-Object CanMutate | ForEach-Object Key)
+        foreach ($blockedCapability in @($capabilityEvaluations | Where-Object { -not $_.CanMutate })) {
+            Write-Log "Capability gate: $($blockedCapability.Key) will not run - $($blockedCapability.Reason)" -Level Warning
+        }
 
         if ($scanOnlyMode) {
             $ui.txtProgressTitle.Text = "Scanning (preview mode)..."
@@ -4495,13 +4832,13 @@ function Show-MainWindow {
         }
         $window.Dispatcher.Invoke([action]{}, "Render")
 
-        if (-not $scanOnlyMode) {
-            try { $null = New-RestoreRollbackSnapshot -SelectedKeys $selectedKeys }
+        if (-not $scanOnlyMode -and $runnableKeys.Count -gt 0) {
+            try { $null = New-RestoreRollbackSnapshot -SelectedKeys $runnableKeys }
             catch { Write-Log "Could not create rollback snapshot: $($_.Exception.Message)" -Level Warning }
         }
 
         # Restore point
-        if ($doRestorePoint -and !$scanOnlyMode) {
+        if ($doRestorePoint -and !$scanOnlyMode -and $runnableKeys.Count -gt 0) {
             $ui.txtProgressSub.Text = "Creating restore point..."
             $window.Dispatcher.Invoke([action]{}, "Render")
             Write-Log "Creating system restore point..." -Level Info
@@ -4530,12 +4867,15 @@ function Show-MainWindow {
             Write-Log "Pre-flight impact preview:" -Level Section
             foreach ($impact in $impactPreview) {
                 $impactLabel = $friendlyMap[$impact.FixKey]; if (-not $impactLabel) { $impactLabel = $impact.FixKey }
-                Write-Log "$impactLabel - $($impact.DetectedIssueCount) detected issue(s), $($impact.DetailCount) detail(s), severity $($impact.Severity)" -Level Info
+                Write-Log "$impactLabel - $($impact.DetectedIssueCount) detected issue(s), $($impact.DetailCount) detail(s), severity $($impact.Severity), capability $($impact.CapabilityStatus)" -Level Info
+                if (-not $impact.CanMutate) { Write-Log "  Capability gate reason: $($impact.CapabilityReason)" -Level Warning }
             }
             Write-Log "" -Level Info
             foreach ($key in $selectedKeys) {
                 $fn = $friendlyMap[$key]; if (!$fn) { $fn = $key }
-                Write-Log "Would restore: $fn" -Level Info
+                $capability = $capabilityMap[$key]
+                if ($capability -and $capability.CanMutate) { Write-Log "Would restore: $fn" -Level Info }
+                else { Write-Log "Would skip: $fn - $($capability.Reason)" -Level Warning }
             }
             Write-Log "" -Level Info
             Write-Log "=== PREVIEW COMPLETE ===" -Level Section
@@ -4591,21 +4931,27 @@ function Show-MainWindow {
 
             $script:CurrentCategory = $fn
             $script:CategoryResults[$fn] = @{ Status="OK"; Changed=0; Errors=0 }
-            try {
-                & $funcMap[$key]
-                if ($script:CategoryResults[$fn].Errors -gt 0 -and $script:CategoryResults[$fn].Changed -gt 0) {
-                    $script:CategoryResults[$fn].Status = "Partial"
-                } elseif ($script:CategoryResults[$fn].Errors -gt 0) {
+            $capability = $capabilityMap[$key]
+            if (-not $capability -or -not $capability.CanMutate) {
+                $script:CategoryResults[$fn].Status = "Skipped"
+                $script:CategoryResults[$fn].Reason = if ($capability) { $capability.Reason } else { "Category is not declared in the capability catalog" }
+            } else {
+                try {
+                    & $funcMap[$key]
+                    if ($script:CategoryResults[$fn].Errors -gt 0 -and $script:CategoryResults[$fn].Changed -gt 0) {
+                        $script:CategoryResults[$fn].Status = "Partial"
+                    } elseif ($script:CategoryResults[$fn].Errors -gt 0) {
+                        $script:CategoryResults[$fn].Status = "Error"
+                    } elseif ($script:CategoryResults[$fn].Changed -gt 0) {
+                        $script:CategoryResults[$fn].Status = "Fixed"
+                    } else {
+                        $script:CategoryResults[$fn].Status = "Already OK"
+                    }
+                } catch {
                     $script:CategoryResults[$fn].Status = "Error"
-                } elseif ($script:CategoryResults[$fn].Changed -gt 0) {
-                    $script:CategoryResults[$fn].Status = "Fixed"
-                } else {
-                    $script:CategoryResults[$fn].Status = "Already OK"
+                    $script:CategoryResults[$fn].Errors++
+                    Write-Log "Error in $fn : $($_.Exception.Message)" -Level Error
                 }
-            } catch {
-                $script:CategoryResults[$fn].Status = "Error"
-                $script:CategoryResults[$fn].Errors++
-                Write-Log "Error in $fn : $($_.Exception.Message)" -Level Error
             }
 
             # Add category result indicator
@@ -4828,6 +5174,14 @@ Set-Alias -Name Restore-LocalGroupPolicyDefaults -Value Restore-LocalGroupPolicy
 # ENTRY POINT
 # ============================================================================
 
+if ($CapabilityReport) {
+    $capabilityKeys = if ($RestoreCategories) { @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { $null }
+    if ($AllowManagedPolicy) { $capabilityReportDocument = Get-RestoreCapabilityReport -SelectedKeys $capabilityKeys -AllowManagedPolicy }
+    else { $capabilityReportDocument = Get-RestoreCapabilityReport -SelectedKeys $capabilityKeys }
+    Write-Output ($capabilityReportDocument | ConvertTo-Json -Depth 20)
+    exit 0
+}
+
 if ($ExportSnapshot) {
     $null = Export-RegistrySnapshot -OutputPath $ExportSnapshot
     Write-Output "Registry snapshot exported: $ExportSnapshot"
@@ -4869,19 +5223,23 @@ if ($ResumeScheduledRestore) {
 }
 
 if ($SecurityReset) {
-    $null = New-RestoreRollbackSnapshot -SelectedKeys @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkSecurityUI")
-    Restore-SecurityCenterFullReset
-    exit
+    if ($AllowManagedPolicy) { $securityResult = Invoke-RestoreSelection -SelectedKeys @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkSecurityUI") -CreateRollbackSnapshot -AllowManagedPolicy }
+    else { $securityResult = Invoke-RestoreSelection -SelectedKeys @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkSecurityUI") -CreateRollbackSnapshot }
+    Write-Output ($securityResult | ConvertTo-Json -Depth 20)
+    exit ([int]$securityResult.ExitCode)
 }
 
 if ($RebuildSearch) {
-    Restore-SearchIndexer -Rebuild
-    exit
+    if ($AllowManagedPolicy) { $searchResult = Invoke-RestoreSelection -SelectedKeys @("chkSearchIndexer") -CreateRollbackSnapshot -AllowManagedPolicy }
+    else { $searchResult = Invoke-RestoreSelection -SelectedKeys @("chkSearchIndexer") -CreateRollbackSnapshot }
+    Write-Output ($searchResult | ConvertTo-Json -Depth 20)
+    exit ([int]$searchResult.ExitCode)
 }
 
 if ($RestoreTier) {
-    $null = Invoke-RestoreTier -Tier $RestoreTier
-    exit
+    $tierResult = Invoke-RestoreTier -Tier $RestoreTier
+    Write-Output ($tierResult | ConvertTo-Json -Depth 20)
+    exit ([int]$tierResult.ExitCode)
 }
 
 if ($ScheduleRestore) {
@@ -4893,14 +5251,10 @@ if ($ScheduleRestore) {
 
 if ($RestoreCategories) {
     $directKeys = @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    $directMap = Get-RestoreFunctionMap
-    $null = New-RestoreRollbackSnapshot -SelectedKeys $directKeys
-    foreach ($directKey in $directKeys) {
-        if ($directMap.ContainsKey($directKey)) { $script:CurrentCategory = $directKey; & $directMap[$directKey] }
-        else { Write-Log "Restore category not recognized: $directKey" -Level Warning }
-    }
-    $script:CurrentCategory = ""
-    exit
+    if ($AllowManagedPolicy) { $directResult = Invoke-RestoreSelection -SelectedKeys $directKeys -CreateRollbackSnapshot -AllowManagedPolicy }
+    else { $directResult = Invoke-RestoreSelection -SelectedKeys $directKeys -CreateRollbackSnapshot }
+    Write-Output ($directResult | ConvertTo-Json -Depth 20)
+    exit ([int]$directResult.ExitCode)
 }
 
 if (-not $NoGui) { Show-MainWindow }

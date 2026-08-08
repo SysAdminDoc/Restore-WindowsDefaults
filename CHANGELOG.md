@@ -2,6 +2,10 @@
 
 All notable changes to Restore-WindowsDefaults will be documented in this file.
 
+## [Unreleased]
+
+- Added fail-closed capability gates with versioned machine profiles, per-category OS/build/architecture/runtime declarations, managed-policy ownership decisions, CLI capability reports, and Intune/SCCM reporting.
+
 ## [v4.4.0] - 2026-08-03
 
 - Added detection-only fingerprints for common debloat tools plus disabled service/task attribution.
