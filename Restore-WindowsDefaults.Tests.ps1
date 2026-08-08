@@ -332,17 +332,25 @@ Describe "Restore-WindowsDefaults action plans" {
         $planProfile = Get-RestoreMachineProfile -OperatingSystemProvider $planProvider -ManagementState $planManagement
     }
 
-    It "emits a versioned plan with exact registry state and review boundaries" {
+    It "emits a versioned plan with exact registry, service, file, and command state" {
         $plan = Get-RestoreActionPlan -SelectedKeys @("chkDefender") -MachineProfile $planProfile
 
         $plan.SchemaVersion | Should -Be 1
-        $plan.Status | Should -Be "ReviewRequired"
-        $plan.ExecutionAllowed | Should -BeFalse
+        $plan.Status | Should -Be "Ready"
+        $plan.ExecutionAllowed | Should -BeTrue
         $plan.PlanHash | Should -Match '^[a-f0-9]{64}$'
         $plan.ExactOperationCount | Should -BeGreaterThan 0
-        $plan.OpaqueOperationCount | Should -Be 1
+        $plan.OpaqueOperationCount | Should -Be 0
         @($plan.Operations | Where-Object Kind -eq "RegistryValue").Count | Should -BeGreaterThan 0
+        @($plan.Operations | Where-Object Kind -eq "Service").Count | Should -BeGreaterThan 0
         ($plan.Operations | Where-Object Kind -eq "RegistryValue" | Select-Object -First 1).PSObject.Properties.Name | Should -Contain "Before"
+        foreach ($operation in $plan.Operations) {
+            [string]::IsNullOrWhiteSpace([string]$operation.Scope) | Should -BeFalse
+            [string]::IsNullOrWhiteSpace([string]$operation.Risk) | Should -BeFalse
+            [string]::IsNullOrWhiteSpace([string]$operation.RollbackAction) | Should -BeFalse
+            [string]::IsNullOrWhiteSpace([string]$operation.Dependency) | Should -BeFalse
+            [string]::IsNullOrWhiteSpace([string]$operation.Verification) | Should -BeFalse
+        }
     }
 
     It "allows a fully represented registry category to execute its plan" {
