@@ -345,6 +345,15 @@ Describe "Restore-WindowsDefaults action plans" {
         ($plan.Operations | Where-Object Kind -eq "RegistryValue" | Select-Object -First 1).PSObject.Properties.Name | Should -Contain "Before"
     }
 
+    It "allows a fully represented registry category to execute its plan" {
+        $plan = Get-RestoreActionPlan -SelectedKeys @("chkBing") -MachineProfile $planProfile
+
+        $plan.Status | Should -Be "Ready"
+        $plan.ExecutionAllowed | Should -BeTrue
+        $plan.OpaqueOperationCount | Should -Be 0
+        @($plan.Operations | Where-Object { $_.Kind -eq "RegistryValue" -and $_.Exact }).Count | Should -BeGreaterThan 0
+    }
+
     It "keeps an unknown profile non-executable in the plan" {
         $unknownProvider = { [pscustomobject]@{ ProductName="Windows 11 Pro"; IsWindows=$true; IsOnline=$true } }
         $unknownProfile = Get-RestoreMachineProfile -OperatingSystemProvider $unknownProvider -ManagementState $planManagement
@@ -354,5 +363,51 @@ Describe "Restore-WindowsDefaults action plans" {
         $plan.ExecutionAllowed | Should -BeFalse
         @($plan.Operations | Where-Object Kind -eq "CapabilityGate").Count | Should -Be 1
         @($plan.Operations | Where-Object CanExecute).Count | Should -Be 0
+    }
+
+    It "keeps registry helpers mutation-free under WhatIf and captures the intended state" {
+        $path = "HKCU:\Software\Restore-WindowsDefaults-WhatIf-$([guid]::NewGuid().ToString('N'))"
+        try {
+            $script:ActionPlanCapture = $true
+            $script:CapturedActionOperations = New-Object System.Collections.Generic.List[object]
+            $script:CurrentCategory = "chkTest"
+            Set-RegistryValue -Path $path -Name "TestValue" -Value 1 -Type DWord | Should -BeFalse
+
+            Test-Path -LiteralPath $path | Should -BeFalse
+            $script:CapturedActionOperations.Count | Should -Be 1
+            $script:CapturedActionOperations[0].Action | Should -Be "Set"
+            $script:CapturedActionOperations[0].After.Exists | Should -BeTrue
+        } finally {
+            $script:ActionPlanCapture = $false
+            $script:CurrentCategory = ""
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "routes ready plan operations through the mutation primitives" {
+        $path = "HKCU:\Software\Restore-WindowsDefaults-PlanExecutor-$([guid]::NewGuid().ToString('N'))"
+        $plan = [pscustomobject]@{
+            Operations=@([pscustomobject]@{
+                OperationId="test-0001"; CategoryKey="chkTest"; Kind="RegistryValue"; Action="Set"
+                Target="$path\Value"; CanExecute=$true
+                Before=[pscustomobject]@{Exists=$false;Path=$path;Name="Value";Type=$null;Value=$null}
+                After=[pscustomobject]@{Exists=$true;Path=$path;Name="Value";Type="DWord";Value=1}
+            })
+        }
+        try {
+            $script:ActionPlanCapture = $true
+            $script:CapturedActionOperations = New-Object System.Collections.Generic.List[object]
+            $result = Invoke-RestoreActionPlan -ActionPlan $plan -CategoryKey "chkTest"
+
+            $result.OperationCount | Should -Be 1
+            $result.Changed | Should -Be 0
+            $result.Errors | Should -Be 0
+            $script:CapturedActionOperations.Count | Should -Be 1
+            Test-Path -LiteralPath $path | Should -BeFalse
+        } finally {
+            $script:ActionPlanCapture = $false
+            $script:CurrentCategory = ""
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
+        }
     }
 }

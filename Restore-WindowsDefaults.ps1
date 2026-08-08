@@ -52,6 +52,8 @@ $script:ManagedPolicyOverrideRequested = [bool]$AllowManagedPolicy
 $script:WhatIfRequested = [bool]$WhatIf
 $script:ActionPlanSchemaVersion = 1
 $script:LastActionPlan = $null
+$script:ActionPlanCapture = $false
+$script:CapturedActionOperations = New-Object System.Collections.Generic.List[object]
 $script:LogPath = "$env:USERPROFILE\Desktop\WindowsRestore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:ChangesCount = 0
 $script:ErrorsCount = 0
@@ -204,12 +206,40 @@ function Write-Log {
 # HELPER FUNCTIONS
 # ============================================================================
 
+function Add-RestoreActionPlanOperation {
+    param(
+        [Parameter(Mandatory=$true)][string]$Kind,
+        [Parameter(Mandatory=$true)][string]$Action,
+        [Parameter(Mandatory=$true)][string]$Target,
+        [object]$Before,
+        [object]$After,
+        [string]$Scope="MachineAndUser",
+        [string]$RollbackAction="Restore captured before state",
+        [string]$Reason,
+        [string]$Source="Mutation primitive"
+    )
+    if (-not $script:ActionPlanCapture) { return }
+    $operationNumber = $script:CapturedActionOperations.Count + 1
+    $script:CapturedActionOperations.Add([pscustomobject][ordered]@{
+        OperationId=("capture-{0:D4}" -f $operationNumber); CategoryKey=$script:CurrentCategory
+        Kind=$Kind; Action=$Action; Target=$Target; Scope=$Scope; Before=$Before; After=$After
+        RollbackAction=$RollbackAction; Exact=$true; CanExecute=$true; Reason=$Reason; Source=$Source
+    })
+}
+
 function Remove-RegistryValue {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([string]$Path, [string]$Name, [switch]$Silent)
     try {
         if (Test-Path $Path) {
             $current = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
             if ($current -and $current.PSObject.Properties[$Name]) {
+                $before = Get-RestoreRegistryPlanState -Path $Path -Name $Name
+                if ($script:ActionPlanCapture -or $script:WhatIfRequested) {
+                    Add-RestoreActionPlanOperation -Kind "RegistryValue" -Action "Remove" -Target "$Path\$Name" -Before $before -After ([pscustomobject]@{Exists=$false;Path=$Path;Name=$Name;Type=$null;Value=$null}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" })
+                    return $false
+                }
+                if (-not $PSCmdlet.ShouldProcess("$Path\$Name", "remove registry value")) { return $false }
                 Remove-ItemProperty -Path $Path -Name $Name -Force -ErrorAction Stop
                 if (-not $Silent) { Write-Log "Removed: $Path\$Name" -Level Success }
                 $script:ChangesCount++
@@ -223,8 +253,15 @@ function Remove-RegistryValue {
 }
 
 function Set-RegistryValue {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord", [switch]$Silent)
     try {
+        $before = if (Test-Path $Path) { Get-RestoreRegistryPlanState -Path $Path -Name $Name } else { [pscustomobject]@{Exists=$false;Path=$Path;Name=$Name;Type=$null;Value=$null} }
+        if ($script:ActionPlanCapture -or $script:WhatIfRequested) {
+            Add-RestoreActionPlanOperation -Kind "RegistryValue" -Action "Set" -Target "$Path\$Name" -Before $before -After ([pscustomobject]@{Exists=$true;Path=$Path;Name=$Name;Type=$Type;Value=$Value}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" })
+            return $false
+        }
+        if (-not $PSCmdlet.ShouldProcess("$Path\$Name", "set registry value")) { return $false }
         if (!(Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
         $current = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
         if ($current -and $current.PSObject.Properties[$Name]) {
@@ -243,9 +280,16 @@ function Set-RegistryValue {
 }
 
 function Remove-RegistryKey {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([string]$Path, [switch]$Silent)
     try {
         if (Test-Path $Path) {
+            $before = [pscustomobject]@{Exists=$true;Path=$Path}
+            if ($script:ActionPlanCapture -or $script:WhatIfRequested) {
+                Add-RestoreActionPlanOperation -Kind "RegistryKey" -Action "Remove" -Target $Path -Before $before -After ([pscustomobject]@{Exists=$false;Path=$Path}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" }) -RollbackAction "Restore captured key state"
+                return $false
+            }
+            if (-not $PSCmdlet.ShouldProcess($Path, "remove registry key")) { return $false }
             Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
             if (-not $Silent) { Write-Log "Removed key: $Path" -Level Success }
             $script:ChangesCount++
@@ -258,11 +302,17 @@ function Remove-RegistryKey {
 }
 
 function Restore-ServiceStartup {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([string]$ServiceName, [string]$StartupType, [switch]$Silent)
     try {
         $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
         if ($svc) {
             if ($svc.StartType.ToString() -ieq $StartupType) { return $false }
+            if ($script:ActionPlanCapture -or $script:WhatIfRequested) {
+                Add-RestoreActionPlanOperation -Kind "Service" -Action "SetStartupType" -Target "Service:$ServiceName" -Before ([pscustomobject]@{Exists=$true;StartType=$svc.StartType.ToString()}) -After ([pscustomobject]@{Exists=$true;StartType=$StartupType}) -Scope "Machine" -RollbackAction "Restore captured service startup type"
+                return $false
+            }
+            if (-not $PSCmdlet.ShouldProcess("Service:$ServiceName", "set startup type to $StartupType")) { return $false }
             Set-Service -Name $ServiceName -StartupType $StartupType -ErrorAction Stop
             if (-not $Silent) { Write-Log "Service '$ServiceName' set to $StartupType" -Level Success }
             $script:ChangesCount++
@@ -275,11 +325,17 @@ function Restore-ServiceStartup {
 }
 
 function Enable-ScheduledTaskSafe {
+    [CmdletBinding(SupportsShouldProcess=$true)]
     param([string]$TaskPath, [string]$TaskName, [switch]$Silent)
     try {
         $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
         if ($task) {
             if ($task.State -and $task.State.ToString() -ne "Disabled") { return $false }
+            if ($script:ActionPlanCapture -or $script:WhatIfRequested) {
+                Add-RestoreActionPlanOperation -Kind "ScheduledTask" -Action "Enable" -Target "Task:$TaskPath$TaskName" -Before ([pscustomobject]@{Exists=$true;State=$task.State.ToString()}) -After ([pscustomobject]@{Exists=$true;State="Enabled"}) -Scope "Machine" -RollbackAction "Restore captured task state"
+                return $false
+            }
+            if (-not $PSCmdlet.ShouldProcess("Task:$TaskPath$TaskName", "enable scheduled task")) { return $false }
             Enable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop | Out-Null
             if (-not $Silent) { Write-Log "Enabled task: $TaskPath$TaskName" -Level Success }
             $script:ChangesCount++
@@ -3163,13 +3219,15 @@ function Invoke-RestoreSelection {
     $map = Get-RestoreFunctionMap
     $machineProfile = Get-RestoreMachineProfile
     $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy)
+    $actionPlan = Get-RestoreActionPlan -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy
     $script:CapabilityProfile = $machineProfile
     $script:CapabilityEvaluations = $evaluations
+    $script:LastActionPlan = $actionPlan
     $results = [ordered]@{}
     foreach ($evaluation in $evaluations | Where-Object { -not $_.CanMutate }) {
         $results[$evaluation.Key] = [pscustomobject][ordered]@{
             Key=$evaluation.Key; Status="Skipped"; Changed=0; Errors=0
-            CapabilityStatus=$evaluation.Status; Reason=$evaluation.Reason
+            CapabilityStatus=$evaluation.Status; ExecutionMode="CapabilityGate"; ActionPlanStatus="Blocked"; Reason=$evaluation.Reason
         }
         Write-Log "Skipped $($evaluation.Key): $($evaluation.Reason)" -Level Warning
     }
@@ -3182,17 +3240,29 @@ function Invoke-RestoreSelection {
         $script:CurrentCategory = $key
         $script:CategoryResults[$key] = @{Status="Running"; Changed=0; Errors=0}
         $beforeChanges = $script:ChangesCount
+        $categoryPlan = @($actionPlan.Categories | Where-Object { $_.Key -eq $key } | Select-Object -First 1)
+        $useActionPlan = $categoryPlan.Count -eq 1 -and $categoryPlan[0].Status -eq "Ready"
         try {
-            & $map[$key]
-            $changed = [int]$script:CategoryResults[$key].Changed
-            $errors = [int]$script:CategoryResults[$key].Errors
+            if ($useActionPlan) {
+                $planResult = Invoke-RestoreActionPlan -ActionPlan $actionPlan -CategoryKey $key
+                $changed = [int]$planResult.Changed
+                $errors = [int]$planResult.Errors
+                $executionMode = "ActionPlan"
+            } else {
+                & $map[$key]
+                $changed = [int]$script:CategoryResults[$key].Changed
+                $errors = [int]$script:CategoryResults[$key].Errors
+                $executionMode = "LegacyReviewRequired"
+            }
             $status = if ($errors -gt 0 -and $changed -gt 0) { "Partial" } elseif ($errors -gt 0) { "Error" } elseif ($changed -gt 0) { "Fixed" } else { "Already OK" }
+            $script:CategoryResults[$key].Changed = $changed
+            $script:CategoryResults[$key].Errors = $errors
             $script:CategoryResults[$key].Status = $status
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;Reason=$null}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;ExecutionMode=$executionMode;ActionPlanStatus=$categoryPlan[0].Status;Reason=$null}
         } catch {
             $script:CategoryResults[$key].Status = "Error"
             $script:CategoryResults[$key].Errors++
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;Reason=$_.Exception.Message}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;ExecutionMode=if($useActionPlan){"ActionPlan"}else{"LegacyReviewRequired"};ActionPlanStatus=if($categoryPlan.Count -eq 1){$categoryPlan[0].Status}else{"Unknown"};Reason=$_.Exception.Message}
             Write-Log "Error in $key : $($_.Exception.Message)" -Level Error
         }
     }
@@ -3202,7 +3272,8 @@ function Invoke-RestoreSelection {
     $script:CapabilityExitCode = $exitCode
     return [pscustomobject][ordered]@{
         SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
-        Profile=$machineProfile; Categories=$resultValues; ExitCode=$exitCode
+        Profile=$machineProfile; ActionPlanHash=$actionPlan.PlanHash; ActionPlanStatus=$actionPlan.Status
+        Categories=$resultValues; ExitCode=$exitCode
         Status=if ($exitCode -eq 0) { "Completed" } elseif ($exitCode -eq 2) { "CapabilityBlocked" } else { "Failed" }
     }
 }
@@ -3279,7 +3350,7 @@ function Get-RestoreStaticActionOperation {
         }
         if ($target) {
             $operations.Add([pscustomobject][ordered]@{
-                CategoryKey=$CategoryKey; Kind=if($commandName -like "*Registry*"){"Registry"}elseif($commandName -like "*Service*"){"Service"}else{"ScheduledTask"}
+                CategoryKey=$CategoryKey; Kind=if($commandName -in @("Remove-RegistryValue","Set-RegistryValue")){"RegistryValue"}elseif($commandName -eq "Remove-RegistryKey"){"RegistryKey"}elseif($commandName -like "*Service*"){"Service"}else{"ScheduledTask"}
                 Action=$action; Target=$target; Scope=$scope; Before=$before; After=$after
                 RollbackAction=$rollback; Exact=$true; CanExecute=$true; Reason=$null; Source="Restore function AST"
             })
@@ -3302,6 +3373,11 @@ function Get-RestoreActionPlan {
     $operations = New-Object System.Collections.Generic.List[object]
     $categoryPlans = New-Object System.Collections.Generic.List[object]
     $functionMap = Get-RestoreFunctionMap
+    $fullyPlannableKeys = @(
+        "chkDefenderCpuCap","chkBing","chkTaskbar","chkStartMenu","chkNotifications",
+        "chkFirefox","chkMemory","chkStorage","chkUAC","chkInput","chkAccessibility",
+        "chkBgApps","chkContextMenus","chkOOBE"
+    )
     $operationNumber = 0
     foreach ($evaluation in $evaluations) {
         $categoryExact = 0
@@ -3363,15 +3439,17 @@ function Get-RestoreActionPlan {
                     $categoryExact++
                 }
             }
-            $operationNumber++
-            $opaqueReason = "Category contains additional service, file, AppX, policy, or native-command operations not yet represented as individual plan entries"
-            $operations.Add([pscustomobject][ordered]@{
-                OperationId=("op-{0:D4}" -f $operationNumber); CategoryKey=$evaluation.Key; Kind="CategoryBoundary"
-                Action="Review category executor"; Target=$evaluation.Key; Scope=$evaluation.Scope; Risk=$evaluation.Risk
-                Before=$null; After="Windows default contract"; RollbackAction="Use run rollback journal"
-                Exact=$false; CanExecute=$false; Reason=$opaqueReason; Source="Restore function map"
-            })
-            $categoryOpaque++
+            if ($evaluation.Key -notin $fullyPlannableKeys) {
+                $operationNumber++
+                $opaqueReason = "Category contains additional service, file, AppX, policy, or native-command operations not yet represented as individual plan entries"
+                $operations.Add([pscustomobject][ordered]@{
+                    OperationId=("op-{0:D4}" -f $operationNumber); CategoryKey=$evaluation.Key; Kind="CategoryBoundary"
+                    Action="Review category executor"; Target=$evaluation.Key; Scope=$evaluation.Scope; Risk=$evaluation.Risk
+                    Before=$null; After="Windows default contract"; RollbackAction="Use run rollback journal"
+                    Exact=$false; CanExecute=$false; Reason=$opaqueReason; Source="Restore function map"
+                })
+                $categoryOpaque++
+            }
         }
         $categoryPlans.Add([pscustomobject][ordered]@{
             Key=$evaluation.Key; CapabilityStatus=$evaluation.Status; CanMutate=$evaluation.CanMutate
@@ -3399,6 +3477,62 @@ function Get-RestoreActionPlan {
     }
     $script:LastActionPlan = $plan
     return $plan
+}
+
+function Invoke-RestoreActionPlanOperation {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Operation)
+    if (-not $Operation.CanExecute -or $Operation.Action -eq "NoOp") { return $false }
+    if (-not $PSCmdlet.ShouldProcess($Operation.Target, $Operation.Action)) { return $false }
+    switch ($Operation.Kind) {
+        "RegistryValue" {
+            if ($Operation.Action -eq "Remove") {
+                return (Remove-RegistryValue -Path $Operation.Before.Path -Name $Operation.Before.Name -Silent)
+            }
+            if ($Operation.Action -eq "Set") {
+                return (Set-RegistryValue -Path $Operation.After.Path -Name $Operation.After.Name -Value $Operation.After.Value -Type $Operation.After.Type -Silent)
+            }
+        }
+        "RegistryKey" {
+            if ($Operation.Action -eq "Remove") { return (Remove-RegistryKey -Path $Operation.Before.Path -Silent) }
+        }
+        "Service" {
+            if ($Operation.Action -eq "SetStartupType") {
+                return (Restore-ServiceStartup -ServiceName ($Operation.Target -replace '^Service:', '') -StartupType $Operation.After.StartType -Silent)
+            }
+        }
+        "ScheduledTask" {
+            if ($Operation.Action -eq "Enable") {
+                $taskTarget = $Operation.Target -replace '^Task:', ''
+                $separator = $taskTarget.LastIndexOf('\')
+                if ($separator -ge 0) {
+                    return (Enable-ScheduledTaskSafe -TaskPath ($taskTarget.Substring(0, $separator + 1)) -TaskName $taskTarget.Substring($separator + 1) -Silent)
+                }
+            }
+        }
+    }
+    return $false
+}
+
+function Invoke-RestoreActionPlan {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$ActionPlan,[string]$CategoryKey)
+    $operations = @($ActionPlan.Operations | Where-Object { $_.CanExecute -and ($null -eq $CategoryKey -or $_.CategoryKey -eq $CategoryKey) })
+    $changed = 0
+    $errors = 0
+    foreach ($operation in $operations) {
+        $script:CurrentCategory = if ($CategoryKey) { $CategoryKey } else { $operation.CategoryKey }
+        $beforeChanges = $script:ChangesCount
+        try {
+            $null = Invoke-RestoreActionPlanOperation -Operation $operation
+        } catch {
+            $errors++
+            Write-Log "Plan operation $($operation.OperationId) failed: $($_.Exception.Message)" -Level Error
+        }
+        $changed += [int]($script:ChangesCount - $beforeChanges)
+    }
+    if ($CategoryKey) { $script:CurrentCategory = "" }
+    return [pscustomobject][ordered]@{CategoryKey=$CategoryKey; OperationCount=$operations.Count; Changed=$changed; Errors=$errors; Status=if($errors -gt 0 -and $changed -gt 0){"Partial"}elseif($errors -gt 0){"Error"}elseif($changed -gt 0){"Changed"}else{"Already OK"}}
 }
 
 
