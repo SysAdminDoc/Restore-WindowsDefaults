@@ -26,6 +26,7 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 - **Debloat fingerprinting** - Detects evidence from O&O ShutUp10, WPD, ThisIsWin11, Sophia Script, and Win10Privacy without executing their code
 - **Baseline inventory** - Exports and compares registry/AppX state, including provisioned-package and offline-WIM comparisons
 - **Managed-device safety** - Reports structured domain, MDM, Group Policy, local-policy, and account-join provenance; managed values and categories are skipped by default unless an explicit operator override is recorded
+- **Independent restore verification** - Records bounded native-command exit codes, stderr, failure taxonomy, fresh postconditions, and pending-reboot state in CLI, GUI, and deployment-wrapper results
 - **Operational recovery** - Adds security reset, Search index rebuild, Store/WinGet repair, privacy-slider repair, integrity-checked rollback journals, and next-boot restore scheduling
 - **Deployment wrappers** - Read-only compliance and optional remediation entry points for Intune and Configuration Manager
 - **HTML report export** - Save a detailed dark-themed report of everything restored with before/after states
@@ -78,7 +79,7 @@ The same script supports non-GUI workflows for automation and diagnostics:
 .\Restore-WindowsDefaults.ps1 -RestoreTier Quick
 .\Restore-WindowsDefaults.ps1 -SecurityReset
 .\Restore-WindowsDefaults.ps1 -RebuildSearch
-.\Restore-WindowsDefaults.ps1 -PostUpdateCheck
+.\Restore-WindowsDefaults.ps1 -NoGui -PostUpdateCheck
 .\Restore-WindowsDefaults.ps1 -ExportSupportBundle .\support.zip
 
 # Schedule selected categories for the next boot
@@ -86,6 +87,8 @@ The same script supports non-GUI workflows for automation and diagnostics:
 ```
 
 `-NoGui` is intended for automation. The Intune and Configuration Manager wrappers under `deploy\` emit JSON compliance results by default; add `-Remediate` to run the critical security and service/task categories in an already elevated management context.
+
+Restore and remediation JSON includes a structured outcome for each executable operation: `Changed`, `Skipped`, `Unsupported`, `Failed`, or `VerificationFailed`, with native exit code, bounded stdout/stderr, and failure taxonomy where applicable. Registry, file, service, task, AppX, optional-feature, and environment-variable operations are checked with fresh postcondition reads after execution. Native commands and restore points are reported as `NotObservable` when no deterministic reader exists. `-PostUpdateCheck` performs an independent fresh verification pass and reports `VerificationStatus`, `VerificationReport`, and structured `PendingRebootState`; a pending reboot or partial verification is never hidden by a successful process exit.
 
 The BaselineReport CLI emits the versioned registry, AppX, fingerprint, service/task, and scheduled-task catalogs with source provenance, supported build and edition ranges, confidence, and warning-only handling for unknown entries. No catalog entry with unknown provenance or unsupported scope is eligible for automatic fixes.
 

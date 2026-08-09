@@ -816,3 +816,75 @@ Describe "Restore-WindowsDefaults rollback journals" {
         }
     }
 }
+
+Describe "Restore-WindowsDefaults native outcomes and verification" {
+    It "classifies native success, stderr failures, and unavailable executables" {
+        $success = Invoke-RestoreNativeCommand -FilePath "cmd.exe" -ArgumentList @("/c","exit","0") -Silent
+        $failure = Invoke-RestoreNativeCommand -FilePath "cmd.exe" -ArgumentList @("/c","echo native-error 1>&2 & exit /b 7") -ExpectedExitCodes @(0) -Silent
+        $unsupported = Invoke-RestoreNativeCommand -FilePath "rwd-missing-native-command.exe" -Silent
+
+        $success.Status | Should -Be "Changed"
+        $success.ExitCode | Should -Be 0
+        $success.Success | Should -BeTrue
+        $failure.Status | Should -Be "Failed"
+        $failure.ExitCode | Should -Be 7
+        $failure.FailureCategory | Should -Be "UnexpectedExitCode"
+        $failure.FailureReason | Should -Match "unexpected exit code"
+        $failure.Stderr | Should -Match "native-error"
+        $unsupported.Status | Should -Be "Unsupported"
+        $unsupported.FailureCategory | Should -Be "ExecutableUnavailable"
+        $success.PendingRebootState.SchemaVersion | Should -Be 1
+    }
+
+    It "reports native failures as action-plan errors instead of verified no-change" {
+        $plan = [pscustomobject]@{
+            Operations=@([pscustomobject]@{
+                OperationId="native-0001"; CategoryKey="chkTest"; Kind="NativeCommand"; Action="Execute"; Target="cmd.exe /c exit 9"
+                Scope="Machine"; CanExecute=$true; Before=[pscustomobject]@{Executable="cmd.exe";Arguments=@("/c","exit","9");ExitCode=$null;Observed=$true}
+                After=[pscustomobject]@{ExpectedExitCodes=@(0);RequiresReboot=$false;Completed=$true}
+                Metadata=[pscustomobject]@{FilePath="cmd.exe";ArgumentList=@("/c","exit","9");ExpectedExitCodes=@(0);RequiresReboot=$false}
+            })
+        }
+        $result = Invoke-RestoreActionPlan -ActionPlan $plan -CategoryKey "chkTest"
+
+        $result.Status | Should -Be "Error"
+        $result.Errors | Should -Be 1
+        $result.Operations[0].Status | Should -Be "Failed"
+        $result.Operations[0].ExitCode | Should -Be 9
+        $result.Operations[0].FailureCategory | Should -Be "UnexpectedExitCode"
+        $result.Operations[0].FailureReason | Should -Match "unexpected exit code"
+        @($result.PendingRebootState.Signals).Count | Should -BeGreaterThan 0
+    }
+
+    It "freshly verifies a registry postcondition after plan execution" {
+        $path = "HKCU:\Software\RwdIndependentVerification-$([guid]::NewGuid().ToString('N'))"
+        $plan = [pscustomobject]@{
+            Operations=@([pscustomobject]@{
+                OperationId="registry-0001"; CategoryKey="chkTest"; Kind="RegistryValue"; Action="Set"; Target="$path\Value"
+                Scope="CurrentUser"; CanExecute=$true; Before=[pscustomobject]@{Exists=$false;KeyExists=$false;Path=$path;Name="Value";Type=$null;Value=$null}
+                After=[pscustomobject]@{Exists=$true;Path=$path;Name="Value";Type="DWord";Value=19}
+            })
+        }
+        try {
+            $result = Invoke-RestoreActionPlan -ActionPlan $plan -CategoryKey "chkTest"
+            $result.Errors | Should -Be 0
+            $result.Operations[0].Verification.Status | Should -Be "Verified"
+            $result.Operations[0].Verification.FreshRead | Should -BeTrue
+            $report = Get-RestoreIndependentPostRunVerification -ActionPlan $plan
+            $report.Status | Should -Be "Verified"
+            $report.VerifiedCount | Should -Be 1
+            $report.Independent | Should -BeTrue
+        } finally {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "reports a pending reboot from injected structured signals" {
+        $pending = Get-RestorePendingRebootState -Provider { param($path) $path -match "Component Based Servicing" }
+
+        $pending.PendingReboot | Should -BeTrue
+        $pending.Status | Should -Be "Pending"
+        @($pending.Signals | Where-Object { $_.Detected }).Count | Should -Be 1
+        $pending.Signals[0].PSObject.Properties.Name | Should -Contain "EvidenceType"
+    }
+}

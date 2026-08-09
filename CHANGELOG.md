@@ -12,6 +12,7 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 - Routed fully represented registry, service, and scheduled-task operations through `ShouldProcess`-aware mutation primitives and the versioned plan executor.
 - Made mapped category restore paths capture exact registry, service, task, file, AppX, environment, optional-feature, native-command, and restore-point operations before execution, with stale-state precondition checks shared by CLI and GUI.
 - Replaced run snapshots with v2 atomic rollback journals containing per-operation state, SHA-256 integrity, resumable execution, tamper refusal, inverse adapters, and legacy snapshot compatibility.
+- Added bounded native-command outcomes with exit codes, stderr, reboot-required and failure-taxonomy states, independent fresh postcondition verification, explicit pending-reboot reporting, and structured propagation through CLI, GUI, Intune, and Configuration Manager results.
 
 ## [v4.4.0] - 2026-08-03
 

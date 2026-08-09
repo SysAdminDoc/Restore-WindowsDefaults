@@ -54,6 +54,12 @@ $script:CapabilityExitCode = 0
 $script:ManagementState = $null
 $script:ManagedPolicyOverrideRequested = [bool]$AllowManagedPolicy
 $script:WhatIfRequested = [bool]$WhatIf
+$script:NativeCommandSchemaVersion = 1
+$script:NativeCommandMaxOutputBytes = 256KB
+$script:NativeCommandResults = New-Object System.Collections.Generic.List[object]
+$script:VerificationSchemaVersion = 1
+$script:LastVerificationReport = $null
+$script:PendingRebootState = $null
 $script:ActionPlanSchemaVersion = 1
 $script:LastActionPlan = $null
 $script:ActionPlanCapture = $false
@@ -655,6 +661,86 @@ function Invoke-RestoreScheduledTaskState {
     }
 }
 
+function Get-RestoreNativeOutput {
+    param([string]$Path,[int64]$MaxBytes=$script:NativeCommandMaxOutputBytes)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return [pscustomobject]@{Text="";Truncated=$false;Bytes=0} }
+    $stream = $null
+    try {
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        $bytesToRead = [int][Math]::Min([int64]$file.Length,[int64]$MaxBytes)
+        $buffer = New-Object byte[] $bytesToRead
+        $stream = [System.IO.File]::OpenRead($file.FullName)
+        $read = if ($bytesToRead -gt 0) { $stream.Read($buffer,0,$bytesToRead) } else { 0 }
+        $text = if ($read -gt 0) { [Text.Encoding]::Default.GetString($buffer,0,$read) } else { "" }
+        return [pscustomobject]@{Text=$text;Truncated=([int64]$file.Length -gt $MaxBytes);Bytes=$file.Length}
+    } catch {
+        return [pscustomobject]@{Text="";Truncated=$false;Bytes=0}
+    } finally {
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Get-RestoreNativeFailureTaxonomy {
+    param([string]$FilePath,[object]$ExitCode,[int[]]$ExpectedExitCodes,[string]$ErrorMessage,[bool]$ExecutableAvailable)
+    if (-not $ExecutableAvailable) { return [pscustomobject]@{Category="Unsupported";Code="ExecutableUnavailable";Reason="The native executable '$FilePath' is not installed or cannot be resolved"} }
+    if ($ErrorMessage) { return [pscustomobject]@{Category="Failed";Code="LaunchFailed";Reason=$ErrorMessage} }
+    if ($null -eq $ExitCode) { return [pscustomobject]@{Category="Failed";Code="NoExitCode";Reason="The process ended without an exit code"} }
+    $numericExitCode = [int]$ExitCode
+    if ($numericExitCode -in @($ExpectedExitCodes)) {
+        if ($numericExitCode -in @(3010,1641)) { return [pscustomobject]@{Category="Success";Code="RebootRequired";Reason="The command requested a reboot"} }
+        return [pscustomobject]@{Category="Success";Code="ExpectedExitCode";Reason="The command returned an expected exit code"}
+    }
+    if ($numericExitCode -in @(5,0x5,740)) { return [pscustomobject]@{Category="Failed";Code="AccessDenied";Reason="The command reported insufficient privilege"} }
+    return [pscustomobject]@{Category="Failed";Code="UnexpectedExitCode";Reason="The command returned an unexpected exit code"}
+}
+
+function Get-RestorePendingRebootState {
+    [CmdletBinding()]
+    param([scriptblock]$Provider)
+    $definitions = @(
+        @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending";ValueName=$null;Source="Component Based Servicing"},
+        @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update";ValueName="RebootRequired";Source="Windows Update"},
+        @{Path="HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager";ValueName="PendingFileRenameOperations";Source="Pending file rename"},
+        @{Path="HKLM:\SOFTWARE\Microsoft\Updates";ValueName="UpdateExeVolatile";Source="Update executable state"}
+    )
+    $signals = New-Object System.Collections.Generic.List[object]
+    $errors = New-Object System.Collections.Generic.List[string]
+    foreach ($definition in @($definitions)) {
+        $detected = $false
+        try {
+            if ($Provider) {
+                $provided = & $Provider $definition.Path $definition.ValueName
+                if ($provided -is [bool]) { $detected = [bool]$provided }
+                elseif ($provided -and $provided.PSObject.Properties['PendingReboot']) { $detected = [bool]$provided.PendingReboot }
+                elseif ($provided -and $provided.PSObject.Properties['Detected']) { $detected = [bool]$provided.Detected }
+                else { $detected = [bool]$provided }
+            } elseif ($definition.ValueName) {
+                $properties = Get-ItemProperty -LiteralPath $definition.Path -Name $definition.ValueName -ErrorAction SilentlyContinue
+                if ($properties -and $properties.PSObject.Properties[$definition.ValueName]) {
+                    $value = $properties.$($definition.ValueName)
+                    $detected = if ($definition.ValueName -eq "UpdateExeVolatile") { [int]$value -ne 0 } else { $true }
+                }
+            } else { $detected = Test-Path -LiteralPath $definition.Path }
+        } catch { $errors.Add("Pending reboot signal query failed for $($definition.Path)") }
+        $null = $signals.Add([pscustomobject][ordered]@{Source=$definition.Source;Path=$definition.Path;ValueName=$definition.ValueName;Detected=$detected;EvidenceType="StructuredPresence"})
+    }
+    $pending = @($signals | Where-Object Detected).Count -gt 0
+    $known = $errors.Count -eq 0
+    $result = [pscustomobject][ordered]@{
+        SchemaVersion=$script:VerificationSchemaVersion; PendingReboot=$pending; Status=if(-not $known){"Unknown"}elseif($pending){"Pending"}else{"Clear"}
+        Known=$known; Signals=@($signals.ToArray()); QueryErrors=@($errors.ToArray()); CheckedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
+    }
+    $script:PendingRebootState = $result
+    return $result
+}
+
+function Add-RestoreNativeCommandResult {
+    param([Parameter(Mandatory=$true)][object]$Result)
+    if (-not $script:NativeCommandResults) { $script:NativeCommandResults = New-Object System.Collections.Generic.List[object] }
+    $null = $script:NativeCommandResults.Add($Result)
+    return $Result
+}
+
 function Invoke-RestoreNativeCommand {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param(
@@ -668,23 +754,59 @@ function Invoke-RestoreNativeCommand {
     $argumentText = @($ArgumentList) -join " "
     $target = "$FilePath $argumentText".Trim()
     $before = [pscustomobject][ordered]@{Executable=$FilePath;Arguments=@($ArgumentList);ExitCode=$null;Observed=$true}
-    $after = [pscustomobject][ordered]@{ExpectedExitCodes=@($ExpectedExitCodes);RequiresReboot=[bool]$RequiresReboot;Completed=$true}
+    $after = [pscustomobject][ordered]@{ExpectedExitCodes=@($ExpectedExitCodes);RequiresReboot=[bool]$RequiresReboot;Completed=$true;Status="Planned";PendingReboot=[bool]$RequiresReboot}
+    $metadata = [pscustomobject][ordered]@{FilePath=$FilePath;ArgumentList=@($ArgumentList);ExpectedExitCodes=@($ExpectedExitCodes);RequiresReboot=[bool]$RequiresReboot;NativeCommandSchemaVersion=$script:NativeCommandSchemaVersion;FailureTaxonomy="ExecutableUnavailable|AccessDenied|LaunchFailed|UnexpectedExitCode|RebootRequired"}
     if ($script:ActionPlanCapture) {
-        Add-RestoreActionPlanOperation -Kind "NativeCommand" -Action "Execute" -Target $target -Before $before -After $after -Scope $Scope -RollbackAction "No automatic rollback; verify command postcondition" -Risk "High" -Verification "Exit code is one of the expected values" -Metadata ([pscustomobject]@{FilePath=$FilePath;ArgumentList=@($ArgumentList);ExpectedExitCodes=@($ExpectedExitCodes);RequiresReboot=[bool]$RequiresReboot})
-        return [pscustomobject]@{Success=$false;ExitCode=$null;Planned=$true;Target=$target}
+        Add-RestoreActionPlanOperation -Kind "NativeCommand" -Action "Execute" -Target $target -Before $before -After $after -Scope $Scope -RollbackAction "No automatic rollback; verify command postcondition" -Risk "High" -Verification "Exit code taxonomy and fresh postcondition state are reported" -Metadata $metadata
+        return [pscustomobject][ordered]@{Success=$false;Status="Planned";ExitCode=$null;Planned=$true;Target=$target;PendingReboot=[bool]$RequiresReboot;FailureCategory="Planned";Stderr=""}
     }
-    if ($script:WhatIfRequested) { return [pscustomobject]@{Success=$false;ExitCode=$null;Planned=$true;Target=$target} }
+    if ($script:WhatIfRequested) { return [pscustomobject][ordered]@{Success=$false;Status="Planned";ExitCode=$null;Planned=$true;Target=$target;PendingReboot=[bool]$RequiresReboot;FailureCategory="Planned";Stderr=""} }
+    $command = Get-Command -Name $FilePath -ErrorAction SilentlyContinue
+    $executableAvailable = $null -ne $command
+    if (-not $executableAvailable) {
+        try { $executableAvailable = Test-Path -LiteralPath $FilePath -PathType Leaf } catch { $executableAvailable = $false }
+    }
+    if (-not $executableAvailable) {
+        $taxonomy = Get-RestoreNativeFailureTaxonomy -FilePath $FilePath -ExitCode $null -ExpectedExitCodes $ExpectedExitCodes -ErrorMessage $null -ExecutableAvailable:$false
+        $unsupported = [pscustomobject][ordered]@{SchemaVersion=$script:NativeCommandSchemaVersion;Success=$false;Changed=$false;Status="Unsupported";ExitCode=$null;Target=$target;Scope=$Scope;RequiresReboot=[bool]$RequiresReboot;PendingReboot=$false;PendingRebootState=(Get-RestorePendingRebootState);FailureCategory=$taxonomy.Code;FailureReason=$taxonomy.Reason;Stdout="";Stderr="";OutputTruncated=$false;Error=$taxonomy.Reason}
+        if (-not $Silent) { Write-Log "Native command unsupported: $target - $($taxonomy.Reason)" -Level Warning }
+        return (Add-RestoreNativeCommandResult -Result $unsupported)
+    }
+    $tempDirectory = Join-Path ([System.IO.Path]::GetTempPath()) ("RestoreNative-{0}" -f ([guid]::NewGuid().ToString("N")))
+    $stdoutPath = Join-Path $tempDirectory "stdout.txt"
+    $stderrPath = Join-Path $tempDirectory "stderr.txt"
+    New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
     try {
-        if (-not $PSCmdlet.ShouldProcess($target, "execute native restore command")) { return [pscustomobject]@{Success=$false;ExitCode=$null;Skipped=$true;Target=$target} }
-        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        if (-not $PSCmdlet.ShouldProcess($target, "execute native restore command")) {
+            return (Add-RestoreNativeCommandResult -Result ([pscustomobject][ordered]@{SchemaVersion=$script:NativeCommandSchemaVersion;Success=$false;Changed=$false;Status="Skipped";ExitCode=$null;Target=$target;Scope=$Scope;PendingReboot=$false;FailureCategory="ShouldProcessDeclined";FailureReason="Execution was declined by ShouldProcess";Stdout="";Stderr="";OutputTruncated=$false}))
+        }
+        $process = Start-Process -FilePath $FilePath -ArgumentList $ArgumentList -Wait -PassThru -WindowStyle Hidden -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
         $exitCode = [int]$process.ExitCode
-        $success = $exitCode -in @($ExpectedExitCodes)
-        if ($success) { if (-not $Silent) { Write-Log "Native command completed ($exitCode): $target" -Level Success }; $script:ChangesCount++ }
-        elseif (-not $Silent) { Write-Log "Native command failed ($exitCode): $target" -Level Warning }
-        return [pscustomobject]@{Success=$success;ExitCode=$exitCode;Target=$target;RequiresReboot=[bool]$RequiresReboot}
+        $stdout = Get-RestoreNativeOutput -Path $stdoutPath
+        $stderr = Get-RestoreNativeOutput -Path $stderrPath
+        $taxonomy = Get-RestoreNativeFailureTaxonomy -FilePath $FilePath -ExitCode $exitCode -ExpectedExitCodes $ExpectedExitCodes -ErrorMessage $null -ExecutableAvailable:$true
+        $pendingState = Get-RestorePendingRebootState
+        $success = $taxonomy.Category -eq "Success"
+        $status = if ($success) { "Changed" } else { "Failed" }
+        $pending = [bool]($RequiresReboot -or $pendingState.PendingReboot -or $taxonomy.Code -eq "RebootRequired")
+        $result = [pscustomobject][ordered]@{
+            SchemaVersion=$script:NativeCommandSchemaVersion; Success=$success; Changed=$success; Status=$status; ExitCode=$exitCode
+            Target=$target; Scope=$Scope; RequiresReboot=[bool]$RequiresReboot; PendingReboot=$pending; PendingRebootState=$pendingState
+            FailureCategory=$taxonomy.Code; FailureReason=if($success){$null}else{$taxonomy.Reason}; Stdout=$stdout.Text; Stderr=$stderr.Text
+            OutputTruncated=([bool]($stdout.Truncated -or $stderr.Truncated)); Error=if($success){$null}else{$taxonomy.Reason}
+        }
+        if ($success) {
+            if (-not $Silent) { Write-Log "Native command completed ($exitCode): $target" -Level Success }
+            $script:ChangesCount++
+        } elseif (-not $Silent) { Write-Log "Native command failed ($exitCode): $target - $($taxonomy.Reason)" -Level Warning }
+        return (Add-RestoreNativeCommandResult -Result $result)
     } catch {
-        if (-not $Silent) { Write-Log "Native command could not run: $target - $($_.Exception.Message)" -Level Warning }
-        return [pscustomobject]@{Success=$false;ExitCode=$null;Target=$target;Error=$_.Exception.Message}
+        $taxonomy = Get-RestoreNativeFailureTaxonomy -FilePath $FilePath -ExitCode $null -ExpectedExitCodes $ExpectedExitCodes -ErrorMessage $_.Exception.Message -ExecutableAvailable:$true
+        $failed = [pscustomobject][ordered]@{SchemaVersion=$script:NativeCommandSchemaVersion;Success=$false;Changed=$false;Status="Failed";ExitCode=$null;Target=$target;Scope=$Scope;RequiresReboot=[bool]$RequiresReboot;PendingReboot=$false;FailureCategory=$taxonomy.Code;FailureReason=$taxonomy.Reason;Stdout="";Stderr="";OutputTruncated=$false;Error=$taxonomy.Reason}
+        if (-not $Silent) { Write-Log "Native command could not run: $target - $($taxonomy.Reason)" -Level Warning }
+        return (Add-RestoreNativeCommandResult -Result $failed)
+    } finally {
+        if (Test-Path -LiteralPath $tempDirectory) { Remove-Item -LiteralPath $tempDirectory -Recurse -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -4141,6 +4263,7 @@ function Get-RestoreCapabilityReport {
         ManagementEvidence=if($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['Evidence']){@($MachineProfile.Management.Evidence)}else{@()}
         ManagedPolicyOverride=[bool]$AllowManagedPolicy
         ManagementDecision=if($AllowManagedPolicy){"OverrideRequested"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsManaged){"SkipByDefault"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsKnown){"ReviewLocal"}else{"Unknown"}
+        PendingRebootState=(Get-RestorePendingRebootState)
         SupportedCount=@($evaluations | Where-Object CanMutate).Count
         BlockedCount=@($evaluations | Where-Object { -not $_.CanMutate }).Count
         Status=if (@($evaluations | Where-Object { -not $_.CanMutate }).Count -eq 0) { "Ready" } else { "Blocked" }
@@ -4157,6 +4280,8 @@ function Invoke-RestoreSelection {
     $keys = @($SelectedKeys | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $map = Get-RestoreFunctionMap
     $machineProfile = Get-RestoreMachineProfile
+    $script:NativeCommandResults = New-Object System.Collections.Generic.List[object]
+    $script:LastVerificationReport = $null
     $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy)
     $actionPlan = Get-RestoreActionPlan -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy
     $script:CapabilityProfile = $machineProfile
@@ -4187,6 +4312,7 @@ function Invoke-RestoreSelection {
         $beforeChanges = $script:ChangesCount
         $categoryPlan = @($actionPlan.Categories | Where-Object { $_.Key -eq $key } | Select-Object -First 1)
         $useActionPlan = $categoryPlan.Count -eq 1 -and $categoryPlan[0].Status -eq "Ready"
+        $planResult = $null
         try {
             if ($useActionPlan) {
                 $planResult = Invoke-RestoreActionPlan -ActionPlan $actionPlan -CategoryKey $key
@@ -4203,11 +4329,11 @@ function Invoke-RestoreSelection {
             $script:CategoryResults[$key].Changed = $changed
             $script:CategoryResults[$key].Errors = $errors
             $script:CategoryResults[$key].Status = $status
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;ExecutionMode=$executionMode;ActionPlanStatus=$categoryPlan[0].Status;Reason=$null;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;ExecutionMode=$executionMode;ActionPlanStatus=$categoryPlan[0].Status;Reason=$null;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence;VerificationFailedCount=if($planResult){$planResult.VerificationFailedCount}else{0};NotObservableCount=if($planResult){$planResult.NotObservableCount}else{0};PendingReboot=if($planResult){[bool]$planResult.PendingReboot}else{$false};Operations=if($planResult){@($planResult.Operations)}else{@()}}
         } catch {
             $script:CategoryResults[$key].Status = "Error"
             $script:CategoryResults[$key].Errors++
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;ExecutionMode=if($useActionPlan){"ActionPlan"}else{"LegacyReviewRequired"};ActionPlanStatus=if($categoryPlan.Count -eq 1){$categoryPlan[0].Status}else{"Unknown"};Reason=$_.Exception.Message;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;ExecutionMode=if($useActionPlan){"ActionPlan"}else{"LegacyReviewRequired"};ActionPlanStatus=if($categoryPlan.Count -eq 1){$categoryPlan[0].Status}else{"Unknown"};Reason=$_.Exception.Message;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence;VerificationFailedCount=0;NotObservableCount=0;PendingReboot=$false;Operations=@()}
             Write-Log "Error in $key : $($_.Exception.Message)" -Level Error
         }
     }
@@ -4217,7 +4343,13 @@ function Invoke-RestoreSelection {
         Update-RestoreRollbackJournal -Journal $rollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State $journalState | Out-Null
     }
     $resultValues = @($results.Values)
-    $exitCode = if (@($resultValues | Where-Object Status -eq "Error").Count -gt 0) { 1 } elseif (@($resultValues | Where-Object { $_.Status -eq "Skipped" }).Count -gt 0) { 2 } else { 0 }
+    $verificationReport = Get-RestoreIndependentPostRunVerification -ActionPlan $actionPlan
+    $pendingState = $verificationReport.PendingRebootState
+    $verificationFailures = [int](($resultValues | ForEach-Object { $_.VerificationFailedCount } | Measure-Object -Sum).Sum)
+    $notObservable = [int](($resultValues | ForEach-Object { $_.NotObservableCount } | Measure-Object -Sum).Sum)
+    $verificationFailures = [Math]::Max($verificationFailures, [int]$verificationReport.VerificationFailedCount)
+    $notObservable = [Math]::Max($notObservable, [int]$verificationReport.NotObservableCount)
+    $exitCode = if (@($resultValues | Where-Object Status -eq "Error").Count -gt 0 -or $verificationReport.Status -eq "VerificationFailed") { 1 } elseif (@($resultValues | Where-Object { $_.Status -eq "Skipped" }).Count -gt 0) { 2 } else { 0 }
     $script:CapabilityExitCode = $exitCode
     return [pscustomobject][ordered]@{
         SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
@@ -4225,7 +4357,9 @@ function Invoke-RestoreSelection {
         ManagementEvidence=if($machineProfile.Management -and $machineProfile.Management.PSObject.Properties['Evidence']){@($machineProfile.Management.Evidence)}else{@()}
         ManagedPolicyOverride=[bool]$AllowManagedPolicy
         ActionPlanHash=$actionPlan.PlanHash; ActionPlanStatus=$actionPlan.Status
-        Categories=$resultValues; ExitCode=$exitCode
+        Categories=$resultValues; NativeCommands=@($script:NativeCommandResults.ToArray()); VerificationFailedCount=$verificationFailures; NotObservableCount=$notObservable
+        VerificationStatus=$verificationReport.Status; VerificationReport=$verificationReport
+        PendingReboot=$pendingState.PendingReboot; PendingRebootState=$pendingState; ExitCode=$exitCode
         RollbackPath=if($rollbackJournal){$script:ActiveRollbackJournalPath}else{$null}
         RollbackJournalState=if($rollbackJournal){$rollbackJournal.State}else{$null}
         Status=if ($exitCode -eq 0) { "Completed" } elseif ($exitCode -eq 2) { "CapabilityBlocked" } else { "Failed" }
@@ -4333,6 +4467,133 @@ function Test-RestoreActionPlanPrecondition {
     } catch {
         return [pscustomobject]@{Matches=$false;Reason="Could not verify precondition: $($_.Exception.Message)"}
     }
+}
+
+function Test-RestoreActionPlanPostcondition {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][object]$Operation)
+    $status = "Unsupported"
+    $reason = "No independent postcondition adapter is registered for this operation kind"
+    $freshRead = $true
+    try {
+        switch ($Operation.Kind) {
+            "RegistryValue" {
+                $current = Get-RestoreRegistryPlanState -Path $Operation.Before.Path -Name $Operation.Before.Name
+                if ($Operation.Action -eq "Remove") { $postconditionMatches = ($current.Exists -eq $false) }
+                elseif ($Operation.Action -eq "Set") {
+                    $postconditionMatches = $current.Exists -eq $true
+                    if ($postconditionMatches -and $Operation.After.Type) { $postconditionMatches = $current.Type -eq [string]$Operation.After.Type }
+                    if ($postconditionMatches -and $Operation.After.PSObject.Properties['Value']) { $postconditionMatches = ($current.Value | ConvertTo-Json -Depth 12 -Compress) -eq ($Operation.After.Value | ConvertTo-Json -Depth 12 -Compress) }
+                } else { $postconditionMatches = $true }
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh registry state matches the planned postcondition" } else { "Fresh registry state does not match the planned postcondition" }
+            }
+            "RegistryKey" {
+                $exists = Test-Path -LiteralPath $Operation.After.Path
+                $postconditionMatches = if ($Operation.Action -eq "Remove") { -not $exists } else { $exists }
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh registry key state matches the plan" } else { "Fresh registry key state does not match the plan" }
+            }
+            "File" {
+                $source = Get-RestoreFilePlanState -Path $Operation.Before.Path
+                $destinationPath = if ($Operation.After -and $Operation.After.Path) { [string]$Operation.After.Path } else { [string]$Operation.Before.Path }
+                $destination = Get-RestoreFilePlanState -Path $destinationPath
+                $postconditionMatches = switch ($Operation.Action) {
+                    "Remove" { -not $source.Exists }
+                    "Rename" { (-not $source.Exists) -and $destination.Exists }
+                    "Move" { (-not $source.Exists) -and $destination.Exists }
+                    "Copy" { $destination.Exists }
+                    "Write" { $destination.Exists -and (!$Operation.After.Sha256 -or $destination.Sha256 -eq [string]$Operation.After.Sha256) }
+                    default { $true }
+                }
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh file state matches the plan" } else { "Fresh file state does not match the plan" }
+            }
+            "Service" {
+                $serviceName = ($Operation.Target -replace '^Service:', '')
+                $current = Get-RestoreServicePlanState -ServiceName $serviceName
+                $postconditionMatches = $current.Exists -and (!$Operation.After.StartType -or $current.StartType -eq [string]$Operation.After.StartType)
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh service startup state matches the plan" } else { "Fresh service startup state does not match the plan" }
+            }
+            "ServiceControl" {
+                $serviceName = ($Operation.Target -replace '^Service:', '')
+                $current = Get-RestoreServicePlanState -ServiceName $serviceName
+                $postconditionMatches = $current.Exists -and (!$Operation.After.Status -or $current.Status -eq [string]$Operation.After.Status)
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh service running state matches the plan" } else { "Fresh service running state does not match the plan" }
+            }
+            "ScheduledTask" {
+                $taskTarget = $Operation.Target -replace '^Task:', ''
+                $separator = $taskTarget.LastIndexOf('\')
+                $current = if ($separator -ge 0) { Get-RestoreScheduledTaskPlanState -TaskPath $taskTarget.Substring(0,$separator + 1) -TaskName $taskTarget.Substring($separator + 1) } else { $null }
+                $postconditionMatches = $current -and $current.Exists -and (!$Operation.After.State -or $current.State -eq [string]$Operation.After.State)
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh scheduled-task state matches the plan" } else { "Fresh scheduled-task state does not match the plan" }
+            }
+            "AppX" {
+                $packageName = if ($Operation.After.PackageName) { [string]$Operation.After.PackageName } else { [string]$Operation.Before.PackageName }
+                $scope = if ($Operation.After.Scope) { [string]$Operation.After.Scope } elseif ($Operation.Before.Scope) { [string]$Operation.Before.Scope } else { "CurrentUser" }
+                $current = Get-RestoreAppxPlanState -PackageName $packageName -Scope $scope
+                $expectedInstalled = if ($Operation.After.PSObject.Properties['Installed']) { [bool]$Operation.After.Installed } else { $true }
+                $postconditionMatches = [bool]$current.Installed -eq $expectedInstalled
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh AppX state matches the requested scope" } else { "Fresh AppX state does not match the requested scope" }
+            }
+            "OptionalFeature" {
+                $feature = Get-WindowsOptionalFeature -FeatureName $Operation.Target -Online -ErrorAction Stop
+                $currentState = if ($feature) { [string]$feature.State } else { "Missing" }
+                $postconditionMatches = $currentState -eq [string]$Operation.After.State
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh optional-feature state matches the plan" } else { "Fresh optional-feature state does not match the plan" }
+            }
+            "EnvironmentVariable" {
+                $separator = $Operation.Target.IndexOf(':')
+                $scope = $Operation.Target.Substring(0,$separator); $name = $Operation.Target.Substring($separator + 1)
+                $currentValue = [System.Environment]::GetEnvironmentVariable($name,$scope)
+                $postconditionMatches = ($currentValue | ConvertTo-Json -Compress) -eq ($Operation.After.Value | ConvertTo-Json -Compress)
+                $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
+                $reason = if ($postconditionMatches) { "Fresh environment-variable state matches the plan" } else { "Fresh environment-variable state does not match the plan" }
+            }
+            "NativeCommand" {
+                $status = "NotObservable"; $freshRead = $false
+                $reason = "The command returned a structured exit result, but no deterministic postcondition reader is registered for $($Operation.Metadata.FilePath)"
+            }
+            "RestorePoint" {
+                $status = "NotObservable"; $freshRead = $false
+                $reason = "System Restore point creation is not independently observable without relying on the provider's mutable sequence state"
+            }
+            "CapabilityGate" { $status = "Skipped"; $freshRead = $false; $reason = "Capability-gated operation was not executed" }
+        }
+    } catch { $status = "VerificationFailed"; $reason = "Independent postcondition read failed: $($_.Exception.Message)" }
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:VerificationSchemaVersion; OperationId=$Operation.OperationId; CategoryKey=$Operation.CategoryKey
+        Kind=$Operation.Kind; Target=$Operation.Target; Status=$status; VerificationStatus=$status; FreshRead=$freshRead; Reason=$reason
+        CheckedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
+    }
+}
+
+function Get-RestoreIndependentPostRunVerification {
+    [CmdletBinding()]
+    param([object]$ActionPlan=$script:LastActionPlan)
+    $results = New-Object System.Collections.Generic.List[object]
+    $plannedOperations = if ($ActionPlan -and $ActionPlan.PSObject.Properties['Operations']) { @($ActionPlan.Operations | Where-Object { $_.CanExecute }) } else { @() }
+    foreach ($operation in $plannedOperations) {
+        $null = $results.Add((Test-RestoreActionPlanPostcondition -Operation $operation))
+    }
+    $failed = @($results | Where-Object Status -eq "VerificationFailed").Count
+    $notObservable = @($results | Where-Object Status -eq "NotObservable").Count
+    $pending = Get-RestorePendingRebootState
+    $status = if ($failed -gt 0) { "VerificationFailed" } elseif ($notObservable -gt 0) { "Partial" } elseif ($results.Count -gt 0) { "Verified" } else { "NoOperations" }
+    $report = [pscustomobject][ordered]@{
+        SchemaVersion=$script:VerificationSchemaVersion; Independent=$true; Status=$status
+        OperationCount=$results.Count; VerifiedCount=@($results | Where-Object Status -eq "Verified").Count
+        VerificationFailedCount=$failed; NotObservableCount=$notObservable; Operations=@($results.ToArray())
+        PendingReboot=$pending.PendingReboot; PendingRebootState=$pending
+        CheckedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
+    }
+    $script:LastVerificationReport = $report
+    return $report
 }
 
 function Get-RestoreStaticActionOperation {
@@ -4519,6 +4780,7 @@ function Get-RestoreActionPlan {
         ManagementEvidence=if($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['Evidence']){@($MachineProfile.Management.Evidence)}else{@()}
         ManagedPolicyOverride=[bool]$AllowManagedPolicy
         ManagementDecision=if($AllowManagedPolicy){"OverrideRequested"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsManaged){"SkipByDefault"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsKnown){"ReviewLocal"}else{"Unknown"}
+        PendingRebootState=(Get-RestorePendingRebootState)
         ExactOperationCount=@($operationArray | Where-Object Exact).Count; OpaqueOperationCount=$opaqueCount
         CapabilityBlockedCount=$blockedCount; HealthReportAvailable=($null -ne $HealthReport)
     }
@@ -4529,10 +4791,10 @@ function Get-RestoreActionPlan {
 function Invoke-RestoreActionPlanOperation {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param([Parameter(Mandatory=$true)][object]$Operation)
-    if (-not $Operation.CanExecute -or $Operation.Action -eq "NoOp") { return $false }
+    if (-not $Operation.CanExecute -or $Operation.Action -eq "NoOp") { return [pscustomobject]@{Status="Skipped";Success=$false;Changed=$false;Reason="Operation is not executable"} }
     $precondition = Test-RestoreActionPlanPrecondition -Operation $Operation
     if (-not $precondition.Matches) { throw "Plan precondition failed for $($Operation.OperationId): $($precondition.Reason)" }
-    if (-not $PSCmdlet.ShouldProcess($Operation.Target, $Operation.Action)) { return $false }
+    if (-not $PSCmdlet.ShouldProcess($Operation.Target, $Operation.Action)) { return [pscustomobject]@{Status="Skipped";Success=$false;Changed=$false;Reason="Execution was declined by ShouldProcess"} }
     switch ($Operation.Kind) {
         "RegistryValue" {
             if ($Operation.Action -eq "Remove") {
@@ -4578,13 +4840,13 @@ function Invoke-RestoreActionPlanOperation {
         "NativeCommand" {
             if ($Operation.Metadata) {
                 $nativeResult = Invoke-RestoreNativeCommand -FilePath $Operation.Metadata.FilePath -ArgumentList @($Operation.Metadata.ArgumentList) -ExpectedExitCodes @($Operation.Metadata.ExpectedExitCodes) -RequiresReboot:([bool]$Operation.Metadata.RequiresReboot) -Scope $Operation.Scope -Silent
-                if ($nativeResult.PSObject.Properties["Success"]) { return [bool]$nativeResult.Success }
+                return $nativeResult
             }
         }
         "AppX" {
             if ($Operation.Metadata) {
                 $appxResult = Invoke-RestoreAppxRegistration -PackageName $Operation.Metadata.PackageName -ManifestPath $Operation.Metadata.ManifestPath -PackageFamilyName $Operation.Metadata.PackageFamilyName -Scope $Operation.Metadata.Scope -Silent
-                if ($appxResult.PSObject.Properties["Success"]) { return [bool]$appxResult.Success }
+                return $appxResult
             }
         }
         "OptionalFeature" {
@@ -4602,11 +4864,11 @@ function Invoke-RestoreActionPlanOperation {
         "RestorePoint" {
             if ($Operation.Metadata) {
                 $restorePoint = Invoke-RestoreSystemRestorePoint -Description $Operation.Metadata.Description -Drive $Operation.Metadata.Drive -Silent
-                if ($restorePoint.PSObject.Properties["Success"]) { return [bool]$restorePoint.Success }
+                return $restorePoint
             }
         }
     }
-    return $false
+    return [pscustomobject]@{Status="Unsupported";Success=$false;Changed=$false;Reason="No executor is registered for operation kind $($Operation.Kind)"}
 }
 
 function Invoke-RestoreActionPlan {
@@ -4619,6 +4881,10 @@ function Invoke-RestoreActionPlan {
     })
     $changed = 0
     $errors = 0
+    $verificationFailed = 0
+    $notObservable = 0
+    $pendingReboot = $false
+    $operationResults = New-Object System.Collections.Generic.List[object]
     $operationIndex = 0
     foreach ($operation in $operations) {
         $script:CurrentCategory = if ($CategoryKey) { $CategoryKey } else { $operation.CategoryKey }
@@ -4629,15 +4895,46 @@ function Invoke-RestoreActionPlan {
             Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State "Executing" -OperationId $operation.OperationId -OperationStatus "Running" -NextOperationIndex $operationIndex | Out-Null
         }
         try {
-            $null = Invoke-RestoreActionPlanOperation -Operation $operation
+            $rawResult = Invoke-RestoreActionPlanOperation -Operation $operation
             $operationChanged = [int]($script:ChangesCount - $beforeChanges) -gt 0
-            if ($journalOperation.Count -eq 1) {
-                $journalStatus = if ($operationChanged) { "Completed" } else { "VerifiedNoChange" }
-                Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $script:ActiveRollbackJournalPath -OperationId $operation.OperationId -OperationStatus $journalStatus -Changed:$operationChanged -ErrorMessage $null -NextOperationIndex ($operationIndex + 1) | Out-Null
+            $operationStatus = $null
+            $operationReason = $null
+            $exitCode = $null
+            $failureCategory = $null
+            $stderr = ""
+            if ($rawResult -and $rawResult.PSObject.Properties['Status']) { $operationStatus = [string]$rawResult.Status }
+            if ($rawResult -and $rawResult.PSObject.Properties['Reason']) { $operationReason = [string]$rawResult.Reason }
+            if (-not $operationReason -and $rawResult -and $rawResult.PSObject.Properties['FailureReason']) { $operationReason = [string]$rawResult.FailureReason }
+            if (-not $operationReason -and $rawResult -and $rawResult.PSObject.Properties['Error']) { $operationReason = [string]$rawResult.Error }
+            if ($rawResult -and $rawResult.PSObject.Properties['ExitCode']) { $exitCode = $rawResult.ExitCode }
+            if ($rawResult -and $rawResult.PSObject.Properties['FailureCategory']) { $failureCategory = [string]$rawResult.FailureCategory }
+            if ($rawResult -and $rawResult.PSObject.Properties['Stderr']) { $stderr = [string]$rawResult.Stderr }
+            if (-not $operationStatus) {
+                if ($script:ActionPlanCapture -or $script:WhatIfRequested) { $operationStatus = "Planned" }
+                elseif ([bool]$rawResult) { $operationStatus = "Changed" }
+                else { $operationStatus = "VerificationFailed"; $operationReason = "Mutation primitive reported no change for an executable operation" }
             }
+            if ($operationStatus -in @("Failed","Unsupported","VerificationFailed")) {
+                $errors++; if ($operationStatus -eq "VerificationFailed") { $verificationFailed++ }
+                if (-not $operationReason) { $operationReason = "Operation returned $operationStatus" }
+                Write-Log "Plan operation $($operation.OperationId) $($operationStatus): $operationReason" -Level Error
+            }
+            $verification = $null
+            if ($operationStatus -notin @("Failed","Unsupported","VerificationFailed","Planned","Skipped")) {
+                $verification = Test-RestoreActionPlanPostcondition -Operation $operation
+                if ($verification.Status -eq "VerificationFailed") { $errors++; $verificationFailed++; $operationStatus="VerificationFailed"; $operationReason=$verification.Reason }
+                elseif ($verification.Status -eq "NotObservable") { $notObservable++ }
+            }
+            if ($rawResult -and $rawResult.PSObject.Properties['PendingReboot'] -and $rawResult.PendingReboot) { $pendingReboot = $true }
+            if ($journalOperation.Count -eq 1) {
+                $journalStatus = if ($operationStatus -in @("Failed","Unsupported","VerificationFailed")) { "Failed" } elseif ($operationChanged) { "Completed" } else { "VerifiedNoChange" }
+                Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $script:ActiveRollbackJournalPath -OperationId $operation.OperationId -OperationStatus $journalStatus -Changed:$operationChanged -ErrorMessage $operationReason -NextOperationIndex ($operationIndex + 1) | Out-Null
+            }
+            $null = $operationResults.Add([pscustomobject][ordered]@{OperationId=$operation.OperationId;CategoryKey=$operation.CategoryKey;Kind=$operation.Kind;Target=$operation.Target;Status=$operationStatus;Changed=$operationChanged;ExitCode=$exitCode;FailureCategory=$failureCategory;FailureReason=$operationReason;Stderr=$stderr;Verification=$verification;PendingReboot=if($rawResult -and $rawResult.PSObject.Properties['PendingReboot']){[bool]$rawResult.PendingReboot}else{$false}})
         } catch {
             $errors++
             Write-Log "Plan operation $($operation.OperationId) failed: $($_.Exception.Message)" -Level Error
+            $null = $operationResults.Add([pscustomobject][ordered]@{OperationId=$operation.OperationId;CategoryKey=$operation.CategoryKey;Kind=$operation.Kind;Target=$operation.Target;Status="Failed";Changed=([int]($script:ChangesCount - $beforeChanges) -gt 0);ExitCode=$null;FailureCategory="ExecutorException";FailureReason=$_.Exception.Message;Stderr="";Verification=$null;PendingReboot=$false})
             if ($journalOperation.Count -eq 1) {
                 Update-RestoreRollbackJournal -Journal $script:ActiveRollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State "Failed" -OperationId $operation.OperationId -OperationStatus "Failed" -Changed:([int]($script:ChangesCount - $beforeChanges) -gt 0) -ErrorMessage $_.Exception.Message -NextOperationIndex ($operationIndex + 1) | Out-Null
             }
@@ -4646,7 +4943,13 @@ function Invoke-RestoreActionPlan {
         $operationIndex++
     }
     if ($CategoryKey) { $script:CurrentCategory = "" }
-    return [pscustomobject][ordered]@{CategoryKey=$CategoryKey; OperationCount=$operations.Count; Changed=$changed; Errors=$errors; Status=if($errors -gt 0 -and $changed -gt 0){"Partial"}elseif($errors -gt 0){"Error"}elseif($changed -gt 0){"Changed"}else{"Already OK"}}
+    $pendingState = Get-RestorePendingRebootState
+    if ($pendingState.PendingReboot) { $pendingReboot = $true }
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:VerificationSchemaVersion; CategoryKey=$CategoryKey; OperationCount=$operations.Count; Changed=$changed; Errors=$errors
+        VerificationFailedCount=$verificationFailed; NotObservableCount=$notObservable; PendingReboot=$pendingReboot; PendingRebootState=$pendingState
+        Operations=@($operationResults.ToArray()); Status=if($errors -gt 0 -and $changed -gt 0){"Partial"}elseif($errors -gt 0){"Error"}elseif($changed -gt 0){"Changed"}else{"Already OK"}
+    }
 }
 
 
@@ -6243,6 +6546,7 @@ function Invoke-ScheduledRestore {
 
 function Get-PostUpdateSecurityRecheck {
     $health = Get-SystemHealthReport
+    $verification = Get-RestoreIndependentPostRunVerification -ActionPlan $script:LastActionPlan
     $securityKeys = @("Defender","Firewall","SmartScreen","WindowsUpdate","SecurityUI","Crypto")
     $security = @()
     foreach ($key in $securityKeys) {
@@ -6260,7 +6564,9 @@ function Get-PostUpdateSecurityRecheck {
         CheckedAt=(Get-Date).ToUniversalTime().ToString("o")
         ManagementState=$script:ManagementState
         ManagedPolicyOverride=[bool]$script:ManagedPolicyOverrideRequested
-        Passed=(@($security | Where-Object { $_.Severity -in @("Critical","High") }).Count -eq 0)
+        FreshVerification=$verification
+        PendingReboot=$verification.PendingReboot; PendingRebootState=$verification.PendingRebootState
+        Passed=(@($security | Where-Object { $_.Severity -in @("Critical","High") }).Count -eq 0 -and $verification.Status -notin @("VerificationFailed"))
         Categories=@($security)
     }
 }
@@ -7216,6 +7522,20 @@ function Show-MainWindow {
             Update-RestoreRollbackJournal -Journal $rollbackJournal -JournalPath $script:ActiveRollbackJournalPath -State $journalState | Out-Null
         }
 
+        $verificationReport = Get-RestoreIndependentPostRunVerification -ActionPlan $actionPlan
+        if ($verificationReport.Status -eq "VerificationFailed") {
+            Write-Log "Independent verification failed for $($verificationReport.VerificationFailedCount) operation(s); review the restore log before rebooting" -Level Error
+        } elseif ($verificationReport.Status -eq "Partial") {
+            Write-Log "Independent verification completed with $($verificationReport.NotObservableCount) operation(s) requiring review" -Level Warning
+        } else {
+            Write-Log "Independent verification passed for $($verificationReport.VerifiedCount) operation(s)" -Level Success
+        }
+        if ($verificationReport.PendingReboot) {
+            Write-Log "Pending reboot detected: restored state may not be fully active until the next restart" -Level Warning
+        } else {
+            Write-Log "No pending reboot was detected" -Level Info
+        }
+
         # ---- SUMMARY ----
         Write-Log "" -Level Info
         Write-Log "=== RESTORATION SUMMARY ===" -Level Section
@@ -7251,7 +7571,15 @@ function Show-MainWindow {
         $ui.txtProgressSub.Text = ($parts -join "  |  ")
         $ui.progressBar.Value = $ui.progressBar.Maximum
         $ui.txtProgressPercent.Text = "Complete"; $ui.txtProgressStep.Text = ""
-        $ui.txtStatus.Text = "Please reboot to finish applying changes"
+        $ui.txtStatus.Text = if ($verificationReport.Status -eq "VerificationFailed") {
+            "Verification failed; review the log before rebooting"
+        } elseif ($verificationReport.PendingReboot) {
+            "Restore verified; reboot to finish applying changes"
+        } elseif ($verificationReport.Status -eq "Partial") {
+            "Restore completed; review unobservable operations"
+        } else {
+            "Restore verified; no reboot is currently pending"
+        }
         $ui.btnReboot.Visibility = "Visible"; $ui.btnLater.Visibility = "Visible"
         $ui.btnRollback.Visibility = "Visible"
         $ui.btnExportReport.Visibility = "Visible"; $ui.btnViewLog.Visibility = "Visible"
