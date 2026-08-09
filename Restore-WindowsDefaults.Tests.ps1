@@ -566,6 +566,92 @@ Describe "Restore-WindowsDefaults action plans" {
     }
 }
 
+Describe "Restore-WindowsDefaults management provenance" {
+    It "returns structured domain, MDM, Group Policy, and dsreg evidence without raw output" {
+        $domainProvider = { [pscustomobject]@{ PartOfDomain=$true } }
+        $detectedPaths = @(
+            "HKLM:\SOFTWARE\Microsoft\Enrollments",
+            "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device",
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History"
+        )
+        $pathProvider = { param($path) $path -in $detectedPaths }
+        $dsregProvider = { @("AzureAdJoined : YES","DomainJoined : YES","WorkplaceJoined : NO") }
+
+        $state = Get-PolicyManagementState -DomainProvider $domainProvider -PathProvider $pathProvider -DsregProvider $dsregProvider
+
+        $state.SchemaVersion | Should -Be 1
+        $state.IsKnown | Should -BeTrue
+        $state.IsManaged | Should -BeTrue
+        $state.MdmEnrolled | Should -BeTrue
+        $state.Ownership | Should -Be "Organization (Domain + MDM)"
+        $state.Dsreg.Status | Should -Be "Parsed"
+        @($state.Signals | Where-Object { $_.SignalType -eq "MdmEnrollment" -and $_.Detected }).Count | Should -BeGreaterThan 0
+        @($state.Evidence | Where-Object { $_.Source -eq "Group Policy registry history" }).Count | Should -Be 1
+        $state.Dsreg.RawOutputRetained | Should -BeFalse
+        ($state.Dsreg.PSObject.Properties.Name -contains "RawOutput") | Should -BeFalse
+    }
+
+    It "labels unavailable or localized dsreg output as an explicit fallback" {
+        $state = Get-PolicyManagementState -DomainProvider { $false } -PathProvider { param($path) $false } -DsregProvider { "EstadoDeAzure : SI" }
+
+        $state.IsKnown | Should -BeTrue
+        $state.IsManaged | Should -BeFalse
+        $state.Dsreg.Status | Should -Be "Unparsed"
+        $state.Dsreg.FallbackUsed | Should -BeTrue
+        $state.Dsreg.Warning | Should -Match "fallback|recognized"
+    }
+
+    It "classifies managed policy provenance and records the operator override" {
+        $managed = [pscustomobject]@{
+            IsManaged=$true; IsKnown=$true; DomainJoined=$false; MdmEnrolled=$true
+            Ownership="Organization (MDM)"; Evidence=@([pscustomobject]@{Source="MDM Policy CSP";Detected=$true})
+        }
+        $pathProvider = { param($path) [pscustomobject]@{Exists=$true;ValueNames=@("NoAutoUpdate") } }
+
+        $preserved = Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "NoAutoUpdate" -ManagementState $managed -PathProvider $pathProvider
+        $override = Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "NoAutoUpdate" -ManagementState $managed -AllowManagedPolicy -PathProvider $pathProvider
+
+        $preserved.Source | Should -Be "MDM policy registry"
+        $preserved.Ownership | Should -Be "Organization"
+        $preserved.ManagementDecision | Should -Be "SkipByDefault"
+        $preserved.CanMutate | Should -BeFalse
+        $preserved.Reason | Should -Match "operator authority"
+        $override.ManagementDecision | Should -Be "OverrideAllowed"
+        $override.OperatorOverride | Should -BeTrue
+        $override.CanMutate | Should -BeTrue
+    }
+
+    It "carries management evidence into capability reports and capability gates" {
+        $management = [pscustomobject]@{
+            IsManaged=$true; IsKnown=$true; DomainJoined=$true; MdmEnrolled=$false
+            Ownership="Organization (Domain)"; Evidence=@([pscustomobject]@{Source="Win32_ComputerSystem";Detected=$true})
+            Decision="SkipByDefault"
+        }
+        $osProvider = {
+            [pscustomobject]@{
+                ProductName="Windows 11 Pro"; ProductFamily="Windows 11"; EditionID="Professional"
+                CurrentBuild=26100; Architecture="AMD64"; Locale="en-US"; IsWindows=$true; IsOnline=$true
+                PowerShellMajor=5; IsWindowsPowerShell=$true; IsAdministrator=$true
+            }
+        }
+        $profile = Get-RestoreMachineProfile -OperatingSystemProvider $osProvider -ManagementState $management
+        $report = Get-RestoreCapabilityReport -SelectedKeys @("chkWindowsUpdate") -MachineProfile $profile
+        $category = $report.Categories[0]
+        $plan = Get-RestoreActionPlan -SelectedKeys @("chkWindowsUpdate") -MachineProfile $profile
+        $gate = @($plan.Operations | Where-Object Kind -eq "CapabilityGate")[0]
+
+        $report.ManagementDecision | Should -Be "SkipByDefault"
+        $category.Status | Should -Be "OrganizationOwned"
+        $category.ManagedPolicyDecision | Should -Be "SkippedByDefault"
+        $category.OperatorOverride | Should -BeFalse
+        @($category.ManagementEvidence).Count | Should -Be 1
+        $plan.ManagedPolicyOverride | Should -BeFalse
+        $gate.Metadata.ManagementDecision | Should -Be "SkippedByDefault"
+        $gate.Metadata.OperatorOverride | Should -BeFalse
+        $plan.Categories[0].PolicyOwnership | Should -Be "Organization (Domain)"
+    }
+}
+
 Describe "Restore-WindowsDefaults rollback journals" {
     It "writes an atomic v2 journal with operation and whole-file integrity" {
         $journalPath = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-journal-{0}.json" -f ([guid]::NewGuid().ToString("N")))

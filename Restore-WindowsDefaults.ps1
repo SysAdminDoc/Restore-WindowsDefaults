@@ -47,9 +47,11 @@ param(
 
 $script:Version = "4.4.0"
 $script:CapabilitySchemaVersion = 1
+$script:ManagementSchemaVersion = 1
 $script:CapabilityProfile = $null
 $script:CapabilityEvaluations = @()
 $script:CapabilityExitCode = 0
+$script:ManagementState = $null
 $script:ManagedPolicyOverrideRequested = [bool]$AllowManagedPolicy
 $script:WhatIfRequested = [bool]$WhatIf
 $script:ActionPlanSchemaVersion = 1
@@ -1452,59 +1454,301 @@ function Compare-AppxPackageBaseline {
 # RESTORATION DEPTH AND OPERATIONS
 # ============================================================================
 
+function Get-RestoreDsregState {
+    [CmdletBinding()]
+    param([scriptblock]$Provider)
+
+    $signals = New-Object System.Collections.Generic.List[object]
+    $values = [ordered]@{ AzureAdJoined=$false; WorkplaceJoined=$false; DomainJoined=$false; EnterpriseJoined=$false }
+    $available = $false
+    $warning = $null
+    $source = "dsregcmd.exe /status"
+    $provided = @()
+    try {
+        if ($Provider) {
+            $provided = @(& $Provider)
+            $available = $true
+        } else {
+            $command = Get-Command dsregcmd.exe -ErrorAction SilentlyContinue
+            if ($command) {
+                $provided = @(& $command.Source /status 2>$null)
+                $available = $true
+            } else {
+                $warning = "dsregcmd.exe was unavailable; account join ownership uses the fallback management signals"
+            }
+        }
+    } catch {
+        $available = $true
+        $warning = "dsregcmd.exe status could not be collected; account join ownership uses the fallback management signals"
+    }
+
+    $recognized = $false
+    foreach ($candidate in @($provided)) {
+        $candidateObject = if ($candidate -is [string]) { $null } else { $candidate }
+        if ($candidateObject) {
+            foreach ($key in @($values.Keys)) {
+                $property = $candidateObject.PSObject.Properties[$key]
+                if ($property) {
+                    $valueText = [string]$property.Value
+                    if ($property.Value -is [bool]) { $values[$key] = [bool]$property.Value; $recognized = $true }
+                    elseif ($valueText -match '^(?i:yes|true|1)$') { $values[$key] = $true; $recognized = $true }
+                    elseif ($valueText -match '^(?i:no|false|0)$') { $values[$key] = $false; $recognized = $true }
+                }
+            }
+        }
+    }
+    if (-not $recognized) {
+        foreach ($line in @($provided)) {
+            $match = [regex]::Match([string]$line, '^\s*(?<key>AzureAdJoined|WorkplaceJoined|DomainJoined|EnterpriseJoined)\s*:\s*(?<value>YES|NO)\s*$', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($match.Success) {
+                $key = $match.Groups['key'].Value
+                $values[$key] = $match.Groups['value'].Value -ieq 'YES'
+                $recognized = $true
+            }
+        }
+    }
+    foreach ($key in @($values.Keys)) {
+        $wasReported = $false
+        foreach ($candidate in @($provided)) {
+            $candidateText = [string]$candidate
+            if ($candidateText -match ("^\s*" + [regex]::Escape($key) + "\s*:\s*(YES|NO)\s*$")) { $wasReported = $true; break }
+            if ($candidate -isnot [string] -and $candidate.PSObject.Properties[$key]) { $wasReported = $true; break }
+        }
+        if ($wasReported) {
+            $null = $signals.Add([pscustomobject][ordered]@{
+                Key=$key; Value=[bool]$values[$key]; Source=$source; SignalType="StructuredJoinSignal"
+                Scope="Machine"; Confidence=if($recognized){"High"}else{"Low"}; RawOutputRetained=$false
+            })
+        }
+    }
+    if (-not $available) {
+        $status = "Unavailable"
+        if (-not $warning) { $warning = "dsregcmd.exe was unavailable; account join ownership uses the fallback management signals" }
+    } elseif (-not $recognized) {
+        $status = "Unparsed"
+        if (-not $warning) { $warning = "dsregcmd.exe returned no recognized structured join signals; the result is a labeled fallback" }
+    } else { $status = "Parsed" }
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:ManagementSchemaVersion; Source=$source; Available=$available
+        Status=$status; Parsed=$recognized; Warning=$warning; FallbackUsed=($status -ne "Parsed")
+        AzureAdJoined=[bool]$values.AzureAdJoined; WorkplaceJoined=[bool]$values.WorkplaceJoined
+        DomainJoined=[bool]$values.DomainJoined; EnterpriseJoined=[bool]$values.EnterpriseJoined
+        Signals=@($signals.ToArray()); RawOutputRetained=$false
+    }
+}
+
 function Get-PolicyManagementState {
+    [CmdletBinding()]
+    param(
+        [scriptblock]$DomainProvider,
+        [scriptblock]$PathProvider,
+        [scriptblock]$DsregProvider
+    )
+
     $domainJoined = $false
     $domainKnown = $false
     $queryErrors = New-Object System.Collections.Generic.List[string]
+    $signals = New-Object System.Collections.Generic.List[object]
     try {
-        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
-        $domainJoined = [bool]$computerSystem.PartOfDomain
+        $domainResult = if ($DomainProvider) { & $DomainProvider } else { Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop }
+        if ($domainResult -is [bool]) { $domainJoined = [bool]$domainResult }
+        elseif ($domainResult -and $domainResult.PSObject.Properties['PartOfDomain']) { $domainJoined = [bool]$domainResult.PartOfDomain }
+        else { throw "Domain provider did not return PartOfDomain" }
         $domainKnown = $true
     } catch {
         $queryErrors.Add("Domain membership query failed: $($_.Exception.Message)")
     }
-    $mdmPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Enrollments",
-        "HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts",
-        "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device"
+    $domainConfidence = if ($domainKnown) { "High" } else { "Unknown" }
+    $null = $signals.Add([pscustomobject][ordered]@{
+        SignalType="DomainMembership"; Source="Win32_ComputerSystem"; Path="PartOfDomain"; Detected=$domainJoined
+        Scope="Machine"; Confidence=$domainConfidence; EvidenceType="StructuredSignal"
+    })
+
+    $pathDefinitions = @(
+        @{Path="HKLM:\SOFTWARE\Microsoft\Enrollments"; SignalType="MdmEnrollment"; Source="MDM enrollment registry"; Scope="Machine"},
+        @{Path="HKLM:\SOFTWARE\Microsoft\Provisioning\OMADM\Accounts"; SignalType="MdmEnrollment"; Source="OMA-DM account registry"; Scope="Machine"},
+        @{Path="HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device"; SignalType="MdmPolicy"; Source="MDM Policy CSP"; Scope="Machine"},
+        @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History"; SignalType="GroupPolicy"; Source="Group Policy registry history"; Scope="Machine"},
+        @{Path="HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State"; SignalType="GroupPolicy"; Source="Group Policy registry state"; Scope="Machine"},
+        @{Path="HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\History"; SignalType="GroupPolicy"; Source="User Group Policy registry history"; Scope="CurrentUser"},
+        @{Path="HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Group Policy\State"; SignalType="GroupPolicy"; Source="User Group Policy registry state"; Scope="CurrentUser"}
     )
-    $mdmSignals = @()
-    foreach ($mdmPath in $mdmPaths) {
-        try {
-            if (Test-Path -LiteralPath $mdmPath) { $mdmSignals += $mdmPath }
-        } catch { $queryErrors.Add("Management signal query failed for $mdmPath") }
+    if ($env:WINDIR) {
+        $pathDefinitions += @(
+            @{Path=(Join-Path $env:WINDIR "System32\GroupPolicy"); SignalType="LocalGroupPolicy"; Source="Local Group Policy store"; Scope="Machine"},
+            @{Path=(Join-Path $env:WINDIR "System32\GroupPolicyUsers"); SignalType="LocalGroupPolicy"; Source="Local Group Policy user store"; Scope="Machine"}
+        )
     }
-    $mdmEnrolled = $mdmSignals.Count -gt 0
+    $detectedMdm = New-Object System.Collections.Generic.List[string]
+    $detectedSources = New-Object System.Collections.Generic.List[string]
+    foreach ($definition in @($pathDefinitions)) {
+        $detected = $false
+        try {
+            $pathResult = if ($PathProvider) { & $PathProvider $definition.Path } else { Test-Path -LiteralPath $definition.Path }
+            if ($pathResult -is [bool]) { $detected = [bool]$pathResult }
+            elseif ($pathResult -and $pathResult.PSObject.Properties['Detected']) { $detected = [bool]$pathResult.Detected }
+            elseif ($pathResult -and $pathResult.PSObject.Properties['Exists']) { $detected = [bool]$pathResult.Exists }
+            else { $detected = [bool]$pathResult }
+        } catch {
+            $queryErrors.Add("Management signal query failed for $($definition.Path)")
+        }
+        $confidence = if ($queryErrors.Count -eq 0) { "High" } else { "Unknown" }
+        $null = $signals.Add([pscustomobject][ordered]@{
+            SignalType=$definition.SignalType; Source=$definition.Source; Path=$definition.Path; Detected=$detected
+            Scope=$definition.Scope; Confidence=$confidence; EvidenceType="StructuredPathPresence"
+        })
+        if ($detected) {
+            if ($definition.SignalType -in @("MdmEnrollment","MdmPolicy")) { $null = $detectedMdm.Add($definition.Path) }
+            if ($definition.Source -notin @($detectedSources)) { $null = $detectedSources.Add($definition.Source) }
+        }
+    }
+
+    $dsreg = Get-RestoreDsregState -Provider $DsregProvider
+    foreach ($dsregSignal in @($dsreg.Signals)) {
+        $null = $signals.Add([pscustomobject][ordered]@{
+            SignalType=$dsregSignal.SignalType; Source=$dsregSignal.Source; Path=$dsregSignal.Key
+            Detected=([bool]$dsregSignal.Value); Scope=$dsregSignal.Scope; Confidence=$dsregSignal.Confidence
+            EvidenceType="StructuredJoinSignal"
+        })
+        if ($dsregSignal.Value -and $dsregSignal.Source -notin @($detectedSources)) { $null = $detectedSources.Add($dsregSignal.Source) }
+    }
+
+    $mdmEnrolled = $detectedMdm.Count -gt 0
+    $azureManaged = [bool]($dsreg.AzureAdJoined -or $dsreg.EnterpriseJoined)
+    $isManaged = [bool]($domainJoined -or $mdmEnrolled -or $azureManaged)
+    $isKnown = [bool]($domainKnown -and $queryErrors.Count -eq 0)
+    $ownership = if (-not $isKnown) { "Unknown" }
+        elseif ($domainJoined -and $mdmEnrolled) { "Organization (Domain + MDM)" }
+        elseif ($mdmEnrolled) { "Organization (MDM)" }
+        elseif ($domainJoined) { "Organization (Domain)" }
+        elseif ($azureManaged) { "Organization (Azure AD)" }
+        else { "Local" }
+    $evidence = @($signals | Where-Object { $_.Detected })
+    $managementConfidence = if (-not $isKnown) { "Unknown" } elseif ($isManaged -and $dsreg.Status -eq "Parsed") { "High" } elseif ($isManaged) { "Medium" } else { "Medium" }
     return [pscustomobject][ordered]@{
-        SchemaVersion=$script:CapabilitySchemaVersion
-        DomainJoined=$domainJoined; MdmEnrolled=$mdmEnrolled
-        IsManaged=($domainJoined -or $mdmEnrolled)
-        IsKnown=($domainKnown -and $queryErrors.Count -eq 0)
-        Signals=@($mdmSignals)
-        QueryErrors=@($queryErrors)
-        Ownership=if ($domainJoined -or $mdmEnrolled) { "Organization" } else { "Local" }
+        SchemaVersion=$script:ManagementSchemaVersion; ManagementSchemaVersion=$script:ManagementSchemaVersion
+        DomainJoined=$domainJoined; MdmEnrolled=$mdmEnrolled; AzureAdJoined=$azureManaged
+        IsManaged=$isManaged; IsKnown=$isKnown; ManagementStatus=if($isKnown){"Known"}else{"Unknown"}
+        ManagementConfidence=$managementConfidence; Dsreg=$dsreg; DsregStatus=$dsreg.Status
+        DsregWarning=$dsreg.Warning; FallbackUsed=$dsreg.FallbackUsed
+        Signals=@($signals.ToArray()); Evidence=$evidence; OwnershipEvidence=$evidence
+        OwnershipSources=@($detectedSources.ToArray()); QueryErrors=@($queryErrors.ToArray())
+        Ownership=$ownership; PolicyOwnership=if($isManaged){"Organization"}elseif($isKnown){"LocalDefault"}else{"Unknown"}
+        Decision=if($isManaged){"SkipByDefault"}elseif($isKnown){"ReviewLocal"}else{"Unknown"}
         ComputerName=$env:COMPUTERNAME
     }
 }
 
+function Get-RestorePolicyProvenance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [string]$ValueName,
+        [object]$ManagementState,
+        [switch]$AllowManagedPolicy,
+        [scriptblock]$PathProvider
+    )
+    if (-not $ManagementState) { $ManagementState = Get-PolicyManagementState }
+    $keyExists = $false
+    $valueExists = $false
+    try {
+        if ($PathProvider) {
+            $pathResult = & $PathProvider $Path
+            if ($pathResult -is [bool]) { $keyExists = [bool]$pathResult }
+            elseif ($pathResult -and $pathResult.PSObject.Properties['Exists']) { $keyExists = [bool]$pathResult.Exists }
+            elseif ($pathResult -and $pathResult.PSObject.Properties['KeyExists']) { $keyExists = [bool]$pathResult.KeyExists }
+            if ($pathResult -and $pathResult.PSObject.Properties['ValueNames'] -and $ValueName) { $valueExists = $ValueName -in @($pathResult.ValueNames) }
+        } else {
+            $keyExists = Test-Path -LiteralPath $Path
+            if ($keyExists -and $ValueName) {
+                $properties = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
+                $valueExists = [bool]$properties.PSObject.Properties[$ValueName]
+            }
+        }
+    } catch { $keyExists = $false; $valueExists = $false }
+    $exists = if ($ValueName) { $valueExists } else { $keyExists }
+    $normalized = [string]$Path
+    $lowerPath = $normalized.ToLowerInvariant()
+    $domainJoined = if ($ManagementState.PSObject.Properties['DomainJoined']) { [bool]$ManagementState.DomainJoined } else { $false }
+    $mdmEnrolled = if ($ManagementState.PSObject.Properties['MdmEnrolled']) { [bool]$ManagementState.MdmEnrolled } else { $false }
+    $managementKnown = if ($ManagementState.PSObject.Properties['IsKnown']) { [bool]$ManagementState.IsKnown } else { $false }
+    $managementEvidence = if ($ManagementState.PSObject.Properties['Evidence']) { @($ManagementState.Evidence) } else { @() }
+    $localGroupPolicyEvidence = @($managementEvidence | Where-Object { $_.Source -match '(?i)local group policy' -and $_.Detected }).Count -gt 0
+    $source = "Local configuration"
+    $policyKind = "LocalConfiguration"
+    if ($lowerPath -match '\\policymanager\\current\\') { $source="MDM Policy CSP"; $policyKind="MdmPolicy" }
+    elseif ($lowerPath -match '\\policymanager\\default\\') { $source="Windows PolicyManager default"; $policyKind="PolicyManagerDefault" }
+    elseif ($lowerPath -match '\\group policy\\|\\grouppolicy') { $source="Group Policy store"; $policyKind="GroupPolicy" }
+    elseif ($lowerPath -match '^[^:]+:\\software\\policies\\') {
+        $policyKind = if ($lowerPath -match '^hkc?u:') { "UserPolicyRegistry" } else { "MachinePolicyRegistry" }
+        if ($mdmEnrolled -and $domainJoined) { $source="Group Policy / MDM policy registry" }
+        elseif ($mdmEnrolled) { $source="MDM policy registry" }
+        elseif ($domainJoined) { $source="Group Policy registry" }
+        elseif ($localGroupPolicyEvidence) { $source="Local Group Policy registry"; $policyKind="LocalGroupPolicy" }
+        else { $source="Local policy registry" }
+    }
+    $organizationSource = ($source -match '(?i)mdm|policy csp') -or ($source -match '(?i)^group policy' -and $source -notmatch '(?i)local')
+    $managed = [bool]($exists -and $organizationSource -and ($domainJoined -or $mdmEnrolled -or $ManagementState.IsManaged))
+    if ($policyKind -eq "MdmPolicy" -and $exists -and -not $mdmEnrolled) { $managed = [bool]($ManagementState.IsManaged -and $exists) }
+    $ownership = if ($managed) { "Organization" } elseif ($managementKnown) { "Local" } else { "Unknown" }
+    $decision = if ($managed -and $AllowManagedPolicy) { "OverrideAllowed" }
+        elseif ($managed) { "SkipByDefault" }
+        elseif ($managementKnown) { "ReviewLocal" }
+        else { "Unknown" }
+    $evidence = $managementEvidence
+    $confidence = if ($managed -and $evidence.Count -gt 0) { "High" } elseif ($managementKnown) { "Medium" } else { "Low" }
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:ManagementSchemaVersion; Path=$Path; ValueName=$ValueName; Exists=$exists; KeyExists=$keyExists
+        Source=$source; PolicyKind=$policyKind; Ownership=$ownership; Managed=$managed; Confidence=$confidence
+        Evidence=$evidence; ManagementStatus=if($managementKnown){"Known"}else{"Unknown"}
+        ManagementDecision=$decision; OperatorOverride=[bool]$AllowManagedPolicy; CanMutate=([bool](-not $managed -or $AllowManagedPolicy))
+        Reason=if($managed -and -not $AllowManagedPolicy){"Organization-owned policy value is preserved by default; use -AllowManagedPolicy only with operator authority"}elseif($managed){"Managed policy override explicitly requested; organization-owned state may be changed"}else{"No organization ownership evidence was detected for this value"}
+    }
+}
+
 function Get-EdgePolicyState {
+    [CmdletBinding()]
+    param([object]$ManagementState)
     $machinePath = "HKLM:\SOFTWARE\Policies\Microsoft\Edge"
     $userPath = "HKCU:\SOFTWARE\Policies\Microsoft\Edge"
     $machinePolicies = @(); $userPolicies = @()
     if (Test-Path -LiteralPath $machinePath) { $machinePolicies = @((Get-Item -LiteralPath $machinePath -ErrorAction SilentlyContinue).Property) }
     if (Test-Path -LiteralPath $userPath) { $userPolicies = @((Get-Item -LiteralPath $userPath -ErrorAction SilentlyContinue).Property) }
-    $management = Get-PolicyManagementState
+    $management = if ($ManagementState) { $ManagementState } else { Get-PolicyManagementState }
     $hasPolicies = ($machinePolicies.Count + $userPolicies.Count) -gt 0
+    $machineProvenance = Get-RestorePolicyProvenance -Path $machinePath -ManagementState $management
+    $userProvenance = Get-RestorePolicyProvenance -Path $userPath -ManagementState $management
     $source = if (-not $hasPolicies) { "None" }
-        elseif ($management.IsManaged -and $machinePolicies.Count) { "Managed machine policy" }
+        elseif ($machineProvenance.Managed) { "Managed machine policy" }
         elseif ($machinePolicies.Count) { "Local machine policy" }
         else { "User policy" }
     return [pscustomobject][ordered]@{
-        Managed=($management.IsManaged -and $machinePolicies.Count -gt 0)
-        HasPolicies=$hasPolicies; Source=$source
+        Managed=($machineProvenance.Managed -or $userProvenance.Managed); HasPolicies=$hasPolicies; Source=$source
         MachinePolicies=@($machinePolicies); UserPolicies=@($userPolicies)
         DomainJoined=$management.DomainJoined; MdmEnrolled=$management.MdmEnrolled
+        ManagementState=$management; PolicyProvenance=@($machineProvenance,$userProvenance)
+        OwnershipEvidence=@($management.Evidence); ManagementDecision=if($machineProvenance.Managed -or $userProvenance.Managed){"SkipByDefault"}else{$management.Decision}
     }
+}
+
+function Remove-RestoreManagedPolicyValue {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [object]$ManagementState,
+        [switch]$ForceManaged
+    )
+    $management = if ($ManagementState) { $ManagementState } else { Get-PolicyManagementState }
+    $override = [bool]($ForceManaged -or $script:ManagedPolicyOverrideRequested)
+    $provenance = Get-RestorePolicyProvenance -Path $Path -ValueName $Name -ManagementState $management -AllowManagedPolicy:$override
+    if (-not $provenance.CanMutate) {
+        $script:SkippedCount++
+        Write-Log "Preserved managed policy $Path\$Name ($($provenance.Source)); use -AllowManagedPolicy only with operator authority" -Level Warning
+        return $false
+    }
+    if (-not $PSCmdlet.ShouldProcess("$Path\$Name", "remove policy value")) { return $false }
+    return (Remove-RegistryValue -Path $Path -Name $Name -Silent)
 }
 
 function Reset-WindowsUpdateChannelAndDeferral {
@@ -1513,13 +1757,14 @@ function Reset-WindowsUpdateChannelAndDeferral {
     param([switch]$ForceManaged)
     if (-not $PSCmdlet.ShouldProcess("Windows Update policy and deferral state", "reset")) { return $false }
     $management = Get-PolicyManagementState
+    $forceManaged = [bool]($ForceManaged -or $script:ManagedPolicyOverrideRequested)
     $policyRoots = @(
         "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate",
         "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization",
         "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching",
         "HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
     )
-    if ($management.IsManaged -and -not $ForceManaged) {
+    if ($management.IsManaged -and -not $forceManaged) {
         Write-Log "Managed policy state detected; preserving policy containers and removing only explicit pause/deferral values" -Level Warning
     } else {
         foreach ($root in $policyRoots) { Remove-RegistryKey -Path $root -Silent }
@@ -1543,10 +1788,10 @@ function Reset-WindowsUpdateChannelAndDeferral {
         "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\Settings",
         "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\PolicyState"
     )) {
-        foreach ($name in $policyValues) { Remove-RegistryValue -Path $path -Name $name -Silent }
+        foreach ($name in $policyValues) { Remove-RestoreManagedPolicyValue -Path $path -Name $name -ManagementState $management -ForceManaged:$forceManaged }
     }
     foreach ($name in @("Pause","PauseFeatureUpdates","PauseQualityUpdates","RequireDeferUpgrade","DeferFeatureUpdatesPeriodInDays","DeferQualityUpdatesPeriodInDays")) {
-        Remove-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update\$name" -Name "value" -Silent
+        Remove-RestoreManagedPolicyValue -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update\$name" -Name "value" -ManagementState $management -ForceManaged:$forceManaged
     }
     Write-Log "Windows Update channel, release targeting, and deferral state reset" -Level Success
 }
@@ -1634,23 +1879,25 @@ function Restore-DevicePrivacySlider {
 }
 
 function Get-AccountSignInState {
-    $azureJoined = $false; $workplaceJoined = $false; $dsregDomainJoined = $false
-    try {
-        $dsregOutput = @(& dsregcmd.exe /status 2>$null)
-        foreach ($line in $dsregOutput) {
-            if ($line -match 'AzureAdJoined\s*:\s*YES') { $azureJoined = $true }
-            if ($line -match 'WorkplaceJoined\s*:\s*YES') { $workplaceJoined = $true }
-            if ($line -match 'DomainJoined\s*:\s*YES') { $dsregDomainJoined = $true }
-        }
-    } catch { Write-Verbose "dsregcmd.exe was unavailable or did not return account state" }
-    $management = Get-PolicyManagementState
-    $kind = if ($azureJoined) { "Azure AD / Microsoft account capable" }
-        elseif ($dsregDomainJoined -or $management.DomainJoined) { "Domain account" }
-        elseif ($workplaceJoined) { "Workplace account" }
+    [CmdletBinding()]
+    param(
+        [scriptblock]$DsregProvider,
+        [object]$ManagementState
+    )
+    $management = if ($ManagementState) { $ManagementState } else { Get-PolicyManagementState -DsregProvider $DsregProvider }
+    $dsreg = if ($management.PSObject.Properties['Dsreg']) { $management.Dsreg } else { Get-RestoreDsregState -Provider $DsregProvider }
+    $kind = if ($dsreg.AzureAdJoined) { "Azure AD / Microsoft account capable" }
+        elseif ($dsreg.DomainJoined -or $management.DomainJoined) { "Domain account" }
+        elseif ($dsreg.WorkplaceJoined) { "Workplace account" }
         else { "Local account or unjoined device" }
     return [pscustomobject][ordered]@{
-        AccountKind=$kind; AzureAdJoined=$azureJoined; WorkplaceJoined=$workplaceJoined
-        DomainJoined=($dsregDomainJoined -or $management.DomainJoined)
+        SchemaVersion=$script:ManagementSchemaVersion; AccountKind=$kind
+        AzureAdJoined=[bool]$dsreg.AzureAdJoined; WorkplaceJoined=[bool]$dsreg.WorkplaceJoined
+        DomainJoined=([bool]($dsreg.DomainJoined -or $management.DomainJoined))
+        EnterpriseJoined=[bool]$dsreg.EnterpriseJoined; Dsreg=$dsreg; DsregStatus=$dsreg.Status
+        DsregWarning=$dsreg.Warning; StructuredSignals=@($dsreg.Signals)
+        ManagementState=$management; PolicyOwnership=$management.PolicyOwnership
+        ManagementDecision=$management.Decision; OwnershipEvidence=@($management.Evidence)
         UserName="$env:USERDOMAIN\$env:USERNAME"
     }
 }
@@ -1659,6 +1906,7 @@ function Restore-AccountSignIn {
     Write-Log "=== ACCOUNT SIGN-IN COMPONENTS ===" -Level Section
     $state = Get-AccountSignInState
     Write-Log "Detected sign-in context: $($state.AccountKind) ($($state.UserName))" -Level Info
+    if ($state.DsregWarning) { Write-Log "Account join signal note: $($state.DsregWarning)" -Level Warning }
     @(
         @{N="wlidsvc";T="Manual"}, @{N="TokenBroker";T="Manual"},
         @{N="NgcSvc";T="Manual"}, @{N="NgcCtnrSvc";T="Manual"},
@@ -2516,8 +2764,9 @@ function Restore-WindowsUpdateSettings {
 
     # ---- Reset update channel, release targeting, and deferral policies ----
     $management = Get-PolicyManagementState
-    Reset-WindowsUpdateChannelAndDeferral -ForceManaged:$ForceManaged
-    if ($ForceManaged -or -not $management.IsManaged) {
+    $forceManaged = [bool]($ForceManaged -or $script:ManagedPolicyOverrideRequested)
+    Reset-WindowsUpdateChannelAndDeferral -ForceManaged:$forceManaged
+    if ($forceManaged -or -not $management.IsManaged) {
         Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Silent
         Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" -Silent
         Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching" -Silent
@@ -2530,7 +2779,7 @@ function Restore-WindowsUpdateSettings {
       "AlwaysAutoRebootAtScheduledTime","AlwaysAutoRebootAtScheduledTimeMinutes",
       "IncludeRecommendedUpdates","AutomaticMaintenanceEnabled","DetectionFrequency",
       "DetectionFrequencyEnabled","RescheduleWaitTime","RescheduleWaitTimeEnabled"
-    ) | ForEach-Object { Remove-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name $_ -Silent }
+    ) | ForEach-Object { Remove-RestoreManagedPolicyValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name $_ -ManagementState $management -ForceManaged:$forceManaged }
 
     # ---- WU base policies ----
     @("WUServer","WUStatusServer","UpdateServiceUrlAlternate","DisableWindowsUpdateAccess",
@@ -2548,7 +2797,7 @@ function Restore-WindowsUpdateSettings {
       "ConfigureDeadlineNoAutoReboot","DoNotConnectToWindowsUpdateInternetLocations",
       "SetPolicyDrivenUpdateSourceForFeatureUpdates","SetPolicyDrivenUpdateSourceForQualityUpdates",
       "SetPolicyDrivenUpdateSourceForDriverUpdates","SetPolicyDrivenUpdateSourceForOtherUpdates"
-    ) | ForEach-Object { Remove-RegistryValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Name $_ -Silent }
+    ) | ForEach-Object { Remove-RestoreManagedPolicyValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -Name $_ -ManagementState $management -ForceManaged:$forceManaged }
 
     # ---- UX Settings ----
     @("ActiveHoursStart","ActiveHoursEnd","PauseFeatureUpdatesStartTime","PauseFeatureUpdatesEndTime",
@@ -2562,13 +2811,13 @@ function Restore-WindowsUpdateSettings {
       "ExcludeWUDriversInQualityUpdate","ConfigureDeadlineForFeatureUpdates",
       "ConfigureDeadlineForQualityUpdates"
     ) | ForEach-Object {
-        Remove-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update\$_" -Name "value" -Silent
+        Remove-RestoreManagedPolicyValue -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Update\$_" -Name "value" -ManagementState $management -ForceManaged:$forceManaged
     }
 
     # ---- WU driver search ----
     Remove-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching" -Name "SearchOrderConfig" -Silent
     Remove-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching" -Name "DontSearchWindowsUpdate" -Silent
-    Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching" -Silent
+    if ($forceManaged -or -not $management.IsManaged) { Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DriverSearching" -Silent }
 
     # ---- Delivery Optimization ----
     Remove-RegistryValue -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config" -Name "DODownloadMode" -Silent
@@ -2705,9 +2954,11 @@ function Restore-EdgeSettings {
     Write-Log "=== MICROSOFT EDGE (COMPREHENSIVE) ===" -Level Section
 
     # Preserve enterprise-managed machine policy unless explicitly overridden.
-    $edgeState = Get-EdgePolicyState
+    $management = Get-PolicyManagementState
+    $forceManaged = [bool]($ForceManaged -or $script:ManagedPolicyOverrideRequested)
+    $edgeState = Get-EdgePolicyState -ManagementState $management
     Write-Log "Edge policy state: $($edgeState.Source)" -Level Info
-    if ($edgeState.Managed -and -not $ForceManaged) {
+    if ($edgeState.Managed -and -not $forceManaged) {
         Write-Log "Managed Edge policies preserved; use ForceManaged only for a deliberate enterprise reset" -Level Warning
     } else {
         Remove-RegistryKey -Path "HKLM:\SOFTWARE\Policies\Microsoft\Edge" -Silent
@@ -3794,6 +4045,11 @@ function Get-RestoreCapabilityEvaluation {
         $reasons = New-Object System.Collections.Generic.List[string]
         $definition = $catalog[$key]
         $status = "Supported"
+        $management = if ($MachineProfile.PSObject.Properties['Management']) { $MachineProfile.Management } else { $null }
+        $managementEvidence = if ($management -and $management.PSObject.Properties['Evidence']) { @($management.Evidence) } else { @() }
+        $managementOwnership = if ($management -and $management.PSObject.Properties['Ownership']) { [string]$management.Ownership } else { "Unknown" }
+        $managementDecision = "NotEvaluated"
+        $operatorOverride = [bool]$AllowManagedPolicy
         if (-not $definition) {
             $status = "Unsupported"
             $reasons.Add("Restore category is not declared in the capability catalog")
@@ -3834,11 +4090,21 @@ function Get-RestoreCapabilityEvaluation {
             if ($definition.RequiresOnline -and -not $MachineProfile.IsOnline) {
                 $status = "Unsupported"; $reasons.Add("Online Windows state is required")
             }
-            if ($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['IsKnown'] -and -not $MachineProfile.Management.IsKnown) {
-                $status = "Unknown"; $reasons.Add("Management ownership could not be determined")
-            } elseif ($MachineProfile.Management -and $MachineProfile.Management.IsManaged -and $definition.ManagedPolicyAction -eq "Skip") {
-                if ($AllowManagedPolicy) { $reasons.Add("Managed policy override explicitly requested") }
-                else { $status = "OrganizationOwned"; $reasons.Add("Organization-owned policy state is preserved by default") }
+            if ($management -and $management.PSObject.Properties['IsKnown'] -and -not $management.IsKnown) {
+                $status = "Unknown"; $managementDecision = "Unknown"
+                $reasons.Add("Management ownership could not be determined; no policy mutation is allowed")
+            } elseif ($management -and $management.IsManaged -and $definition.ManagedPolicyAction -eq "Skip") {
+                if ($AllowManagedPolicy) {
+                    $managementDecision = "OverrideRequested"
+                    $reasons.Add("Managed-policy override explicitly requested; operator accepted organization-owned state risk ($managementOwnership)")
+                } else {
+                    $status = "OrganizationOwned"; $managementDecision = "SkippedByDefault"
+                    $reasons.Add("Organization-owned policy state ($managementOwnership) is preserved by default; use -AllowManagedPolicy only with operator authority")
+                }
+            } elseif ($management -and $management.IsManaged) {
+                $managementDecision = "ManagedNotApplicable"
+            } elseif ($management) {
+                $managementDecision = "NotManaged"
             }
         }
         $evaluations += [pscustomobject][ordered]@{
@@ -3848,7 +4114,10 @@ function Get-RestoreCapabilityEvaluation {
             Scope=if($definition){$definition.Scope}else{"Unknown"}
             Risk=if($definition){$definition.Risk}else{"Unknown"}
             PolicyOwnership=if($definition){$definition.PolicyOwnership}else{"Unknown"}
-            Definition=$definition; Profile=$MachineProfile
+            ManagementOwnership=$managementOwnership; ManagementDecision=$managementDecision
+            ManagedPolicyDecision=$managementDecision; OperatorOverride=$operatorOverride
+            ManagementEvidence=$managementEvidence; PolicyOwnershipEvidence=$managementEvidence
+            ManagementState=$management; Definition=$definition; Profile=$MachineProfile
         }
     }
     return @($evaluations)
@@ -3868,6 +4137,10 @@ function Get-RestoreCapabilityReport {
         SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
         GeneratedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
         Profile=$MachineProfile; Categories=$evaluations
+        ManagementState=$MachineProfile.Management
+        ManagementEvidence=if($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['Evidence']){@($MachineProfile.Management.Evidence)}else{@()}
+        ManagedPolicyOverride=[bool]$AllowManagedPolicy
+        ManagementDecision=if($AllowManagedPolicy){"OverrideRequested"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsManaged){"SkipByDefault"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsKnown){"ReviewLocal"}else{"Unknown"}
         SupportedCount=@($evaluations | Where-Object CanMutate).Count
         BlockedCount=@($evaluations | Where-Object { -not $_.CanMutate }).Count
         Status=if (@($evaluations | Where-Object { -not $_.CanMutate }).Count -eq 0) { "Ready" } else { "Blocked" }
@@ -3894,6 +4167,9 @@ function Invoke-RestoreSelection {
         $results[$evaluation.Key] = [pscustomobject][ordered]@{
             Key=$evaluation.Key; Status="Skipped"; Changed=0; Errors=0
             CapabilityStatus=$evaluation.Status; ExecutionMode="CapabilityGate"; ActionPlanStatus="Blocked"; Reason=$evaluation.Reason
+            PolicyOwnership=$evaluation.PolicyOwnership; ManagementOwnership=$evaluation.ManagementOwnership
+            ManagedPolicyDecision=$evaluation.ManagedPolicyDecision; OperatorOverride=$evaluation.OperatorOverride
+            ManagementEvidence=$evaluation.ManagementEvidence
         }
         Write-Log "Skipped $($evaluation.Key): $($evaluation.Reason)" -Level Warning
     }
@@ -3927,11 +4203,11 @@ function Invoke-RestoreSelection {
             $script:CategoryResults[$key].Changed = $changed
             $script:CategoryResults[$key].Errors = $errors
             $script:CategoryResults[$key].Status = $status
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;ExecutionMode=$executionMode;ActionPlanStatus=$categoryPlan[0].Status;Reason=$null}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;ExecutionMode=$executionMode;ActionPlanStatus=$categoryPlan[0].Status;Reason=$null;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence}
         } catch {
             $script:CategoryResults[$key].Status = "Error"
             $script:CategoryResults[$key].Errors++
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;ExecutionMode=if($useActionPlan){"ActionPlan"}else{"LegacyReviewRequired"};ActionPlanStatus=if($categoryPlan.Count -eq 1){$categoryPlan[0].Status}else{"Unknown"};Reason=$_.Exception.Message}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;ExecutionMode=if($useActionPlan){"ActionPlan"}else{"LegacyReviewRequired"};ActionPlanStatus=if($categoryPlan.Count -eq 1){$categoryPlan[0].Status}else{"Unknown"};Reason=$_.Exception.Message;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence}
             Write-Log "Error in $key : $($_.Exception.Message)" -Level Error
         }
     }
@@ -3945,7 +4221,10 @@ function Invoke-RestoreSelection {
     $script:CapabilityExitCode = $exitCode
     return [pscustomobject][ordered]@{
         SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
-        Profile=$machineProfile; ActionPlanHash=$actionPlan.PlanHash; ActionPlanStatus=$actionPlan.Status
+        Profile=$machineProfile; ManagementState=$machineProfile.Management
+        ManagementEvidence=if($machineProfile.Management -and $machineProfile.Management.PSObject.Properties['Evidence']){@($machineProfile.Management.Evidence)}else{@()}
+        ManagedPolicyOverride=[bool]$AllowManagedPolicy
+        ActionPlanHash=$actionPlan.PlanHash; ActionPlanStatus=$actionPlan.Status
         Categories=$resultValues; ExitCode=$exitCode
         RollbackPath=if($rollbackJournal){$script:ActiveRollbackJournalPath}else{$null}
         RollbackJournalState=if($rollbackJournal){$rollbackJournal.State}else{$null}
@@ -4161,7 +4440,11 @@ function Get-RestoreActionPlan {
                 Action="Skip"; Target=$evaluation.Key; Scope=$evaluation.Scope; Risk=$evaluation.Risk
                 Before=$null; After=$null; RollbackAction="None"; Exact=$true; CanExecute=$false
                 Reason=$evaluation.Reason; Source="Capability catalog"; Dependency="Capability:$($evaluation.Key)"
-                Verification="Capability evaluation remains supported"; Metadata=$null
+                Verification="Capability evaluation remains supported"; Metadata=[pscustomobject][ordered]@{
+                    ManagementDecision=$evaluation.ManagedPolicyDecision; OperatorOverride=$evaluation.OperatorOverride
+                    PolicyOwnership=$evaluation.ManagementOwnership; ManagementEvidence=$evaluation.ManagementEvidence
+                    Reason=$evaluation.Reason
+                }
             })
             $categoryExact++
         } else {
@@ -4200,6 +4483,8 @@ function Get-RestoreActionPlan {
         $categoryPlans.Add([pscustomobject][ordered]@{
             Key=$evaluation.Key; CapabilityStatus=$evaluation.Status; CanMutate=$evaluation.CanMutate
             ExactOperationCount=$categoryExact; OpaqueOperationCount=$categoryOpaque
+            PolicyOwnership=$evaluation.ManagementOwnership; ManagedPolicyDecision=$evaluation.ManagedPolicyDecision
+            OperatorOverride=$evaluation.OperatorOverride; ManagementEvidence=$evaluation.ManagementEvidence
             Status=if (-not $evaluation.CanMutate) { "Blocked" } elseif ($categoryOpaque -gt 0) { "ReviewRequired" } else { "Ready" }
         })
     }
@@ -4230,6 +4515,10 @@ function Get-RestoreActionPlan {
         GeneratedAtUtc=(Get-Date).ToUniversalTime().ToString("o"); PlanHash=$planHash
         Status=$planStatus; ExecutionAllowed=($planStatus -eq "Ready")
         Profile=$MachineProfile; Categories=@($categoryPlans.ToArray()); Operations=$operationArray
+        ManagementState=$MachineProfile.Management
+        ManagementEvidence=if($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['Evidence']){@($MachineProfile.Management.Evidence)}else{@()}
+        ManagedPolicyOverride=[bool]$AllowManagedPolicy
+        ManagementDecision=if($AllowManagedPolicy){"OverrideRequested"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsManaged){"SkipByDefault"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsKnown){"ReviewLocal"}else{"Unknown"}
         ExactOperationCount=@($operationArray | Where-Object Exact).Count; OpaqueOperationCount=$opaqueCount
         CapabilityBlockedCount=$blockedCount; HealthReportAvailable=($null -ne $HealthReport)
     }
@@ -4369,12 +4658,21 @@ function Get-SystemHealthReport {
     $report = [ordered]@{}
     $baselineContext = Get-RestoreBaselineContext
     $script:BaselineCatalogContext = $baselineContext
+    $managementState = if ($baselineContext.MachineProfile -and $baselineContext.MachineProfile.PSObject.Properties['Management']) { $baselineContext.MachineProfile.Management } else { Get-PolicyManagementState }
+    $script:ManagementState = $managementState
+    $managementEvidence = if ($managementState.PSObject.Properties['Evidence']) { @($managementState.Evidence) } else { @() }
+    $managementDecision = if ($managementState.PSObject.Properties['Decision']) { [string]$managementState.Decision } else { "Unknown" }
+    $managementOwnership = if ($managementState.PSObject.Properties['Ownership']) { [string]$managementState.Ownership } else { "Unknown" }
     $addCat = {
-        param($name, $fn, $issues, $details, $sev, $keys)
+        param($name, $fn, $issues, $details, $sev, $keys, $policyProvenance)
         if (!$details -or $details.Count -eq 0) { $details = $issues }
         $report[$name] = @{
             FriendlyName=$fn; Issues=[array]$issues; Details=[array]$details
             Severity=$sev; IssueCount=([array]$issues).Count; FixKeys=$keys
+            PolicyProvenance=[array]$policyProvenance; ManagementEvidence=$managementEvidence
+            ManagementOwnership=$managementOwnership; ManagementDecision=$managementDecision
+            DsregStatus=if($managementState.PSObject.Properties['DsregStatus']){[string]$managementState.DsregStatus}else{"Unknown"}
+            DsregWarning=if($managementState.PSObject.Properties['DsregWarning']){[string]$managementState.DsregWarning}else{$null}
         }
     }
 
@@ -4412,11 +4710,18 @@ function Get-SystemHealthReport {
     # --- Windows Defender ---
     $issues = @(); $details = @()
     $defPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender"
+    $defenderProvenance = @(
+        (Get-RestorePolicyProvenance -Path $defPol -ValueName "DisableAntiSpyware" -ManagementState $managementState),
+        (Get-RestorePolicyProvenance -Path "$defPol\Real-Time Protection" -ValueName "DisableRealtimeMonitoring" -ManagementState $managementState)
+    )
     if ((Get-ItemProperty $defPol -Name "DisableAntiSpyware" -EA 0).DisableAntiSpyware -eq 1) {
         $issues += "Antivirus disabled by policy"; $details += "Policy: DisableAntiSpyware = 1"
     }
     if ((Get-ItemProperty "$defPol\Real-Time Protection" -Name "DisableRealtimeMonitoring" -EA 0).DisableRealtimeMonitoring -eq 1) {
         $issues += "Real-time protection off"; $details += "Policy: DisableRealtimeMonitoring = 1"
+    }
+    foreach ($policy in @($defenderProvenance | Where-Object Exists)) {
+        $details += "Policy provenance: $($policy.ValueName) source=$($policy.Source); ownership=$($policy.Ownership); decision=$($policy.ManagementDecision)"
     }
     $svc = Get-Service "WinDefend" -EA 0
     if ($svc -and $svc.StartType -eq 'Disabled') { $issues += "Defender service disabled"; $details += "Service: WinDefend (Windows Defender) = Disabled" }
@@ -4425,7 +4730,7 @@ function Get-SystemHealthReport {
     }
     $renamedExes = @(Get-ChildItem "$env:ProgramFiles\Windows Defender" -Filter "*.exe.OLD" -EA 0)
     if ($renamedExes.Count) { $issues += "$($renamedExes.Count) Defender EXEs renamed"; $details += ($renamedExes | ForEach-Object { "Renamed: $($_.Name)" }) }
-    & $addCat "Defender" "Windows Defender" $issues $details $(if($issues.Count){"Critical"}else{"OK"}) @("chkDefender")
+    & $addCat "Defender" "Windows Defender" $issues $details $(if($issues.Count){"Critical"}else{"OK"}) @("chkDefender") $defenderProvenance
 
     # --- Firewall ---
     $issues = @(); $details = @()
@@ -4439,13 +4744,15 @@ function Get-SystemHealthReport {
 
     # --- SmartScreen ---
     $issues = @(); $details = @()
+    $smartScreenProvenance = @(Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -ValueName "EnableSmartScreen" -ManagementState $managementState)
     if ((Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Name "EnableSmartScreen" -EA 0).EnableSmartScreen -eq 0) {
         $issues += "SmartScreen disabled by policy"; $details += "Policy: EnableSmartScreen = 0"
     }
+    foreach ($policy in @($smartScreenProvenance | Where-Object Exists)) { $details += "Policy provenance: $($policy.ValueName) source=$($policy.Source); ownership=$($policy.Ownership); decision=$($policy.ManagementDecision)" }
     if ((Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\smartscreen.exe" -Name "Debugger" -EA 0).Debugger) {
         $issues += "SmartScreen executable blocked"; $details += "IFEO: smartscreen.exe has Debugger redirect"
     }
-    & $addCat "SmartScreen" "SmartScreen" $issues $details $(if($issues.Count){"Critical"}else{"OK"}) @("chkSmartScreen")
+    & $addCat "SmartScreen" "SmartScreen" $issues $details $(if($issues.Count){"Critical"}else{"OK"}) @("chkSmartScreen") $smartScreenProvenance
 
     # --- Security UI ---
     $issues = @(); $details = @()
@@ -4462,6 +4769,12 @@ function Get-SystemHealthReport {
 
     # --- Windows Update ---
     $issues = @(); $details = @()
+    $windowsUpdateProvenance = @(
+        (Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -ValueName "NoAutoUpdate" -ManagementState $managementState),
+        (Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -ValueName "UseWUServer" -ManagementState $managementState),
+        (Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate" -ValueName "TargetReleaseVersion" -ManagementState $managementState),
+        (Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Update" -ValueName "value" -ManagementState $managementState)
+    )
     $wuSvcs = [ordered]@{ "wuauserv"="Windows Update"; "DoSvc"="Delivery Optimization"; "WaaSMedicSvc"="Update Health"; "UsoSvc"="Update Orchestrator"; "BITS"="Background Transfer" }
     foreach ($s in $wuSvcs.GetEnumerator()) {
         $svc = Get-Service $s.Key -EA 0
@@ -4470,7 +4783,8 @@ function Get-SystemHealthReport {
     if ((Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -EA 0).NoAutoUpdate -eq 1) {
         $issues += "Auto-update blocked by policy"; $details += "Policy: NoAutoUpdate = 1"
     }
-    & $addCat "WindowsUpdate" "Windows Update" $issues $details $(if($issues.Count){"High"}else{"OK"}) @("chkWindowsUpdate")
+    foreach ($policy in @($windowsUpdateProvenance | Where-Object Exists)) { $details += "Policy provenance: $($policy.ValueName) source=$($policy.Source); ownership=$($policy.Ownership); decision=$($policy.ManagementDecision)" }
+    & $addCat "WindowsUpdate" "Windows Update" $issues $details $(if($issues.Count){"High"}else{"OK"}) @("chkWindowsUpdate") $windowsUpdateProvenance
 
     # --- UAC ---
     $issues = @(); $details = @()
@@ -4593,7 +4907,7 @@ function Get-SystemHealthReport {
 
     # --- Browsers ---
     $issues = @(); $details = @()
-    $edgeState = Get-EdgePolicyState
+    $edgeState = Get-EdgePolicyState -ManagementState $managementState
     if ($edgeState.HasPolicies) {
         $issues += "Edge: $($edgeState.MachinePolicies.Count + $edgeState.UserPolicies.Count) policies"
         $details += "Edge policy source: $($edgeState.Source)"
@@ -4605,7 +4919,8 @@ function Get-SystemHealthReport {
         if ($cp.Count -gt 2) { $issues += "Chrome: $($cp.Count) policies"; $details += ($cp | Select-Object -First 10 | ForEach-Object { "Chrome policy: $_" }) }
     }
     if (Test-Path "HKLM:\SOFTWARE\Policies\Mozilla\Firefox") { $issues += "Firefox has policies"; $details += "Firefox group policies detected" }
-    & $addCat "Browsers" "Browser Settings" $issues $details $(if($issues.Count){"Low"}else{"OK"}) @("chkEdge","chkChrome")
+    foreach ($policy in @($edgeState.PolicyProvenance | Where-Object Exists)) { $details += "Policy provenance: $($policy.Path) source=$($policy.Source); ownership=$($policy.Ownership); decision=$($policy.ManagementDecision)" }
+    & $addCat "Browsers" "Browser Settings" $issues $details $(if($issues.Count){"Low"}else{"OK"}) @("chkEdge","chkChrome") $edgeState.PolicyProvenance
 
     # --- Search indexer ---
     $issues = @(); $details = @()
@@ -4625,7 +4940,9 @@ function Get-SystemHealthReport {
         }
     }
     $details += "Sign-in context: $($accountState.AccountKind)"
-    & $addCat "AccountSignIn" "Account Sign-in" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkAccount")
+    if ($accountState.DsregStatus) { $details += "Structured account-join signals: $($accountState.DsregStatus)" }
+    if ($accountState.DsregWarning) { $details += "Account-join signal note: $($accountState.DsregWarning)" }
+    & $addCat "AccountSignIn" "Account Sign-in" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkAccount") @()
 
     # --- Taskbar/Explorer/UI ---
     $issues = @(); $details = @()
@@ -4645,10 +4962,12 @@ function Get-SystemHealthReport {
 
     # --- OneDrive ---
     $issues = @(); $details = @()
+    $oneDriveProvenance = @(Get-RestorePolicyProvenance -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -ValueName "DisableFileSyncNGSC" -ManagementState $managementState)
     if ((Get-ItemProperty "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" -Name "DisableFileSyncNGSC" -EA 0).DisableFileSyncNGSC -eq 1) {
         $issues += "OneDrive sync blocked"; $details += "Policy: DisableFileSyncNGSC = 1"
     }
-    & $addCat "OneDrive" "OneDrive" $issues $details $(if($issues.Count){"Low"}else{"OK"}) @("chkOneDrive")
+    foreach ($policy in @($oneDriveProvenance | Where-Object Exists)) { $details += "Policy provenance: $($policy.ValueName) source=$($policy.Source); ownership=$($policy.Ownership); decision=$($policy.ManagementDecision)" }
+    & $addCat "OneDrive" "OneDrive" $issues $details $(if($issues.Count){"Low"}else{"OK"}) @("chkOneDrive") $oneDriveProvenance
 
     # --- Scheduled Tasks ---
     $issues = @(); $details = @()
@@ -5312,6 +5631,11 @@ function Get-RestoreImpactPreview {
             CapabilityReason=if ($capabilityMap[$key]) { $capabilityMap[$key].Reason } else { "Category is not declared in the capability catalog" }
             Scope=if ($capabilityMap[$key]) { $capabilityMap[$key].Scope } else { "Unknown" }
             Risk=if ($capabilityMap[$key]) { $capabilityMap[$key].Risk } else { "Unknown" }
+            PolicyOwnership=if ($capabilityMap[$key]) { $capabilityMap[$key].PolicyOwnership } else { "Unknown" }
+            ManagementOwnership=if ($capabilityMap[$key]) { $capabilityMap[$key].ManagementOwnership } else { "Unknown" }
+            ManagedPolicyDecision=if ($capabilityMap[$key]) { $capabilityMap[$key].ManagedPolicyDecision } else { "Unknown" }
+            OperatorOverride=if ($capabilityMap[$key]) { [bool]$capabilityMap[$key].OperatorOverride } else { [bool]$script:ManagedPolicyOverrideRequested }
+            ManagementEvidence=if ($capabilityMap[$key]) { @($capabilityMap[$key].ManagementEvidence) } else { @() }
         }
     }
     return @($preview)
@@ -5924,13 +6248,18 @@ function Get-PostUpdateSecurityRecheck {
     foreach ($key in $securityKeys) {
         if ($health.Contains($key)) {
             $security += [pscustomobject]@{
-                Category=$key; Severity=$health[$key].Severity; IssueCount=$health[$key].IssueCount
+            Category=$key; Severity=$health[$key].Severity; IssueCount=$health[$key].IssueCount
                 Issues=@($health[$key].Issues); Details=@($health[$key].Details)
+                PolicyProvenance=@($health[$key].PolicyProvenance); ManagementEvidence=@($health[$key].ManagementEvidence)
+                ManagementOwnership=$health[$key].ManagementOwnership; ManagementDecision=$health[$key].ManagementDecision
+                DsregStatus=$health[$key].DsregStatus; DsregWarning=$health[$key].DsregWarning
             }
         }
     }
     return [pscustomobject][ordered]@{
         CheckedAt=(Get-Date).ToUniversalTime().ToString("o")
+        ManagementState=$script:ManagementState
+        ManagedPolicyOverride=[bool]$script:ManagedPolicyOverrideRequested
         Passed=(@($security | Where-Object { $_.Severity -in @("Critical","High") }).Count -eq 0)
         Categories=@($security)
     }
@@ -5973,7 +6302,8 @@ function Restore-LocalGroupPolicyDefault {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param([switch]$ForceManaged)
     $management = Get-PolicyManagementState
-    if ($management.IsManaged -and -not $ForceManaged) {
+    $forceManaged = [bool]($ForceManaged -or $script:ManagedPolicyOverrideRequested)
+    if ($management.IsManaged -and -not $forceManaged) {
         Write-Log "Domain or MDM management detected; local Group Policy reset skipped" -Level Warning
         return $false
     }

@@ -25,7 +25,7 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 - **Import undo manifest** - Load JSON manifests from Debloat-Win11 v1.1.0 for precise restoration
 - **Debloat fingerprinting** - Detects evidence from O&O ShutUp10, WPD, ThisIsWin11, Sophia Script, and Win10Privacy without executing their code
 - **Baseline inventory** - Exports and compares registry/AppX state, including provisioned-package and offline-WIM comparisons
-- **Managed-device safety** - Detects domain/MDM policy ownership and preserves managed policy containers unless explicitly overridden
+- **Managed-device safety** - Reports structured domain, MDM, Group Policy, local-policy, and account-join provenance; managed values and categories are skipped by default unless an explicit operator override is recorded
 - **Operational recovery** - Adds security reset, Search index rebuild, Store/WinGet repair, privacy-slider repair, integrity-checked rollback journals, and next-boot restore scheduling
 - **Deployment wrappers** - Read-only compliance and optional remediation entry points for Intune and Configuration Manager
 - **HTML report export** - Save a detailed dark-themed report of everything restored with before/after states
@@ -69,6 +69,8 @@ The same script supports non-GUI workflows for automation and diagnostics:
 .\Restore-WindowsDefaults.ps1 -NoGui -WhatIf -RestoreCategories chkDefender,chkWindowsUpdate
 .\Restore-WindowsDefaults.ps1 -NoGui -PlanPath .\restore-plan.json -RestoreCategories chkDefender,chkWindowsUpdate
 .\Restore-WindowsDefaults.ps1 -NoGui -BaselineReport
+.\Restore-WindowsDefaults.ps1 -NoGui -CapabilityReport -RestoreCategories chkDefender,chkWindowsUpdate
+.\Restore-WindowsDefaults.ps1 -NoGui -CapabilityReport -AllowManagedPolicy -RestoreCategories chkDefender,chkWindowsUpdate
 .\Restore-WindowsDefaults.ps1 -NoGui -RollbackLastRun
 .\Restore-WindowsDefaults.ps1 -NoGui -ResumeRestoreJournal
 
@@ -86,6 +88,8 @@ The same script supports non-GUI workflows for automation and diagnostics:
 `-NoGui` is intended for automation. The Intune and Configuration Manager wrappers under `deploy\` emit JSON compliance results by default; add `-Remediate` to run the critical security and service/task categories in an already elevated management context.
 
 The BaselineReport CLI emits the versioned registry, AppX, fingerprint, service/task, and scheduled-task catalogs with source provenance, supported build and edition ranges, confidence, and warning-only handling for unknown entries. No catalog entry with unknown provenance or unsupported scope is eligible for automatic fixes.
+
+Capability reports and action plans include the management schema, detected ownership evidence, policy source, default decision, and `ManagedPolicyOverride`. Domain/MDM/organization-owned categories are `OrganizationOwned` and remain non-executable by default. `-AllowManagedPolicy` records `OverrideRequested` in the report, plan metadata, and category results; use it only when the operator has authority to replace the organization policy. `dsregcmd` signals are parsed only from recognized structured fields. Unavailable or unrecognized output is retained only as a warning-labeled fallback and never treated as proof of local ownership.
 
 ## What It Restores
 
@@ -189,7 +193,7 @@ After restoration completes, click **Export Report** to save a detailed HTML rep
 - PowerShell 5.1 (included with Windows)
 - Administrator privileges
 
-Before any restore, the tool records the product family, build, edition, architecture, locale, PowerShell runtime, elevation state, and domain/MDM management signals. Unknown or unsupported profiles, and categories owned by organization policy, are skipped without mutation. Use `-CapabilityReport` to export the machine profile and per-category gate decisions for automation.
+Before any restore, the tool records the product family, build, edition, architecture, locale, PowerShell runtime, elevation state, and structured management provenance. Unknown or unsupported profiles, and categories owned by organization policy, are skipped without mutation. Policy findings in health and post-update reports identify source, ownership evidence, confidence, and the actionable skip/override decision. Use `-CapabilityReport` or `-PlanPath` to export the machine profile and per-category gate decisions for automation.
 
 ## FAQ
 

@@ -5,6 +5,7 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 ## [Unreleased]
 
 - Added a versioned, build-aware baseline catalog contract across registry defaults, AppX expectations, debloat fingerprints, service/task evidence, and CLI reporting, with provenance, confidence, and warning-only unknown entries.
+- Added structured managed-policy provenance across health findings, capability reports, action plans, and restore results, including domain/MDM/Group Policy evidence, labeled `dsregcmd` fallbacks, default preservation of organization-owned values, and recorded operator overrides.
 - Constrained external undo imports to schema v2 with bounded input, allowlisted paths and operations, provenance, and distinct verified, untrusted, malformed, and unsupported evidence results.
 - Added fail-closed capability gates with versioned machine profiles, per-category OS/build/architecture/runtime declarations, managed-policy ownership decisions, CLI capability reports, and Intune/SCCM reporting.
 - Added versioned `-WhatIf`/`-PlanPath` action plans with capability decisions, registry/service/task state where statically known, operation hashes, and explicit review boundaries for remaining category-level operations.
