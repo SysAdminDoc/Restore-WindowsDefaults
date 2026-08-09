@@ -61,6 +61,12 @@ $script:RollbackJournalMaxBytes = 50MB
 $script:RollbackInlineFileBytes = 4MB
 $script:ActiveRollbackJournalPath = $null
 $script:ActiveRollbackJournal = $null
+$script:ExternalImportSchemaVersion = 2
+$script:ExternalImportMaxBytes = 2MB
+$script:ExternalImportMaxLines = 5000
+$script:ExternalImportMaxLineBytes = 16KB
+$script:ExternalImportMaxItems = 1000
+$script:ExternalImportMaxDepth = 12
 $script:LogPath = "$env:USERPROFILE\Desktop\WindowsRestore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:ChangesCount = 0
 $script:ErrorsCount = 0
@@ -4405,7 +4411,7 @@ function Get-SystemHealthReport {
     foreach ($tc in $taskChecks) {
         try { $t = Get-ScheduledTask -TaskPath $tc.P -TaskName $tc.N -EA Stop
             if ($t.State -eq 'Disabled') { $details += "Disabled: $($tc.N)" }
-        } catch { Write-Verbose "Could not inspect old rollback journal $($candidate.FullName)" }
+        } catch { Write-Verbose "Could not inspect scheduled task $($tc.P)$($tc.N)" }
     }
     if ($details.Count -gt 0) { $issues += "$($details.Count) maintenance tasks disabled" }
     & $addCat "Tasks" "Scheduled Tasks" $issues $details $(if($details.Count -gt 2){"Medium"}elseif($details.Count){"Low"}else{"OK"}) @("chkTasks")
@@ -4519,164 +4525,270 @@ function Get-QuickScanSummary {
 # MANIFEST IMPORT (reads Debloat-Win11 v1.1.0 JSON undo manifests)
 # ============================================================================
 
-function Import-UndoManifest {
-    param([string]$ManifestPath)
-
-    $result = @{
-        Success = $false
-        AppxPackages = @()
-        Services = @()
-        Tasks = @()
-        RegistryKeys = @()
-        RelevantCategories = @()
-        Summary = ""
-        ManifestData = $null
-        FormatVersion = "1"
+function Get-RestoreImportProvenance {
+    param([string]$SourceType,[string]$SourcePath,[string]$FormatVersion,[long]$SourceBytes,[string]$SourceHash)
+    return [pscustomobject][ordered]@{
+        SourceType=$SourceType; SourcePath=$SourcePath; FormatVersion=$FormatVersion
+        ImportedAtUtc=(Get-Date).ToUniversalTime().ToString("o"); SourceBytes=$SourceBytes; SourceSha256=$SourceHash
+        Trust="UntrustedEvidence"; ExecutableContent=$false; ParserSchemaVersion=$script:ExternalImportSchemaVersion
     }
+}
 
-    if (!(Test-Path $ManifestPath)) {
-        $result.Summary = "File not found: $ManifestPath"
-        return $result
+function Get-RestoreBoundedTextFile {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [int64]$MaxBytes=$script:ExternalImportMaxBytes,
+        [int]$MaxLines=$script:ExternalImportMaxLines,
+        [int]$MaxLineBytes=$script:ExternalImportMaxLineBytes
+    )
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return [pscustomobject]@{Success=$false;Status="Malformed";Reason="File not found";Text=$null;Bytes=0;Hash=$null;LineCount=0}
     }
-
     try {
-        $json = Get-Content -Path $ManifestPath -Raw -EA Stop | ConvertFrom-Json -EA Stop
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($file.Length -gt $MaxBytes) {
+            return [pscustomobject]@{Success=$false;Status="Unsupported";Reason="Input exceeds the $MaxBytes-byte limit";Text=$null;Bytes=$file.Length;Hash=$null;LineCount=0}
+        }
+        $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+        $text = [System.IO.File]::ReadAllText($file.FullName)
+        $lines = @($text -split "`r?`n")
+        if ($lines.Count -gt $MaxLines) {
+            return [pscustomobject]@{Success=$false;Status="Unsupported";Reason="Input exceeds the $MaxLines-line limit";Text=$null;Bytes=$bytes.Length;Hash=(Get-RestoreSha256 -Bytes $bytes);LineCount=$lines.Count}
+        }
+        foreach ($line in $lines) {
+            if ([Text.Encoding]::UTF8.GetByteCount([string]$line) -gt $MaxLineBytes) {
+                return [pscustomobject]@{Success=$false;Status="Unsupported";Reason="A line exceeds the $MaxLineBytes-byte limit";Text=$null;Bytes=$bytes.Length;Hash=(Get-RestoreSha256 -Bytes $bytes);LineCount=$lines.Count}
+            }
+        }
+        return [pscustomobject]@{Success=$true;Status="Verified";Reason=$null;Text=$text;Bytes=$bytes.Length;Hash=(Get-RestoreSha256 -Bytes $bytes);LineCount=$lines.Count}
     } catch {
-        $result.Summary = "Invalid JSON: $($_.Exception.Message)"
+        return [pscustomobject]@{Success=$false;Status="Malformed";Reason="Could not read input: $($_.Exception.Message)";Text=$null;Bytes=0;Hash=$null;LineCount=0}
+    }
+}
+
+function Test-RestoreImportObjectLimit {
+    param(
+        [Parameter(Mandatory=$true)][object]$Value,
+        [int]$MaxDepth=$script:ExternalImportMaxDepth,
+        [int]$MaxItems=$script:ExternalImportMaxItems
+    )
+    $itemCount = 0
+    $deepest = 0
+    $limitReason = $null
+    $stack = New-Object System.Collections.Generic.List[object]
+    $stack.Add([pscustomobject]@{Value=$Value;Depth=0})
+    while ($stack.Count -gt 0 -and -not $limitReason) {
+        $lastIndex = $stack.Count - 1
+        $node = $stack[$lastIndex]
+        $stack.RemoveAt($lastIndex)
+        $current = $node.Value
+        $depth = [int]$node.Depth
+        if ($null -eq $current) { continue }
+        $itemCount++
+        if ($itemCount -gt $MaxItems) { $limitReason = "Input exceeds the $MaxItems-item limit"; break }
+        if ($depth -gt $deepest) { $deepest = $depth }
+        if ($depth -gt $MaxDepth) { $limitReason = "Input exceeds the maximum nesting depth of $MaxDepth"; break }
+        if ($current -is [string] -or $current.GetType().IsPrimitive -or $current -is [datetime] -or $current -is [decimal]) { continue }
+        if ($current -is [System.Collections.IEnumerable] -and $current -isnot [System.Collections.IDictionary]) {
+            foreach ($child in $current) { $stack.Add([pscustomobject]@{Value=$child;Depth=($depth + 1)}) }
+            continue
+        }
+        foreach ($property in @($current.PSObject.Properties)) {
+            $stack.Add([pscustomobject]@{Value=$property.Value;Depth=($depth + 1)})
+        }
+    }
+    return [pscustomobject][ordered]@{Valid=($null -eq $limitReason);Status=if($limitReason){"Unsupported"}else{"Verified"};Reason=$limitReason;ItemCount=$itemCount;MaxDepth=$deepest}
+}
+
+function Get-RestoreImportedManifestVersion {
+    param([Parameter(Mandatory=$true)][object]$Manifest)
+    $property = @($Manifest.PSObject.Properties | Where-Object { $_.Name -in @("version","Version","schemaVersion","SchemaVersion") } | Select-Object -First 1)
+    if ($property.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$property[0].Value)) {
+        return [pscustomobject]@{Valid=$false;Status="Malformed";Reason="Manifest must declare version or schemaVersion";Raw=$null;Major=$null}
+    }
+    $raw = [string]$property[0].Value
+    $match = [regex]::Match($raw, '^\s*(?<major>\d+)')
+    if (-not $match.Success) { return [pscustomobject]@{Valid=$false;Status="Malformed";Reason="Manifest version is not numeric";Raw=$raw;Major=$null} }
+    $major = [int]$match.Groups["major"].Value
+    if ($major -notin @(1,2)) { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Manifest schema major version $major is not supported";Raw=$raw;Major=$major} }
+    return [pscustomobject]@{Valid=$true;Status="Verified";Reason=$null;Raw=$raw;Major=$major}
+}
+
+function Test-RestoreImportedRegistryPath {
+    param([string]$Path)
+    $normalized = ConvertTo-RestoreImportedRegistryPath -Path $Path
+    return $normalized -match '^(?i:HKLM|HKCU|HKCR|HKU):\\[^\x00]*$'
+}
+
+function ConvertTo-RestoreImportedRegistryPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path.Length -gt 512 -or $Path -match '[\r\n*?\[\]]') { return $Path }
+    $normalized = ConvertTo-SnapshotRegistryPath -Path $Path
+    if ($normalized -match '^(?i:(HKLM|HKCU|HKCR|HKU))\\') {
+        $normalized = "$($Matches[1]):$($normalized.Substring(4))"
+    }
+    return $normalized
+}
+
+function Test-RestoreImportedServiceName {
+    param([string]$Name)
+    return -not [string]::IsNullOrWhiteSpace($Name) -and $Name.Length -le 256 -and $Name -notmatch '[\\/:*?"<>|\r\n]'
+}
+
+function Test-RestoreImportedTaskPath {
+    param([string]$Path)
+    return -not [string]::IsNullOrWhiteSpace($Path) -and $Path.Length -le 512 -and $Path.StartsWith("\") -and $Path -notmatch '[*?\[\]\r\n]'
+}
+
+function Test-RestoreManifestEntry {
+    param([Parameter(Mandatory=$true)][string]$Kind,[Parameter(Mandatory=$true)][object]$Entry)
+    $normalized = $null; $reason = $null; $status = "Verified"
+    if ($Entry -is [System.Collections.IEnumerable] -and $Entry -isnot [string]) {
+        return [pscustomobject]@{Valid=$false;Status="Malformed";Reason="Entry must be a scalar or object";Normalized=$null}
+    }
+    switch ($Kind) {
+        "AppX" {
+            $name = if($Entry -is [string]){[string]$Entry}elseif($Entry.PSObject.Properties["Name"]){[string]$Entry.Name}elseif($Entry.PSObject.Properties["PackageName"]){[string]$Entry.PackageName}else{$null}
+            if ([string]::IsNullOrWhiteSpace($name)) { $status="Malformed"; $reason="AppX entry has no package name" }
+            elseif ($name.Length -gt 256 -or $name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { $status="Unsupported"; $reason="AppX package name is outside the allowlist" }
+            else { $normalized=$name }
+        }
+        "Service" {
+            $name = if($Entry -is [string]){[string]$Entry}elseif($Entry.PSObject.Properties["Name"]){[string]$Entry.Name}elseif($Entry.PSObject.Properties["ServiceName"]){[string]$Entry.ServiceName}else{$null}
+            if ([string]::IsNullOrWhiteSpace($name)) { $status="Malformed"; $reason="Service entry has no service name" }
+            elseif (-not (Test-RestoreImportedServiceName -Name $name)) { $status="Unsupported"; $reason="Service name contains unsupported characters" }
+            else { $normalized=$name }
+        }
+        "Task" {
+            $path = if($Entry -is [string]){[string]$Entry}elseif($Entry.PSObject.Properties["Path"]){[string]$Entry.Path}elseif($Entry.PSObject.Properties["TaskPath"]){[string]$Entry.TaskPath}else{$null}
+            $name = if($Entry -is [string]){$null}elseif($Entry.PSObject.Properties["Name"]){[string]$Entry.Name}elseif($Entry.PSObject.Properties["TaskName"]){[string]$Entry.TaskName}else{$null}
+            if ([string]::IsNullOrWhiteSpace($path)) { $status="Malformed"; $reason="Scheduled-task entry has no path" }
+            elseif (-not (Test-RestoreImportedTaskPath -Path $path)) { $status="Unsupported"; $reason="Scheduled-task path is outside the allowlist" }
+            elseif ($name -and ($name.Length -gt 256 -or $name -match '[\\/:*?"<>|\r\n]')) { $status="Unsupported"; $reason="Scheduled-task name contains unsupported characters" }
+            else { $normalized=if($name){[pscustomobject][ordered]@{Path=$path;Name=$name}}else{$path} }
+        }
+        "Registry" {
+            $path = if($Entry -is [string]){[string]$Entry}elseif($Entry.PSObject.Properties["Path"]){[string]$Entry.Path}elseif($Entry.PSObject.Properties["path"]){[string]$Entry.path}else{$null}
+            $name = if($Entry -is [string]){$null}elseif($Entry.PSObject.Properties["Name"]){[string]$Entry.Name}elseif($Entry.PSObject.Properties["ValueName"]){[string]$Entry.ValueName}else{$null}
+            if (-not (Test-RestoreImportedRegistryPath -Path $path)) { $status="Unsupported"; $reason="Registry path is outside the supported hive allowlist" }
+            elseif ($name -and ($name.Length -gt 256 -or $name -match '[\r\n]')) { $status="Unsupported"; $reason="Registry value name is invalid" }
+            else { $normalized=[pscustomobject][ordered]@{Path=(ConvertTo-RestoreImportedRegistryPath $path);Name=$name} }
+        }
+        default { $status="Unsupported"; $reason="Imported operation kind '$Kind' is not allowlisted" }
+    }
+    return [pscustomobject][ordered]@{Valid=($status -eq "Verified");Status=$status;Reason=$reason;Normalized=$normalized}
+}
+
+function Add-RestoreManifestCollection {
+    param([Parameter(Mandatory=$true)][object]$Result,[Parameter(Mandatory=$true)][string]$Kind,[object[]]$Entries)
+    foreach ($entry in @($Entries)) {
+        if (@($Result.ImportedEntries).Count -ge $script:ExternalImportMaxItems) {
+            $Result.UnsupportedEntries += [pscustomobject]@{Status="Unsupported";Reason="Manifest item limit reached";Kind=$Kind;Index=@($Result.ImportedEntries).Count}
+            break
+        }
+        $validation = Test-RestoreManifestEntry -Kind $Kind -Entry $entry
+        $record = [pscustomobject][ordered]@{Status=$validation.Status;Trust="UntrustedEvidence";Kind=$Kind;Index=@($Result.ImportedEntries).Count;Value=$validation.Normalized;Reason=$validation.Reason}
+        $Result.ImportedEntries += $record
+        if ($validation.Valid) {
+            $Result.VerifiedEntries += $record
+            $Result.UntrustedEntries += $record
+            switch ($Kind) {
+                "AppX" { $Result.AppxPackages += $validation.Normalized; $category="chkAppx" }
+                "Service" { $Result.Services += $validation.Normalized; $category=Get-RestoreCategoryForImportedChange -Operation ([pscustomobject]@{Kind="Service";Name=$validation.Normalized}) }
+                "Task" { $Result.Tasks += $validation.Normalized; $category=Get-RestoreCategoryForImportedChange -Operation ([pscustomobject]@{Kind="Task";Name=if($validation.Normalized -is [string]){$validation.Normalized}else{$validation.Normalized.Name}}) }
+                "Registry" { $Result.RegistryKeys += $validation.Normalized; $category=Get-RestoreCategoryForImportedChange -Operation ([pscustomobject]@{Kind="Registry";Path=$validation.Normalized.Path;Name=$validation.Normalized.Name}) }
+            }
+            if ($category -and $category -notin $Result.RelevantCategories) { $Result.RelevantCategories += $category }
+        } elseif ($validation.Status -eq "Malformed") { $Result.MalformedEntries += $record }
+        else { $Result.UnsupportedEntries += $record }
+    }
+}
+
+function Import-UndoManifest {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$ManifestPath)
+    $fullPath = if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) { [System.IO.Path]::GetFullPath($ManifestPath) } else { $ManifestPath }
+    $result = [pscustomobject][ordered]@{
+        Success=$false; Status="Rejected"; SchemaVersion=$script:ExternalImportSchemaVersion; SourcePath=$fullPath; SourceBytes=0; SourceHash=$null
+        Provenance=$null; AppxPackages=@(); Services=@(); Tasks=@(); RegistryKeys=@(); RelevantCategories=@(); Summary=""
+        ManifestData=$null; FormatVersion=$null; ImportedEntries=@(); VerifiedEntries=@(); UnsupportedEntries=@(); MalformedEntries=@(); UntrustedEntries=@()
+    }
+    $read = Get-RestoreBoundedTextFile -Path $ManifestPath
+    $result.SourceBytes = $read.Bytes; $result.SourceHash = $read.Hash
+    $result.Provenance = Get-RestoreImportProvenance -SourceType "Debloat-Win11 undo manifest" -SourcePath $fullPath -FormatVersion $null -SourceBytes $read.Bytes -SourceHash $read.Hash
+    if (-not $read.Success) {
+        $diagnostic = [pscustomobject]@{Status=$read.Status;Reason=$read.Reason}
+        if ($read.Status -eq "Unsupported") { $result.UnsupportedEntries += $diagnostic } else { $result.MalformedEntries += $diagnostic }
+        $result.Summary = "Manifest rejected: $($read.Reason)"
+        return $result
+    }
+    try { $json = $read.Text | ConvertFrom-Json -ErrorAction Stop } catch { $result.Summary="Manifest rejected: invalid JSON"; $result.MalformedEntries += [pscustomobject]@{Status="Malformed";Reason="Invalid JSON: $($_.Exception.Message)"}; return $result }
+    $limits = Test-RestoreImportObjectLimit -Value $json
+    if (-not $limits.Valid) {
+        $result.Summary="Manifest rejected: $($limits.Reason)"
+        $result.UnsupportedEntries += [pscustomobject]@{Status=$limits.Status;Reason=$limits.Reason}
+        return $result
+    }
+    $version = Get-RestoreImportedManifestVersion -Manifest $json
+    $result.FormatVersion = $version.Raw
+    $result.Provenance = Get-RestoreImportProvenance -SourceType "Debloat-Win11 undo manifest" -SourcePath $fullPath -FormatVersion $version.Raw -SourceBytes $read.Bytes -SourceHash $read.Hash
+    if (-not $version.Valid) {
+        $result.Summary="Manifest rejected: $($version.Reason)"
+        if ($version.Status -eq "Unsupported") { $result.UnsupportedEntries += [pscustomobject]@{Status=$version.Status;Reason=$version.Reason} } else { $result.MalformedEntries += [pscustomobject]@{Status=$version.Status;Reason=$version.Reason} }
         return $result
     }
 
-    $result.ManifestData = $json
-    if ($json.PSObject.Properties['version']) { $result.FormatVersion = [string]$json.version }
-    elseif ($json.PSObject.Properties['Version']) { $result.FormatVersion = [string]$json.Version }
-    elseif ($json.PSObject.Properties['schemaVersion']) { $result.FormatVersion = [string]$json.schemaVersion }
-
-    # Extract AppX packages
-    if ($json.PSObject.Properties['AppxPackages'] -or $json.PSObject.Properties['appx_packages'] -or $json.PSObject.Properties['removedApps']) {
-        $appxProp = if ($json.PSObject.Properties['AppxPackages']) { $json.AppxPackages }
-                    elseif ($json.PSObject.Properties['appx_packages']) { $json.appx_packages }
-                    elseif ($json.PSObject.Properties['removedApps']) { $json.removedApps }
-                    else { @() }
-        $result.AppxPackages = @($appxProp)
-        if ($result.AppxPackages.Count -gt 0) { $result.RelevantCategories += "chkAppx" }
+    $collectionMap = [ordered]@{AppX=New-Object System.Collections.Generic.List[object];Service=New-Object System.Collections.Generic.List[object];Task=New-Object System.Collections.Generic.List[object];Registry=New-Object System.Collections.Generic.List[object]}
+    foreach ($property in @($json.PSObject.Properties)) {
+        $propertyName = $property.Name.ToLowerInvariant()
+        $kind = if($propertyName -in @("appxpackages","appx_packages","removedapps","packages")){"AppX"}elseif($propertyName -in @("services","disabledservices")){"Service"}elseif($propertyName -in @("scheduledtasks","scheduled_tasks","disabledtasks","tasks")){"Task"}elseif($propertyName -in @("registrykeys","registry_keys","registrychanges")){"Registry"}else{$null}
+        if ($kind) { foreach ($entry in @($property.Value)) { $collectionMap[$kind].Add($entry) } }
+        elseif ($propertyName -notin @("version","schemaversion","formatversion","categories","undo","changes","actions","operations","restoration","description","name","metadata","createdat","source","tool","generator")) {
+            $result.UnsupportedEntries += [pscustomobject]@{Status="Unsupported";Reason="Manifest property '$($property.Name)' is not in the import vocabulary";Property=$property.Name}
+        }
     }
-
-    # Extract services
-    if ($json.PSObject.Properties['Services'] -or $json.PSObject.Properties['services'] -or $json.PSObject.Properties['disabledServices']) {
-        $svcProp = if ($json.PSObject.Properties['Services']) { $json.Services }
-                   elseif ($json.PSObject.Properties['services']) { $json.services }
-                   elseif ($json.PSObject.Properties['disabledServices']) { $json.disabledServices }
-                   else { @() }
-        $result.Services = @($svcProp)
-        if ($result.Services.Count -gt 0) { $result.RelevantCategories += "chkServices" }
-    }
-
-    # Extract tasks
-    if ($json.PSObject.Properties['ScheduledTasks'] -or $json.PSObject.Properties['scheduled_tasks'] -or $json.PSObject.Properties['disabledTasks']) {
-        $taskProp = if ($json.PSObject.Properties['ScheduledTasks']) { $json.ScheduledTasks }
-                    elseif ($json.PSObject.Properties['scheduled_tasks']) { $json.scheduled_tasks }
-                    elseif ($json.PSObject.Properties['disabledTasks']) { $json.disabledTasks }
-                    else { @() }
-        $result.Tasks = @($taskProp)
-        if ($result.Tasks.Count -gt 0) { $result.RelevantCategories += "chkTasks" }
-    }
-
-    # Extract registry keys
-    if ($json.PSObject.Properties['RegistryKeys'] -or $json.PSObject.Properties['registry_keys'] -or $json.PSObject.Properties['registryChanges']) {
-        $regProp = if ($json.PSObject.Properties['RegistryKeys']) { $json.RegistryKeys }
-                   elseif ($json.PSObject.Properties['registry_keys']) { $json.registry_keys }
-                   elseif ($json.PSObject.Properties['registryChanges']) { $json.registryChanges }
-                   else { @() }
-        $result.RegistryKeys = @($regProp)
-    }
-
-    # Newer manifest formats wrap the same collections in undo/changes/actions
-    # objects. Read those containers without executing any imported operation.
-    foreach ($containerName in @("undo","Undo","changes","Changes","actions","Actions","operations","Operations","restoration","Restoration")) {
-        if (-not $json.PSObject.Properties[$containerName]) { continue }
-        foreach ($item in @($json.$containerName)) {
+    foreach ($containerName in @("undo","changes","actions","operations","restoration")) {
+        $containerProperty = $json.PSObject.Properties | Where-Object { $_.Name.ToLowerInvariant() -eq $containerName } | Select-Object -First 1
+        if (-not $containerProperty) { continue }
+        foreach ($item in @($containerProperty.Value)) {
+            if ($item -is [string] -or $item -is [ValueType]) { $result.UnsupportedEntries += [pscustomobject]@{Status="Unsupported";Reason="Container item is not an object";Property=$containerName}; continue }
             foreach ($property in @($item.PSObject.Properties)) {
                 $propertyName = $property.Name.ToLowerInvariant()
-                $propertyValue = @($property.Value)
-                if ($propertyName -match "appx|appxpackages|removedapps|packages") {
-                    $result.AppxPackages = @($result.AppxPackages) + $propertyValue
-                    if ($propertyValue.Count) { $result.RelevantCategories += "chkAppx" }
-                } elseif ($propertyName -match "service") {
-                    $result.Services = @($result.Services) + $propertyValue
-                    if ($propertyValue.Count) { $result.RelevantCategories += "chkServices" }
-                } elseif ($propertyName -match "task|scheduled") {
-                    $result.Tasks = @($result.Tasks) + $propertyValue
-                    if ($propertyValue.Count) { $result.RelevantCategories += "chkTasks" }
-                } elseif ($propertyName -match "registry|reg") {
-                    $result.RegistryKeys = @($result.RegistryKeys) + $propertyValue
-                }
+                $kind = if($propertyName -match "appx|removedapps|packages"){"AppX"}elseif($propertyName -match "service"){"Service"}elseif($propertyName -match "task|scheduled"){"Task"}elseif($propertyName -match "registry|reg"){"Registry"}else{$null}
+                if ($kind) { foreach ($entry in @($property.Value)) { $collectionMap[$kind].Add($entry) } }
+                elseif ($propertyName -notin @("category","categories","description","name")) { $result.UnsupportedEntries += [pscustomobject]@{Status="Unsupported";Reason="Property '$($property.Name)' is not in the import vocabulary";Property=$property.Name} }
             }
         }
     }
+    Add-RestoreManifestCollection -Result $result -Kind "AppX" -Entries @($collectionMap.AppX.ToArray())
+    Add-RestoreManifestCollection -Result $result -Kind "Service" -Entries @($collectionMap.Service.ToArray())
+    Add-RestoreManifestCollection -Result $result -Kind "Task" -Entries @($collectionMap.Task.ToArray())
+    Add-RestoreManifestCollection -Result $result -Kind "Registry" -Entries @($collectionMap.Registry.ToArray())
 
-    # Map registry changes to relevant categories
-    $regCatMap = @{
-        "Windows Defender" = "chkDefender"
-        "Firewall" = "chkFirewall"
-        "SmartScreen" = "chkSmartScreen"
-        "WindowsUpdate" = "chkWindowsUpdate"
-        "DataCollection" = "chkPrivacy"
-        "AppPrivacy" = "chkPrivacy"
-        "OneDrive" = "chkOneDrive"
-        "Edge" = "chkEdge"
-        "Chrome" = "chkChrome"
-        "CloudContent" = "chkCDM"
+    $catKeyMap = @{"defender"="chkDefender";"firewall"="chkFirewall";"smartscreen"="chkSmartScreen";"update"="chkWindowsUpdate";"privacy"="chkPrivacy";"telemetry"="chkPrivacy";"edge"="chkEdge";"chrome"="chkChrome";"onedrive"="chkOneDrive";"cortana"="chkCopilot";"copilot"="chkCopilot";"network"="chkNetwork";"hosts"="chkHostsFile";"gaming"="chkGaming";"xbox"="chkGaming"}
+    $categoryProperty = @($json.PSObject.Properties | Where-Object { $_.Name -ieq "categories" } | Select-Object -First 1)
+    $categoryValues = if($categoryProperty.Count -eq 1){@($categoryProperty[0].Value)}else{@()}
+    foreach ($category in $categoryValues) {
+        $categoryText = if($category -is [string]){[string]$category}elseif($category.PSObject.Properties["name"]){[string]$category.name}else{$null}
+        $mapped = @($catKeyMap.Keys | Where-Object { $categoryText -and $categoryText -match $_ } | Select-Object -First 1)
+        if ($mapped.Count -eq 1) { $key=$catKeyMap[$mapped[0]]; if($key -notin $result.RelevantCategories){$result.RelevantCategories += $key} }
+        elseif ($categoryText) { $result.UnsupportedEntries += [pscustomobject]@{Status="Unsupported";Reason="Category '$categoryText' is not in the supported vocabulary"} }
+        else { $result.MalformedEntries += [pscustomobject]@{Status="Malformed";Reason="Category entry has no name"} }
     }
-    foreach ($rk in $result.RegistryKeys) {
-        $path = if ($rk.PSObject.Properties['Path']) { $rk.Path }
-                elseif ($rk.PSObject.Properties['path']) { $rk.path }
-                elseif ($rk -is [string]) { $rk }
-                else { "" }
-        foreach ($pattern in $regCatMap.Keys) {
-            if ($path -match [regex]::Escape($pattern)) {
-                if ($regCatMap[$pattern] -notin $result.RelevantCategories) {
-                    $result.RelevantCategories += $regCatMap[$pattern]
-                }
-            }
-        }
-    }
-
-    # Also check for specific categories mentioned in the manifest
-    if ($json.PSObject.Properties['categories'] -or $json.PSObject.Properties['Categories']) {
-        $cats = if ($json.PSObject.Properties['categories']) { $json.categories } else { $json.Categories }
-        foreach ($c in $cats) {
-            $catName = if ($c -is [string]) { $c } elseif ($c.PSObject.Properties['name']) { $c.name } else { "" }
-            # Map category names to our checkbox keys
-            $catKeyMap = @{
-                "defender"="chkDefender"; "firewall"="chkFirewall"; "smartscreen"="chkSmartScreen"
-                "update"="chkWindowsUpdate"; "privacy"="chkPrivacy"; "telemetry"="chkPrivacy"
-                "edge"="chkEdge"; "chrome"="chkChrome"; "onedrive"="chkOneDrive"
-                "cortana"="chkCopilot"; "copilot"="chkCopilot"; "network"="chkNetwork"
-                "hosts"="chkHostsFile"; "gaming"="chkGaming"; "xbox"="chkGaming"
-            }
-            foreach ($mk in $catKeyMap.Keys) {
-                if ($catName -match $mk -and $catKeyMap[$mk] -notin $result.RelevantCategories) {
-                    $result.RelevantCategories += $catKeyMap[$mk]
-                }
-            }
-        }
-    }
-
     $result.RelevantCategories = @($result.RelevantCategories | Select-Object -Unique)
-    $parts = @()
-    if ($result.AppxPackages.Count) { $parts += "$($result.AppxPackages.Count) AppX" }
-    if ($result.Services.Count) { $parts += "$($result.Services.Count) services" }
-    if ($result.Tasks.Count) { $parts += "$($result.Tasks.Count) tasks" }
-    if ($result.RegistryKeys.Count) { $parts += "$($result.RegistryKeys.Count) registry keys" }
-    $result.Summary = "Manifest loaded: $($parts -join ', ') to restore"
-    $result.Success = $true
-
+    $validCount = @($result.VerifiedEntries).Count
+    $diagnosticCount = @($result.UnsupportedEntries).Count + @($result.MalformedEntries).Count
+    $parts=@(); if($result.AppxPackages.Count){$parts += "$($result.AppxPackages.Count) AppX"};if($result.Services.Count){$parts += "$($result.Services.Count) services"};if($result.Tasks.Count){$parts += "$($result.Tasks.Count) tasks"};if($result.RegistryKeys.Count){$parts += "$($result.RegistryKeys.Count) registry entries"}
+    $result.Success = $validCount -gt 0
+    $result.Status = if($validCount -eq 0){"Rejected"}elseif($diagnosticCount -gt 0){"ImportedWithWarnings"}else{"Imported"}
+    $warningSuffix = if($diagnosticCount){"; $diagnosticCount unsupported or malformed item(s)"}else{""}
+    $result.Summary = if($result.Success){"Manifest imported as untrusted evidence: $($parts -join ', ')$warningSuffix"}else{"Manifest contained no supported entries"}
     return $result
 }
 
 function Get-RestoreCategoryForImportedChange {
     param([object]$Operation)
-    $text = "$($Operation.Kind) $($Operation.Path) $($Operation.Name) $($Operation.Raw)"
+    $text = "$($Operation.Kind) $($Operation.Path) $($Operation.Name)"
     if ($Operation.Kind -eq "Task") { return "chkTasks" }
     if ($Operation.Kind -eq "Service") {
         if ($text -match '(?i)wuauserv|usosvc|bits|dosvc') { return "chkWindowsUpdate" }
@@ -4700,105 +4812,223 @@ function Get-RestoreCategoryForImportedChange {
     return "chkMisc"
 }
 
+function Test-RestoreExternalChangeOperation {
+    param([Parameter(Mandatory=$true)][object]$Operation)
+    $allowedKinds = @("Registry","Service","Task","AppX")
+    if ($Operation.Kind -notin $allowedKinds) { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Operation kind is not allowlisted"} }
+    if ([string]$Operation.Action -notin @("add","delete","config","enable","disable","change","remove","unknown")) { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Operation action is not allowlisted"} }
+    switch ($Operation.Kind) {
+        "Registry" {
+            if (-not (Test-RestoreImportedRegistryPath -Path $Operation.Path)) { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Registry path is outside the supported hive allowlist"} }
+            if ($Operation.Name -and ([string]$Operation.Name).Length -gt 256) { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Registry value name is too long"} }
+        }
+        "Service" {
+            if (-not (Test-RestoreImportedServiceName -Name $Operation.Name)) { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Service name is invalid"} }
+        }
+        "Task" {
+            $taskPath = [string]$Operation.Path; $taskName = [string]$Operation.Name
+            if (-not $taskPath -and $taskName.StartsWith("\")) { $taskPath=$taskName; $taskName=$null }
+            if (-not (Test-RestoreImportedTaskPath -Path $taskPath)) { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Scheduled-task path is invalid"} }
+            if ($taskName -and $taskName -match '[\\/:*?"<>|\r\n]') { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="Scheduled-task name contains unsupported characters"} }
+        }
+        "AppX" {
+            if ([string]::IsNullOrWhiteSpace([string]$Operation.Name) -or [string]$Operation.Name.Length -gt 256) { return [pscustomobject]@{Valid=$false;Status="Malformed";Reason="AppX package identity is missing or too long"} }
+            if ([string]$Operation.Name -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { return [pscustomobject]@{Valid=$false;Status="Unsupported";Reason="AppX package identity is outside the allowlist"} }
+        }
+    }
+    return [pscustomobject]@{Valid=$true;Status="Verified";Reason=$null}
+}
+
 function ConvertTo-ExternalChangeImportResult {
-    param([string]$Source,[object[]]$Operations)
-    $categories = @($Operations | ForEach-Object {
+    param(
+        [string]$Source,[object[]]$Operations,[object[]]$UnsupportedEntries=@(),[object[]]$MalformedEntries=@(),
+        [string]$SourcePath,[long]$SourceBytes,[string]$SourceHash,[string]$FormatVersion="text"
+    )
+    $verified = @($Operations | Where-Object { $_.Status -eq "Verified" })
+    $categories = @($verified | ForEach-Object {
         Get-RestoreCategoryForImportedChange -Operation $_
-        $operationText = "$($_.Path) $($_.Name) $($_.Raw)"
+        $operationText = "$($_.Path) $($_.Name)"
         if ($_.Kind -eq "Task" -and $operationText -match '(?i)windows.?update|updateorchestrator|wuauserv') { "chkWindowsUpdate" }
     } | Select-Object -Unique)
     $result = [pscustomobject][ordered]@{
-        Success=($Operations.Count -gt 0); Source=$Source; Operations=@($Operations)
-        RelevantCategories=@($categories); Summary=""
+        Success=($verified.Count -gt 0); Status=if($verified.Count -eq 0){"Rejected"}elseif(@($UnsupportedEntries).Count -gt 0 -or @($MalformedEntries).Count -gt 0){"ImportedWithWarnings"}else{"Imported"}
+        SchemaVersion=$script:ExternalImportSchemaVersion; Source=$Source; SourcePath=$SourcePath; SourceBytes=$SourceBytes; SourceHash=$SourceHash; FormatVersion=$FormatVersion
+        Provenance=(Get-RestoreImportProvenance -SourceType $Source -SourcePath $SourcePath -FormatVersion $FormatVersion -SourceBytes $SourceBytes -SourceHash $SourceHash)
+        Operations=$verified; VerifiedEntries=$verified; UntrustedEntries=$verified
+        UnsupportedEntries=@($UnsupportedEntries); MalformedEntries=@($MalformedEntries); RelevantCategories=@($categories); Summary=""
     }
-    if ($Operations.Count -gt 0) {
-        $result.Summary = "$Source loaded: $($Operations.Count) change(s) mapped to $($categories.Count) restoration categor$(if($categories.Count -eq 1){'y'}else{'ies'})"
-    } else { $result.Summary = "$Source contained no recognizable restoration changes" }
+    if ($verified.Count -gt 0) {
+        $suffix = if(@($UnsupportedEntries).Count -or @($MalformedEntries).Count){"; $(@($UnsupportedEntries).Count + @($MalformedEntries).Count) unsupported or malformed line(s)"}else{""}
+        $result.Summary = "$Source imported as untrusted evidence: $($verified.Count) change(s) mapped to $($categories.Count) restoration categor$(if($categories.Count -eq 1){'y'}else{'ies'})$suffix"
+    } else { $result.Summary = "$Source contained no verified restoration changes" }
     return $result
 }
 
 function ConvertTo-ExternalChangeOperation {
-    param([string[]]$Lines)
-    $operations = @()
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param([string[]]$Lines,[switch]$Detailed)
+    $operations = New-Object System.Collections.Generic.List[object]
+    $unsupported = New-Object System.Collections.Generic.List[object]
+    $malformed = New-Object System.Collections.Generic.List[object]
+    $lineNumber=0
     foreach ($line in @($Lines)) {
-        $raw = [string]$line
-        $trimmed = $raw.Trim()
+        $lineNumber++
+        if ($lineNumber -gt $script:ExternalImportMaxLines) { $unsupported.Add([pscustomobject]@{Status="Unsupported";SourceLine=$lineNumber;Reason="Input exceeds the line limit"}); break }
+        $raw = [string]$line; $trimmed=$raw.Trim()
+        if ([Text.Encoding]::UTF8.GetByteCount($raw) -gt $script:ExternalImportMaxLineBytes) { $unsupported.Add([pscustomobject]@{Status="Unsupported";SourceLine=$lineNumber;Reason="Line exceeds the byte limit"}); continue }
         if (-not $trimmed -or $trimmed.StartsWith("#") -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("//")) { continue }
-        $operation = $null
+        $operation=$null
         if ($trimmed -match '(?i)^\s*reg(?:\.exe)?\s+(?<action>add|delete)\s+(?<path>"[^"]+"|\S+)(?:\s+/v\s+(?<name>"[^"]+"|\S+))?(?:\s+/d\s+(?<data>"[^"]+"|\S+))?') {
-            $operation = [pscustomobject]@{
-                Kind="Registry"; Action=$Matches.action; Path=(ConvertTo-SnapshotRegistryPath $Matches.path.Trim('"'))
-                Name=$Matches.name.Trim('"'); Value=$Matches.data.Trim('"'); Raw=$raw
-            }
+            $operation=[pscustomobject]@{Kind="Registry";Action=$Matches.action.ToLowerInvariant();Path=(ConvertTo-RestoreImportedRegistryPath $Matches.path.Trim('"'));Name=if($Matches.name){$Matches.name.Trim('"')}else{$null};Value=if($Matches.data){$Matches.data.Trim('"')}else{$null}}
         } elseif ($trimmed -match '(?i)(Set-ItemProperty|Remove-ItemProperty)') {
-            $pathMatch = [regex]::Match($trimmed, '(?i)-(?:LiteralPath|Path)\s+(?:"([^"]+)"|''([^'']+)''|(\S+))')
-            $nameMatch = [regex]::Match($trimmed, '(?i)-Name\s+(?:"([^"]+)"|''([^'']+)''|(\S+))')
-            if ($pathMatch.Success) {
-                $pathValue = if ($pathMatch.Groups[1].Success) {$pathMatch.Groups[1].Value} elseif ($pathMatch.Groups[2].Success) {$pathMatch.Groups[2].Value} else {$pathMatch.Groups[3].Value}
-                $nameValue = if ($nameMatch.Groups[1].Success) {$nameMatch.Groups[1].Value} elseif ($nameMatch.Groups[2].Success) {$nameMatch.Groups[2].Value} else {$nameMatch.Groups[3].Value}
-                $operation = [pscustomobject]@{Kind="Registry";Action=if($trimmed -match '(?i)Remove-ItemProperty'){"delete"}else{"add"};Path=$pathValue;Name=$nameValue;Value="";Raw=$raw}
-            }
-        } elseif ($trimmed -match '(?i)\bsc(?:\.exe)?\s+config\s+(?<name>\S+).*?start\s*=\s*(?<value>\S+)') {
-            $operation = [pscustomobject]@{Kind="Service";Action="config";Path="";Name=$Matches.name;Value=$Matches.value;Raw=$raw}
-        } elseif ($trimmed -match '(?i)Set-Service\s+.*?-Name\s+(?:"(?<name>[^"]+)"|(?<name2>\S+)).*?-StartupType\s+(?<value>\S+)') {
-            $serviceName = if ($Matches.name) {$Matches.name} else {$Matches.name2}
-            $operation = [pscustomobject]@{Kind="Service";Action="config";Path="";Name=$serviceName;Value=$Matches.value;Raw=$raw}
-        } elseif ($trimmed -match '(?i)(?:schtasks(?:\.exe)?\s+/change.*?/tn\s+"?(?<name>[^"/]+)"?|(?:Enable|Disable)-ScheduledTask)') {
-            $taskName = if ($Matches.name) {$Matches.name.Trim()} else { $trimmed }
-            $operation = [pscustomobject]@{Kind="Task";Action=if($trimmed -match '(?i)disable'){"disable"}else{"enable"};Path="";Name=$taskName;Value="";Raw=$raw}
-        } elseif ($trimmed -match '(?i)(Add|Remove)-AppxPackage') {
-            $operation = [pscustomobject]@{Kind="AppX";Action=$Matches[1].ToLowerInvariant();Path="";Name=$trimmed;Value="";Raw=$raw}
-        } elseif ($trimmed -match '(?i)(HKLM:|HKCU:|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)') {
-            $operation = [pscustomobject]@{Kind="Registry";Action="unknown";Path=$trimmed;Name="";Value="";Raw=$raw}
-        } elseif ($trimmed -match '(?i)^(Registry|Service|Task|AppX)\s*[:\-]\s*(.+)$') {
-            $operation = [pscustomobject]@{Kind=$Matches[1];Action="unknown";Path="";Name=$Matches[2];Value="";Raw=$raw}
+            $pathMatch=[regex]::Match($trimmed,'(?i)-(?:LiteralPath|Path)\s+(?:"([^"]+)"|''([^'']+)''|(\S+))');$nameMatch=[regex]::Match($trimmed,'(?i)-Name\s+(?:"([^"]+)"|''([^'']+)''|(\S+))')
+            if ($pathMatch.Success) {$pathValue=if($pathMatch.Groups[1].Success){$pathMatch.Groups[1].Value}elseif($pathMatch.Groups[2].Success){$pathMatch.Groups[2].Value}else{$pathMatch.Groups[3].Value};$nameValue=if($nameMatch.Groups[1].Success){$nameMatch.Groups[1].Value}elseif($nameMatch.Groups[2].Success){$nameMatch.Groups[2].Value}else{$nameMatch.Groups[3].Value};$operation=[pscustomobject]@{Kind="Registry";Action=if($trimmed -match '(?i)Remove-ItemProperty'){"delete"}else{"add"};Path=$pathValue;Name=$nameValue;Value=$null}}
+        } elseif ($trimmed -match '(?i)\bsc(?:\.exe)?\s+config\s+(?<name>\S+).*?start\s*=\s*(?<value>\S+)') {$operation=[pscustomobject]@{Kind="Service";Action="config";Path="";Name=$Matches.name;Value=$Matches.value}}
+        elseif ($trimmed -match '(?i)Set-Service\s+.*?-Name\s+(?:"(?<name>[^"]+)"|(?<name2>\S+)).*?-StartupType\s+(?<value>\S+)') {$serviceName=if($Matches.name){$Matches.name}else{$Matches.name2};$operation=[pscustomobject]@{Kind="Service";Action="config";Path="";Name=$serviceName;Value=$Matches.value}}
+        elseif ($trimmed -match '(?i)(?:schtasks(?:\.exe)?\s+/change.*?/tn\s+"?(?<name>[^"/]+)"?|(?:Enable|Disable)-ScheduledTask)') {$taskName=if($Matches.name){$Matches.name.Trim()}else{$null};$operation=[pscustomobject]@{Kind="Task";Action=if($trimmed -match '(?i)disable'){"disable"}else{"enable"};Path="";Name=$taskName;Value=$null}}
+        elseif ($trimmed -match '(?i)(Add|Remove)-AppxPackage') {$appxMatch=[regex]::Match($trimmed,'(?i)-(?:Name|Package)\s+(?:"([^"]+)"|(\S+))');$appxName=if($appxMatch.Success){if($appxMatch.Groups[1].Success){$appxMatch.Groups[1].Value}else{$appxMatch.Groups[2].Value}}else{$null};$operation=[pscustomobject]@{Kind="AppX";Action=$Matches[1].ToLowerInvariant();Path="";Name=$appxName;Value=$null}}
+        elseif ($trimmed -match '(?i)(HKLM:|HKCU:|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER)' -and $trimmed -notmatch '(?i)^(Registry|Service|Task|AppX)\s*[:\-]') {$operation=[pscustomobject]@{Kind="Registry";Action="unknown";Path=$trimmed;Name="";Value=$null}}
+        elseif ($trimmed -match '(?i)^(Registry|Service|Task|AppX)\s*[:\-]\s*(.+)$') {
+            $generic=$Matches[2].Trim();$kind=$Matches[1]
+            if($kind -eq "Registry"){$genericParts=@($generic -split '\s+',2);$operation=[pscustomobject]@{Kind="Registry";Action="unknown";Path=(ConvertTo-RestoreImportedRegistryPath $genericParts[0]);Name=if($genericParts.Count -gt 1){$genericParts[1]}else{$null};Value=$null}}
+            elseif($kind -eq "Service"){$operation=[pscustomobject]@{Kind="Service";Action="unknown";Path="";Name=($generic -split '\s+')[0];Value=$null}}
+            elseif($kind -eq "Task"){$operation=[pscustomobject]@{Kind="Task";Action="unknown";Path=$generic;Name=$null;Value=$null}}
+            else{$operation=[pscustomobject]@{Kind="AppX";Action="unknown";Path="";Name=($generic -split '\s+')[0];Value=$null}}
         }
-        if ($operation) { $operations += $operation }
+        if ($operation) {
+            $validation=Test-RestoreExternalChangeOperation -Operation $operation
+            $operation | Add-Member -NotePropertyName SourceLine -NotePropertyValue $lineNumber
+            $operation | Add-Member -NotePropertyName RawHash -NotePropertyValue (Get-RestoreSha256 -Bytes ([Text.Encoding]::UTF8.GetBytes($raw)))
+            $operation | Add-Member -NotePropertyName Trust -NotePropertyValue "UntrustedEvidence"
+            $operation | Add-Member -NotePropertyName ExecutableContent -NotePropertyValue $false
+            $operation | Add-Member -NotePropertyName Status -NotePropertyValue $validation.Status
+            $operation | Add-Member -NotePropertyName Reason -NotePropertyValue $validation.Reason
+            if ($validation.Valid) {$operations.Add($operation)}elseif($validation.Status -eq "Malformed"){$malformed.Add($operation)}else{$unsupported.Add($operation)}
+        } else { $unsupported.Add([pscustomobject]@{Status="Unsupported";SourceLine=$lineNumber;RawHash=(Get-RestoreSha256 -Bytes ([Text.Encoding]::UTF8.GetBytes($raw)));Reason="Line did not match the allowlisted evidence grammar"}) }
     }
-    return @($operations)
+    $document=[pscustomobject][ordered]@{Operations=@($operations.ToArray());UnsupportedEntries=@($unsupported.ToArray());MalformedEntries=@($malformed.ToArray());LineCount=$lineNumber;SchemaVersion=$script:ExternalImportSchemaVersion;ExecutableContent=$false}
+    if ($Detailed) { return $document }
+    return @($document.Operations)
 }
 
 function Import-PrivacySexyCompensationLog {
+    [CmdletBinding()]
     param([Parameter(Mandatory=$true)][string]$LogPath)
-    if (-not (Test-Path -LiteralPath $LogPath)) { return (ConvertTo-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations @()) }
-    $lines = Get-Content -LiteralPath $LogPath -ErrorAction Stop
-    $operations = ConvertTo-ExternalChangeOperation -Lines $lines
-    return (ConvertTo-ExternalChangeImportResult -Source "privacy.sexy compensation log" -Operations $operations)
+    $read=Get-RestoreBoundedTextFile -Path $LogPath
+    if (-not $read.Success) { return (ConvertTo-ExternalChangeImportResult -Source "privacy.sexy compensation log" -SourcePath $LogPath -SourceBytes $read.Bytes -SourceHash $read.Hash -UnsupportedEntries @([pscustomobject]@{Status=$read.Status;Reason=$read.Reason})) }
+    $parsed=ConvertTo-ExternalChangeOperation -Lines @($read.Text -split "`r?`n") -Detailed
+    return (ConvertTo-ExternalChangeImportResult -Source "privacy.sexy compensation log" -SourcePath $LogPath -SourceBytes $read.Bytes -SourceHash $read.Hash -Operations $parsed.Operations -UnsupportedEntries $parsed.UnsupportedEntries -MalformedEntries $parsed.MalformedEntries)
 }
 
 function Import-ChrisTitusWinUtilDiff {
+    [CmdletBinding()]
     param([Parameter(Mandatory=$true)][string]$DiffPath)
-    if (-not (Test-Path -LiteralPath $DiffPath)) { return (ConvertTo-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations @()) }
-    $lines = Get-Content -LiteralPath $DiffPath -ErrorAction Stop
-    $operations = ConvertTo-ExternalChangeOperation -Lines $lines
-    return (ConvertTo-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -Operations $operations)
+    $read=Get-RestoreBoundedTextFile -Path $DiffPath
+    if (-not $read.Success) { return (ConvertTo-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -SourcePath $DiffPath -SourceBytes $read.Bytes -SourceHash $read.Hash -UnsupportedEntries @([pscustomobject]@{Status=$read.Status;Reason=$read.Reason})) }
+    $parsed=ConvertTo-ExternalChangeOperation -Lines @($read.Text -split "`r?`n") -Detailed
+    return (ConvertTo-ExternalChangeImportResult -Source "Chris Titus WinUtil diff" -SourcePath $DiffPath -SourceBytes $read.Bytes -SourceHash $read.Hash -Operations $parsed.Operations -UnsupportedEntries $parsed.UnsupportedEntries -MalformedEntries $parsed.MalformedEntries)
 }
 
 function Import-RegExportSnapshot {
+    [CmdletBinding()]
     param([Parameter(Mandatory=$true)][string]$RegPath)
     if (-not (Test-Path -LiteralPath $RegPath)) { throw "Registry export not found: $RegPath" }
-    $entries = @(); $currentPath = $null
-    foreach ($line in @(Get-Content -LiteralPath $RegPath -ErrorAction Stop)) {
-        $trimmed = ([string]$line).Trim()
+    $fullPath = [System.IO.Path]::GetFullPath($RegPath)
+    $read = Get-RestoreBoundedTextFile -Path $fullPath
+    $entries = New-Object System.Collections.Generic.List[object]
+    $unsupported = New-Object System.Collections.Generic.List[object]
+    $malformed = New-Object System.Collections.Generic.List[object]
+    $currentPath = $null
+    $result = [pscustomobject][ordered]@{
+        SchemaVersion=$script:RegistrySnapshotSchemaVersion; ImportSchemaVersion=$script:ExternalImportSchemaVersion
+        CreatedAt=(Get-Date).ToUniversalTime().ToString("o"); ComputerName=$env:COMPUTERNAME
+        SourcePath=$fullPath; SourceBytes=$read.Bytes; SourceSha256=$read.Hash; FormatVersion="reg-v5"
+        Provenance=(Get-RestoreImportProvenance -SourceType ".reg export" -SourcePath $fullPath -FormatVersion "reg-v5" -SourceBytes $read.Bytes -SourceHash $read.Hash)
+        Success=$false; Status="Rejected"; Entries=@(); VerifiedEntries=@(); UntrustedEntries=@()
+        UnsupportedEntries=@(); MalformedEntries=@(); Summary=""
+    }
+    if (-not $read.Success) {
+        $diagnostic = [pscustomobject]@{Status=$read.Status;SourceLine=0;RawHash=$null;Reason=$read.Reason}
+        if ($read.Status -eq "Malformed") { $malformed.Add($diagnostic) } else { $unsupported.Add($diagnostic) }
+        $result.UnsupportedEntries = @($unsupported.ToArray()); $result.MalformedEntries = @($malformed.ToArray())
+        $result.Summary = "Registry export rejected: $($read.Reason)"
+        return $result
+    }
+    $lineNumber = 0
+    foreach ($line in @([regex]::Split($read.Text, "\r?\n"))) {
+        $lineNumber++
+        $raw = [string]$line
+        $trimmed = $raw.Trim()
+        if (-not $trimmed -or $trimmed.StartsWith("Windows Registry Editor") -or $trimmed.StartsWith(";")) { continue }
+        $rawHash = Get-RestoreSha256 -Bytes ([System.Text.Encoding]::UTF8.GetBytes($raw))
         if ($trimmed -match '^\[(.+)\]$') {
-            $currentPath = ConvertTo-SnapshotRegistryPath $Matches[1]
+            $candidatePath = ConvertTo-SnapshotRegistryPath -Path $Matches[1]
+            if (-not (Test-RestoreImportedRegistryPath -Path $candidatePath)) {
+                $unsupported.Add([pscustomobject]@{Status="Unsupported";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry section is outside the supported hive allowlist"})
+                $currentPath = $null
+            } else { $currentPath = $candidatePath }
             continue
         }
-        if (-not $currentPath -or -not $trimmed -or $trimmed.StartsWith("Windows Registry Editor") -or $trimmed.StartsWith(";") -or $trimmed.StartsWith("-")) { continue }
-        if ($trimmed -notmatch '^(?:"([^"]*)"|@)=(.*)$') { continue }
+        if ($trimmed.StartsWith("-")) {
+            $unsupported.Add([pscustomobject]@{Status="Unsupported";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry key deletion entries are evidence-only and are not imported"})
+            continue
+        }
+        if (-not $currentPath) {
+            $malformed.Add([pscustomobject]@{Status="Malformed";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry value appears before a valid section"})
+            continue
+        }
+        if ($trimmed -notmatch '^(?:"([^"]*)"|@)=(.*)$') {
+            $malformed.Add([pscustomobject]@{Status="Malformed";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry value does not match the supported .reg grammar"})
+            continue
+        }
         $name = if ($null -ne $Matches[1]) { $Matches[1] } else { "(Default)" }
+        if ($name.Length -gt 256 -or $name -match '[\r\n]') {
+            $unsupported.Add([pscustomobject]@{Status="Unsupported";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry value name is invalid"})
+            continue
+        }
+        if ($entries.Count -ge $script:ExternalImportMaxItems) {
+            $unsupported.Add([pscustomobject]@{Status="Unsupported";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry export item limit reached"})
+            break
+        }
         $encoded = $Matches[2]
-        $type = "String"; $value = $encoded
-        if ($encoded -match '(?i)^dword:([0-9a-f]{1,8})$') { $type="DWord"; $value=[Convert]::ToInt32($Matches[1],16) }
-        elseif ($encoded -match '(?i)^qword:([0-9a-f]{1,16})$') { $type="QWord"; $value=[Convert]::ToInt64($Matches[1],16) }
-        elseif ($encoded -match '(?i)^hex(?:\(\d+\))?:') { $type="Binary"; $value=$encoded }
-        elseif ($encoded -match '^"(.*)"$') { $value=$Matches[1] -replace '\\\"','"' -replace '\\\\','\' }
-        $entries += [pscustomobject]@{Path=$currentPath;Name=$name;Type=$type;Value=$value}
+        $type = "String"
+        $value = $encoded
+        if ($encoded -match '(?i)^dword:([0-9a-f]{1,8})$') {
+            $type = "DWord"; $value = [Convert]::ToInt32($Matches[1],16)
+        } elseif ($encoded -match '(?i)^qword:([0-9a-f]{1,16})$') {
+            $type = "QWord"; $value = [Convert]::ToInt64($Matches[1],16)
+        } elseif ($encoded -match '(?i)^dword:|^qword:') {
+            $malformed.Add([pscustomobject]@{Status="Malformed";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry integer value is not valid hexadecimal"})
+            continue
+        } elseif ($encoded -match '(?i)^hex(?:\(\d+\))?:') {
+            if ($encoded -notmatch '(?i)^hex(?:\(\d+\))?:[0-9a-f,\s\\]*$') {
+                $malformed.Add([pscustomobject]@{Status="Malformed";SourceLine=$lineNumber;RawHash=$rawHash;Reason="Registry binary value is not valid hexadecimal"})
+                continue
+            }
+            $type = "Binary"; $value = $encoded
+        } elseif ($encoded -match '^"(.*)"$') {
+            $value = $Matches[1] -replace '\\\"','"' -replace '\\\\','\'
+        }
+        $entry = [pscustomobject][ordered]@{
+            Path=$currentPath; Name=$name; Type=$type; Value=$value; SourceLine=$lineNumber; RawHash=$rawHash
+            Status="Verified"; Trust="UntrustedEvidence"; ExecutableContent=$false
+        }
+        $entries.Add($entry)
     }
-    return [pscustomobject][ordered]@{
-        SchemaVersion=$script:RegistrySnapshotSchemaVersion; CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
-        ComputerName=$env:COMPUTERNAME; SourcePath=$RegPath; Entries=@($entries)
-    }
+    $result.Entries = @($entries.ToArray())
+    $result.VerifiedEntries = @($entries.ToArray())
+    $result.UntrustedEntries = @($entries.ToArray())
+    $result.UnsupportedEntries = @($unsupported.ToArray())
+    $result.MalformedEntries = @($malformed.ToArray())
+    $result.Success = $entries.Count -gt 0
+    $result.Status = if ($entries.Count -eq 0) { "Rejected" } elseif ($unsupported.Count -or $malformed.Count) { "ImportedWithWarnings" } else { "Imported" }
+    $diagnostics = $unsupported.Count + $malformed.Count
+    $result.Summary = if ($entries.Count -gt 0) {
+        $suffix = if ($diagnostics) { "; $diagnostics unsupported or malformed line(s)" } else { "" }
+        ".reg export imported as untrusted evidence: $($entries.Count) verified value(s)$suffix"
+    } else { ".reg export contained no verified registry values" }
+    return $result
 }
 
 function Compare-RegExportSnapshot {

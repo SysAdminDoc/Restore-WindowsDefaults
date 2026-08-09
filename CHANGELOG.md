@@ -4,6 +4,7 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 
 ## [Unreleased]
 
+- Constrained external undo imports to schema v2 with bounded input, allowlisted paths and operations, provenance, and distinct verified, untrusted, malformed, and unsupported evidence results.
 - Added fail-closed capability gates with versioned machine profiles, per-category OS/build/architecture/runtime declarations, managed-policy ownership decisions, CLI capability reports, and Intune/SCCM reporting.
 - Added versioned `-WhatIf`/`-PlanPath` action plans with capability decisions, registry/service/task state where statically known, operation hashes, and explicit review boundaries for remaining category-level operations.
 - Routed fully represented registry, service, and scheduled-task operations through `ShouldProcess`-aware mutation primitives and the versioned plan executor.

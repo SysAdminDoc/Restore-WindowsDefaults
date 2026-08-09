@@ -181,6 +181,12 @@ Describe "Restore-WindowsDefaults external change imports" {
             @($diff.Changed).Name | Should -Contain "Changed"
             @($diff.Added).Name | Should -Contain "Added"
             @($diff.Removed).Name | Should -Contain "Removed"
+            $snapshot = Import-RegExportSnapshot -RegPath $beforePath
+            $snapshot.ImportSchemaVersion | Should -Be 2
+            $snapshot.Provenance.Trust | Should -Be "UntrustedEvidence"
+            $snapshot.Provenance.ExecutableContent | Should -BeFalse
+            $snapshot.Entries[0].Status | Should -Be "Verified"
+            @($snapshot.Entries[0].PSObject.Properties.Name) | Should -Not -Contain "Raw"
         } finally {
             foreach ($path in @($beforePath,$afterPath)) {
                 if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
@@ -211,6 +217,91 @@ Describe "Restore-WindowsDefaults external change imports" {
             $result.RelevantCategories | Should -Contain "chkTasks"
         } finally {
             if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "separates verified, malformed, and unsupported text evidence without retaining commands" {
+        $path = Join-Path ([System.IO.Path]::GetTempPath()) ("import-diagnostics-{0}.log" -f ([guid]::NewGuid().ToString("N")))
+        try {
+            @(
+                'reg add "HKLM\SOFTWARE\Policies\Microsoft\Windows\DataCollection" /v AllowTelemetry /d 0',
+                'Add-AppxPackage -AllUsers',
+                'Invoke-Expression "Remove-Item C:\unsafe"'
+            ) | Set-Content -LiteralPath $path
+
+            $result = Import-PrivacySexyCompensationLog -LogPath $path
+
+            $result.Status | Should -Be "ImportedWithWarnings"
+            $result.Operations.Count | Should -Be 1
+            $result.UntrustedEntries.Count | Should -Be 1
+            $result.UnsupportedEntries.Count | Should -BeGreaterThan 0
+            $result.MalformedEntries.Count | Should -BeGreaterThan 0
+            $result.UnsupportedEntries[0].Reason | Should -Not -BeNullOrEmpty
+            $result.MalformedEntries[0].Reason | Should -Not -BeNullOrEmpty
+            @($result.Operations[0].PSObject.Properties.Name) | Should -Not -Contain "Raw"
+            $result.Operations[0].RawHash | Should -Not -BeNullOrEmpty
+            $result.Provenance.Trust | Should -Be "UntrustedEvidence"
+            $result.Provenance.ExecutableContent | Should -BeFalse
+        } finally {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "rejects missing and unsupported manifest schema versions with distinct diagnostics" {
+        $missingVersionPath = Join-Path ([System.IO.Path]::GetTempPath()) ("manifest-no-version-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        $unsupportedVersionPath = Join-Path ([System.IO.Path]::GetTempPath()) ("manifest-unsupported-version-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        try {
+            @{ changes=@(@{ disabledServices=@("DiagTrack") }) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $missingVersionPath
+            @{ version="9"; changes=@(@{ disabledServices=@("DiagTrack") }) } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $unsupportedVersionPath
+
+            $missing = Import-UndoManifest -ManifestPath $missingVersionPath
+            $unsupported = Import-UndoManifest -ManifestPath $unsupportedVersionPath
+
+            $missing.Status | Should -Be "Rejected"
+            $missing.MalformedEntries.Count | Should -BeGreaterThan 0
+            $missing.MalformedEntries[0].Reason | Should -Match "version"
+            $unsupported.Status | Should -Be "Rejected"
+            $unsupported.UnsupportedEntries.Count | Should -BeGreaterThan 0
+            $unsupported.UnsupportedEntries[0].Status | Should -Be "Unsupported"
+        } finally {
+            foreach ($path in @($missingVersionPath,$unsupportedVersionPath)) {
+                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+
+    It "enforces bounded text, JSON depth, and item counts" {
+        $oversizedPath = Join-Path ([System.IO.Path]::GetTempPath()) ("import-oversized-{0}.log" -f ([guid]::NewGuid().ToString("N")))
+        $deepPath = Join-Path ([System.IO.Path]::GetTempPath()) ("manifest-deep-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        $manyPath = Join-Path ([System.IO.Path]::GetTempPath()) ("manifest-many-{0}.json" -f ([guid]::NewGuid().ToString("N")))
+        try {
+            ("x" * ($script:ExternalImportMaxLineBytes + 1)) | Set-Content -LiteralPath $oversizedPath
+            $deep = @{ version="2"; child=@{} }
+            $cursor = $deep.child
+            for ($i=0; $i -lt ($script:ExternalImportMaxDepth + 2); $i++) {
+                $cursor.child = @{}
+                $cursor = $cursor.child
+            }
+            $deep | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $deepPath
+            $services = @(
+                for ($i=0; $i -lt ($script:ExternalImportMaxItems + 1); $i++) { "Svc$i" }
+            )
+            @{ version="2"; services=$services } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manyPath
+
+            $oversized = Import-PrivacySexyCompensationLog -LogPath $oversizedPath
+            $deepResult = Import-UndoManifest -ManifestPath $deepPath
+            $manyResult = Import-UndoManifest -ManifestPath $manyPath
+
+            $oversized.Status | Should -Be "Rejected"
+            $oversized.UnsupportedEntries.Count | Should -BeGreaterThan 0
+            $deepResult.Status | Should -Be "Rejected"
+            $deepResult.UnsupportedEntries[0].Reason | Should -Match "depth"
+            $manyResult.Status | Should -Be "Rejected"
+            $manyResult.UnsupportedEntries[0].Reason | Should -Match "item"
+        } finally {
+            foreach ($path in @($oversizedPath,$deepPath,$manyPath)) {
+                if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+            }
         }
     }
 }

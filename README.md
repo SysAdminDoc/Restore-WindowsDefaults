@@ -157,7 +157,7 @@ If you used Debloat-Win11 v1.1.0 or a similar tool that generates an undo manife
 4. A summary shows exactly how many AppX packages, services, tasks, and registry keys will be restored
 5. Click **Run Selected Fixes** to restore precisely what was changed
 
-The import path is evidence-only: privacy.sexy compensation logs, Chris Titus WinUtil diffs, `.reg` exports, and newer nested undo manifests are parsed into planned operations and never executed as imported code.
+The import path is evidence-only and uses a versioned, bounded safe schema: privacy.sexy compensation logs, Chris Titus WinUtil diffs, .reg exports, and newer nested undo manifests are limited by bytes, lines, depth, and items; validated entries carry provenance and are classified as verified/untrusted evidence, while malformed or unsupported entries retain a reason. Imported text is never executed as code.
 
 ## HTML Report
 
