@@ -1156,3 +1156,116 @@ Describe "Restore-WindowsDefaults scope contracts" {
         $report.Findings[0].Status | Should -Be "Unavailable"
     }
 }
+
+Describe "Restore-WindowsDefaults support bundle contracts" {
+    It "exports only allowlisted summaries with redaction and verifiable hashes" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-support-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $archive = Join-Path $root "support.zip"
+        $extract = Join-Path $root "extract"
+        $logPath = Join-Path $root "WindowsRestore-sensitive.log"
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        [System.IO.File]::WriteAllText($logPath, @"
+User=alice
+Computer=HOST-01
+Profile=C:\Users\alice\Documents\restore.txt
+Token=abc123
+Authorization: Bearer secret-token
+powershell.exe -NoProfile -Command "Get-Item C:\Users\alice\secret.txt"
+HKLM:\Software\SecretPolicy
+Policy: DisableAntiSpyware = 1
+safe diagnostic line
+"@, [System.Text.Encoding]::UTF8)
+        try {
+            $healthProvider = {
+                [ordered]@{
+                    Defender=[ordered]@{
+                        FriendlyName="Windows Defender"; Severity="High"; IssueCount=2
+                        Issues=@("Profile C:\Users\alice\Documents", "Policy: HKLM:\Software\Policies\Secret = token")
+                        Details=@("Registry value Secret = confidential", "CommandLine=powershell.exe -Command secret")
+                        ObservationScope="Machine"; ScopeStatus="Declared"; ManagementOwnership="Local"; ManagementDecision="LocalDefault"
+                        ManagementEvidence=@("HOST-01", "alice"); RawRegistryData="confidential"
+                    }
+                }
+            }
+            $quickProvider = {
+                [ordered]@{
+                    DisabledServices=2; DisabledTasks=1; MissingAppx=3; ModifiedRegistry=4
+                    ServiceNames=@("SecretService"); TaskNames=@("SecretTask"); AppxNames=@("Secret.App"); RegistryDetails=@("HKLM:\Software\Secret")
+                }
+            }
+            $machineProvider = {
+                [pscustomobject][ordered]@{
+                    ProductFamily="Windows 11"; Build=26100; BuildRevision=100; Edition="Professional"; Architecture="x64"; Locale="en-US"
+                    PowerShellMajor=5; IsOnline=$true; IsAdministrator=$true
+                    Management=[pscustomobject]@{IsKnown=$true;IsManaged=$false;Decision="LocalDefault";Evidence=@("HOST-01")}
+                }
+            }
+            $result = Export-RestoreSupportBundle -OutputPath $archive -HealthProvider $healthProvider -QuickScanProvider $quickProvider -MachineProfileProvider $machineProvider -LogPathProvider { @($logPath) }
+
+            $result.Status | Should -Be "Exported"
+            $result.Success | Should -BeTrue
+            $result.BundleSchemaVersion | Should -Be 2
+            $result.CollisionAvoided | Should -BeFalse
+            $result.ManifestSha256 | Should -Match '^[A-F0-9]{64}$'
+            Expand-Archive -LiteralPath $result.Path -DestinationPath $extract -Force
+            $files = @(Get-ChildItem -LiteralPath $extract -File | Sort-Object Name)
+            @($files.Name) | Should -Contain "metadata.json"
+            @($files.Name) | Should -Contain "health-summary.json"
+            @($files.Name) | Should -Contain "quick-scan.json"
+            @($files.Name) | Should -Contain "events.log"
+            @($files.Name) | Should -Contain "redaction-report.json"
+            @($files.Name) | Should -Contain "manifest.json"
+            @($files.Name | Where-Object { $_ -notin @("metadata.json","health-summary.json","quick-scan.json","events.log","redaction-report.json","manifest.json") }).Count | Should -Be 0
+
+            $metadata = Get-Content -LiteralPath (Join-Path $extract "metadata.json") -Raw | ConvertFrom-Json
+            $metadata.Platform.ProductFamily | Should -Be "Windows 11"
+            $metadata.Platform.Build | Should -Be 26100
+            $metadata.Platform.Management.Status | Should -Be "Unmanaged"
+            $health = Get-Content -LiteralPath (Join-Path $extract "health-summary.json") -Raw | ConvertFrom-Json
+            @($health.Categories[0].PSObject.Properties.Name) | Should -Not -Contain "Details"
+            @($health.Categories[0].PSObject.Properties.Name) | Should -Not -Contain "ManagementEvidence"
+            $quick = Get-Content -LiteralPath (Join-Path $extract "quick-scan.json") -Raw | ConvertFrom-Json
+            @($quick.PSObject.Properties.Name) | Should -Not -Contain "ServiceNames"
+            @($quick.PSObject.Properties.Name) | Should -Not -Contain "RegistryDetails"
+            $events = Get-Content -LiteralPath (Join-Path $extract "events.log") -Raw
+            $events | Should -Not -Match "alice|HOST-01|C:\\Users|abc123|secret-token|powershell\.exe|HKLM:|DisableAntiSpyware"
+            $report = Get-Content -LiteralPath (Join-Path $extract "redaction-report.json") -Raw | ConvertFrom-Json
+            $report.Policy | Should -Be "Explicit allowlist with redaction"
+            $report.RedactionCounts.Username | Should -BeGreaterThan 0
+            $report.RedactionCounts.Hostname | Should -BeGreaterThan 0
+            $report.RedactionCounts.Secret | Should -BeGreaterThan 0
+            $report.RedactionCounts.CommandLine | Should -BeGreaterThan 0
+            $report.ExcludedSources.SourceClass | Should -Contain "RollbackJournals"
+            $manifest = Get-Content -LiteralPath (Join-Path $extract "manifest.json") -Raw | ConvertFrom-Json
+            $manifest.Algorithm | Should -Be "SHA-256"
+            foreach ($entry in @($manifest.Files)) {
+                (Get-FileHash -LiteralPath (Join-Path $extract $entry.Name) -Algorithm SHA256).Hash | Should -Be $entry.Sha256
+                (Get-Item -LiteralPath (Join-Path $extract $entry.Name)).Length | Should -Be $entry.Bytes
+            }
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "does not overwrite an existing archive and keeps the staged contract bounded" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-support-collision-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $archive = Join-Path $root "collision.zip"
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+        try {
+            $healthProvider = { [ordered]@{} }
+            $quickProvider = { [ordered]@{DisabledServices=0;DisabledTasks=0;MissingAppx=0;ModifiedRegistry=0} }
+            $machineProvider = { [pscustomobject]@{ProductFamily="Windows 11";Build=26100;Edition="Professional";Architecture="x64";Locale="en-US";PowerShellMajor=5;IsOnline=$true;IsAdministrator=$true;Management=[pscustomobject]@{IsManaged=$false;Decision="LocalDefault"}} }
+            $first = Export-RestoreSupportBundle -OutputPath $archive -HealthProvider $healthProvider -QuickScanProvider $quickProvider -MachineProfileProvider $machineProvider -LogPathProvider { @() }
+            $firstBytes = (Get-Item -LiteralPath $first.Path).Length
+            $second = Export-RestoreSupportBundle -OutputPath $archive -HealthProvider $healthProvider -QuickScanProvider $quickProvider -MachineProfileProvider $machineProvider -LogPathProvider { @() }
+
+            $second.CollisionAvoided | Should -BeTrue
+            $second.Path | Should -Be (Join-Path $root "collision-1.zip")
+            (Get-Item -LiteralPath $first.Path).Length | Should -Be $firstBytes
+            $second.StagedBytes | Should -BeLessThan $script:SupportBundleMaxBytes
+            $second.ArchiveBytes | Should -BeLessThan $script:SupportBundleMaxBytes
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}

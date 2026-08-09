@@ -89,6 +89,15 @@ $script:ScheduledRestoreRunOncePathOverride = $null
 $script:ScheduledRestoreRunOnceReadProvider = $null
 $script:ScheduledRestoreRunOnceWriteProvider = $null
 $script:ScheduledRestoreRunOnceRemoveProvider = $null
+$script:SupportBundleSchemaVersion = 2
+$script:SupportBundleManifestSchemaVersion = 1
+$script:SupportBundleMaxBytes = 10MB
+$script:SupportBundleMaxFileBytes = 2MB
+$script:SupportBundleMaxFiles = 6
+$script:SupportBundleMaxLogBytes = 512KB
+$script:SupportBundleMaxLogFiles = 3
+$script:SupportBundleMaxCategories = 100
+$script:SupportBundleMaxIssueSummaries = 20
 $script:ExternalImportSchemaVersion = 2
 $script:ExternalImportMaxBytes = 2MB
 $script:ExternalImportMaxLines = 5000
@@ -7072,34 +7081,393 @@ function Get-PostUpdateSecurityRecheck {
     }
 }
 
-function Export-RestoreSupportBundle {
+function Get-RestoreSupportBundleAllowlist {
+    return @(
+        [pscustomobject][ordered]@{
+            FileName="metadata.json"; Format="JSON"; Fields=@("SchemaVersion","ToolName","ToolVersion","BundleSchemaVersion","CreatedAtUtc","ArchiveFormat","ManifestFile","ManifestAlgorithm","RedactionReportFile","MetadataPolicy","IncludedFiles","Platform","Management")
+        },
+        [pscustomobject][ordered]@{
+            FileName="health-summary.json"; Format="JSON"; Fields=@("SchemaVersion","CapturedAtUtc","Categories")
+        },
+        [pscustomobject][ordered]@{
+            FileName="quick-scan.json"; Format="JSON"; Fields=@("SchemaVersion","CapturedAtUtc","DisabledServices","DisabledTasks","MissingAppx","ModifiedRegistry")
+        },
+        [pscustomobject][ordered]@{
+            FileName="events.log"; Format="RedactedText"; Fields=@("RedactedLogLines")
+        },
+        [pscustomobject][ordered]@{
+            FileName="redaction-report.json"; Format="JSON"; Fields=@("SchemaVersion","Policy","IncludedFiles","RedactionCounts","ExcludedSources","Limits","FieldAllowlist")
+        },
+        [pscustomobject][ordered]@{
+            FileName="manifest.json"; Format="JSON"; Fields=@("SchemaVersion","Algorithm","GeneratedAtUtc","Covers","Files")
+        }
+    )
+}
+
+function Get-RestoreSupportObjectProperty {
+    param(
+        [object]$InputObject,
+        [Parameter(Mandatory=$true)][string]$Name
+    )
+    if ($null -eq $InputObject) { return $null }
+    if ($InputObject -is [System.Collections.IDictionary] -and $InputObject.Contains($Name)) { return $InputObject[$Name] }
+    $property = $InputObject.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Get-RestoreSupportRedactionCounter {
+    return [ordered]@{
+        Secret=0; Token=0; Username=0; Hostname=0; ProfilePath=0; WindowsPath=0
+        RegistryPath=0; RegistryData=0; CommandLine=0; Xml=0; Email=0; Truncated=0; InputReadFailure=0
+    }
+}
+
+function Add-RestoreSupportRedactionCount {
+    param(
+        [System.Collections.IDictionary]$Counts,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [int]$Amount = 1
+    )
+    if ($null -eq $Counts -or $Amount -le 0) { return }
+    if (-not $Counts.Contains($Name)) { $Counts[$Name] = 0 }
+    $Counts[$Name] = [int]$Counts[$Name] + $Amount
+}
+
+function ConvertTo-RestoreSupportSafeText {
+    param(
+        [AllowNull()][object]$Value,
+        [System.Collections.IDictionary]$RedactionCounts,
+        [int]$MaxCharacters = 65536
+    )
+    if ($null -eq $Value) { return "" }
+    $text = [string]$Value
+    if ([string]::IsNullOrEmpty($text)) { return $text }
+
+    $lines = [regex]::Split($text, "\r?\n")
+    $commandPattern = '(?i)\b(?:powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?|reg(?:\.exe)?|regedit(?:\.exe)?|dism(?:\.exe)?|schtasks(?:\.exe)?|sc(?:\.exe)?|netsh(?:\.exe)?|icacls(?:\.exe)?|takeown(?:\.exe)?|rundll32(?:\.exe)?|msiexec(?:\.exe)?|start-process|invoke-expression|add-appxpackage|remove-appxpackage|set-itemproperty|remove-item|new-item)\b'
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -match $commandPattern) {
+            $lines[$index] = "[REDACTED_COMMAND_LINE]"
+            Add-RestoreSupportRedactionCount -Counts $RedactionCounts -Name "CommandLine"
+        }
+    }
+    $text = [string]::Join([Environment]::NewLine, $lines)
+
+    $redactionPatterns = @(
+        [pscustomobject]@{Name="Token"; Pattern='(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+'; Replacement="Bearer REDACTED_TOKEN"},
+        [pscustomobject]@{Name="Secret"; Pattern='(?i)\b(?:password|passwd|secret|credential|token|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)\b\s*[:=]\s*["'']?[^\s,;''"]+'; Replacement="REDACTED_SECRET"},
+        [pscustomobject]@{Name="CommandLine"; Pattern='(?i)\b(?:command|commandline|arguments?)\s*[:=]\s*[^\r\n]+'; Replacement="[REDACTED_COMMAND_LINE]"},
+        [pscustomobject]@{Name="Username"; Pattern='(?i)\b(?:user|username|account|owner|profile)\s*[:=]\s*[^\s,;''"]+'; Replacement="REDACTED_USER"},
+        [pscustomobject]@{Name="Hostname"; Pattern='(?i)\b(?:computer|computername|host|hostname)\s*[:=]\s*[^\s,;''"]+'; Replacement="REDACTED_HOSTNAME"},
+        [pscustomobject]@{Name="RegistryPath"; Pattern='(?i)\b(?:HKLM|HKCU|HKU|HKCR|HKEY_LOCAL_MACHINE|HKEY_CURRENT_USER|HKEY_USERS|HKEY_CLASSES_ROOT)(?::)?\\[^\s,;''"<>]+'; Replacement="REDACTED_REGISTRY_PATH"},
+        [pscustomobject]@{Name="RegistryData"; Pattern='(?i)\b(?:Policy|Registry(?:\s+(?:value|data))?|IFEO|ValueName|CurrentValue|DefaultValue)\s*[:=]?\s*[^\r\n]+'; Replacement="REDACTED_REGISTRY_DATA"},
+        [pscustomobject]@{Name="Xml"; Pattern='(?i)\b(?:xml|taskxml)\s*[:=]\s*[^\r\n]+'; Replacement="REDACTED_XML"},
+        [pscustomobject]@{Name="WindowsPath"; Pattern='(?i)(?<![A-Za-z0-9])(?:[A-Za-z]:\\|\\\\)[^\s,;''"<>|]+'; Replacement="REDACTED_PATH"},
+        [pscustomobject]@{Name="Email"; Pattern='(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b'; Replacement="REDACTED_IDENTITY"}
+    )
+    foreach ($pattern in $redactionPatterns) {
+        $redactionMatches = [regex]::Matches($text, $pattern.Pattern)
+        if ($redactionMatches.Count -gt 0) {
+            Add-RestoreSupportRedactionCount -Counts $RedactionCounts -Name $pattern.Name -Amount $redactionMatches.Count
+            $text = [regex]::Replace($text, $pattern.Pattern, $pattern.Replacement)
+        }
+    }
+
+    $identityValues = @(
+        [pscustomobject]@{Name="Username"; Value=$env:USERNAME},
+        [pscustomobject]@{Name="Username"; Value=[Environment]::UserName},
+        [pscustomobject]@{Name="Hostname"; Value=$env:COMPUTERNAME},
+        [pscustomobject]@{Name="Hostname"; Value=[Environment]::MachineName},
+        [pscustomobject]@{Name="Username"; Value=$env:USERDOMAIN}
+    ) | Where-Object { $_.Value -and ([string]$_.Value).Length -ge 2 } | Sort-Object Name,Value -Unique
+    foreach ($identity in $identityValues) {
+        $identityPattern = [regex]::Escape([string]$identity.Value)
+        $identityMatches = [regex]::Matches($text, $identityPattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if ($identityMatches.Count -gt 0) {
+            Add-RestoreSupportRedactionCount -Counts $RedactionCounts -Name $identity.Name -Amount $identityMatches.Count
+            $replacement = if ($identity.Name -eq "Hostname") { "REDACTED_HOSTNAME" } else { "REDACTED_USER" }
+            $text = [regex]::Replace($text, $identityPattern, $replacement, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        }
+    }
+
+    if ($MaxCharacters -lt 1) { $MaxCharacters = 1 }
+    if ($text.Length -gt $MaxCharacters) {
+        $text = $text.Substring(0, $MaxCharacters)
+        Add-RestoreSupportRedactionCount -Counts $RedactionCounts -Name "Truncated"
+    }
+    return $text
+}
+
+function Get-RedactedLogContent {
+    param(
+        [string[]]$Path,
+        [System.Collections.IDictionary]$RedactionCounts,
+        [int]$MaxBytes = $script:SupportBundleMaxLogBytes
+    )
+    $segments = New-Object System.Collections.Generic.List[string]
+    $includedCount = 0
+    $availableCount = 0
+    $truncatedCount = 0
+    $failedCount = 0
+    $selectedPaths = @($Path | Where-Object { $_ } | Select-Object -First $script:SupportBundleMaxLogFiles)
+    foreach ($candidate in $selectedPaths) {
+        $availableCount++
+        try {
+            $raw = [System.IO.File]::ReadAllText([System.IO.Path]::GetFullPath([string]$candidate))
+            $wasTruncated = $false
+            if ([System.Text.Encoding]::UTF8.GetByteCount($raw) -gt $MaxBytes) {
+                $raw = $raw.Substring(0, [Math]::Min($raw.Length, $MaxBytes))
+                $wasTruncated = $true
+                $truncatedCount++
+                Add-RestoreSupportRedactionCount -Counts $RedactionCounts -Name "Truncated"
+            }
+            $safe = ConvertTo-RestoreSupportSafeText -Value $raw -RedactionCounts $RedactionCounts -MaxCharacters $MaxBytes
+            if ($wasTruncated) { $safe = "$safe`r`n[REDACTED_LOG_TRUNCATED]" }
+            $segments.Add(("--- REDACTED LOG SEGMENT {0} ---`r`n{1}`r`n--- END REDACTED LOG SEGMENT {0} ---" -f ($includedCount + 1), $safe))
+            $includedCount++
+        } catch {
+            $failedCount++
+            Add-RestoreSupportRedactionCount -Counts $RedactionCounts -Name "InputReadFailure"
+        }
+    }
+    $content = [string]::Join("`r`n", $segments.ToArray())
+    $encodedLength = [System.Text.Encoding]::UTF8.GetByteCount($content)
+    if ($encodedLength -gt $MaxBytes) {
+        $content = $content.Substring(0, [Math]::Min($content.Length, $MaxBytes))
+        Add-RestoreSupportRedactionCount -Counts $RedactionCounts -Name "Truncated"
+    }
+    return [pscustomobject][ordered]@{
+        Content=$content; IncludedCount=$includedCount; AvailableCount=$availableCount
+        TruncatedCount=$truncatedCount; FailedCount=$failedCount
+    }
+}
+
+function ConvertTo-RestoreSupportHealthSummary {
+    param(
+        [object]$Health,
+        [System.Collections.IDictionary]$RedactionCounts
+    )
+    $categories = New-Object System.Collections.Generic.List[object]
+    $sourceKeys = if ($Health -is [System.Collections.IDictionary]) { @($Health.Keys) } elseif ($Health) { @($Health.PSObject.Properties.Name) } else { @() }
+    foreach ($key in @($sourceKeys | Select-Object -First $script:SupportBundleMaxCategories)) {
+        $value = Get-RestoreSupportObjectProperty -InputObject $Health -Name ([string]$key)
+        $issues = @(Get-RestoreSupportObjectProperty -InputObject $value -Name "Issues")
+        $issueSummaries = @($issues | Select-Object -First $script:SupportBundleMaxIssueSummaries | ForEach-Object {
+            ConvertTo-RestoreSupportSafeText -Value $_ -RedactionCounts $RedactionCounts -MaxCharacters 2048
+        })
+        $issueCount = 0
+        $issueCountValue = Get-RestoreSupportObjectProperty -InputObject $value -Name "IssueCount"
+        if (-not [int]::TryParse(([string]$issueCountValue), [ref]$issueCount)) { $issueCount = $issues.Count }
+        $categories.Add([pscustomobject][ordered]@{
+            Category=(ConvertTo-RestoreSupportSafeText -Value ([string]$key) -RedactionCounts $RedactionCounts -MaxCharacters 128)
+            FriendlyName=(ConvertTo-RestoreSupportSafeText -Value (Get-RestoreSupportObjectProperty -InputObject $value -Name "FriendlyName") -RedactionCounts $RedactionCounts -MaxCharacters 256)
+            Severity=(ConvertTo-RestoreSupportSafeText -Value (Get-RestoreSupportObjectProperty -InputObject $value -Name "Severity") -RedactionCounts $RedactionCounts -MaxCharacters 32)
+            IssueCount=$issueCount; IssueSummaries=@($issueSummaries)
+            ObservationScope=(ConvertTo-RestoreSupportSafeText -Value (Get-RestoreSupportObjectProperty -InputObject $value -Name "ObservationScope") -RedactionCounts $RedactionCounts -MaxCharacters 128)
+            ScopeStatus=(ConvertTo-RestoreSupportSafeText -Value (Get-RestoreSupportObjectProperty -InputObject $value -Name "ScopeStatus") -RedactionCounts $RedactionCounts -MaxCharacters 64)
+            ManagementOwnership=(ConvertTo-RestoreSupportSafeText -Value (Get-RestoreSupportObjectProperty -InputObject $value -Name "ManagementOwnership") -RedactionCounts $RedactionCounts -MaxCharacters 64)
+            ManagementDecision=(ConvertTo-RestoreSupportSafeText -Value (Get-RestoreSupportObjectProperty -InputObject $value -Name "ManagementDecision") -RedactionCounts $RedactionCounts -MaxCharacters 64)
+        })
+    }
+    return [pscustomobject][ordered]@{
+        SchemaVersion=1; CapturedAtUtc=(Get-Date).ToUniversalTime().ToString("o"); Categories=@($categories.ToArray())
+    }
+}
+
+function ConvertTo-RestoreSupportCount {
+    param([object]$Value)
+    $count = 0
+    if ([int]::TryParse(([string]$Value), [ref]$count) -and $count -ge 0) { return $count }
+    return 0
+}
+
+function ConvertTo-RestoreSupportQuickSummary {
+    param([object]$QuickScan)
+    $disabledServices = ConvertTo-RestoreSupportCount (Get-RestoreSupportObjectProperty -InputObject $QuickScan -Name "DisabledServices")
+    $disabledTasks = ConvertTo-RestoreSupportCount (Get-RestoreSupportObjectProperty -InputObject $QuickScan -Name "DisabledTasks")
+    $missingAppx = ConvertTo-RestoreSupportCount (Get-RestoreSupportObjectProperty -InputObject $QuickScan -Name "MissingAppx")
+    $modifiedRegistry = ConvertTo-RestoreSupportCount (Get-RestoreSupportObjectProperty -InputObject $QuickScan -Name "ModifiedRegistry")
+    return [pscustomobject][ordered]@{
+        SchemaVersion=1; CapturedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
+        DisabledServices=$disabledServices; DisabledTasks=$disabledTasks
+        MissingAppx=$missingAppx; ModifiedRegistry=$modifiedRegistry
+    }
+}
+
+function Get-RestoreSupportMachineMetadata {
+    param([object]$MachineProfile)
+    $productFamily = [string](Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "ProductFamily")
+    if ($productFamily -notin @("Windows 10","Windows 11")) { $productFamily = "Unknown" }
+    $build = 0
+    $buildValue = Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "Build"
+    if (-not [int]::TryParse(([string]$buildValue), [ref]$build)) { $build = 0 }
+    $revision = 0
+    $revisionValue = Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "BuildRevision"
+    if (-not [int]::TryParse(([string]$revisionValue), [ref]$revision)) { $revision = 0 }
+    $architecture = [string](Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "Architecture")
+    if ($architecture -notin @("x86","x64","arm64")) { $architecture = "Unknown" }
+    $locale = [string](Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "Locale")
+    if ($locale -notmatch '^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$') { $locale = "Unknown" }
+    $management = Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "Management"
+    $isManaged = Get-RestoreSupportObjectProperty -InputObject $management -Name "IsManaged"
+    $managementStatus = if ($isManaged -eq $true) { "Managed" } elseif ($isManaged -eq $false) { "Unmanaged" } else { "Unknown" }
+    $managementDecision = [string](Get-RestoreSupportObjectProperty -InputObject $management -Name "Decision")
+    if ($managementDecision -notin @("LocalDefault","OrganizationOwned","OverrideRequested","Unknown")) { $managementDecision = "Unknown" }
+    return [pscustomobject][ordered]@{
+        ProductFamily=$productFamily; Build=$build; BuildRevision=$revision; Edition=(ConvertTo-RestoreSupportSafeText -Value (Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "Edition") -MaxCharacters 64)
+        Architecture=$architecture; Locale=$locale
+        PowerShellMajor=[int](Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "PowerShellMajor")
+        IsOnline=[bool](Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "IsOnline")
+        IsAdministrator=[bool](Get-RestoreSupportObjectProperty -InputObject $MachineProfile -Name "IsAdministrator")
+        Management=[pscustomobject][ordered]@{Known=($managementStatus -ne "Unknown");Status=$managementStatus;Decision=$managementDecision}
+    }
+}
+
+function Write-RestoreSupportBundleTextFile {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [AllowEmptyString()][string]$Content,
+        [int]$MaxBytes = $script:SupportBundleMaxFileBytes
+    )
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($Content)
+    if ($bytes.Length -gt $MaxBytes) { throw "Support bundle file exceeds the $MaxBytes byte limit: $(Split-Path -Leaf $Path)" }
+    [System.IO.File]::WriteAllBytes($Path, $bytes)
+    return $bytes.Length
+}
+
+function Get-RestoreSupportBundleOutputPath {
     param([Parameter(Mandatory=$true)][string]$OutputPath)
-    $fullPath = [System.IO.Path]::GetFullPath($OutputPath)
-    if ([System.IO.Path]::GetExtension($fullPath) -ine ".zip") { $fullPath += ".zip" }
+    $requestedPath = [System.IO.Path]::GetFullPath($OutputPath)
+    if ([System.IO.Path]::GetExtension($requestedPath) -ine ".zip") { $requestedPath += ".zip" }
+    $candidate = $requestedPath
+    $collisionAvoided = $false
+    $index = 0
+    while (Test-Path -LiteralPath $candidate) {
+        $index++
+        $directory = [System.IO.Path]::GetDirectoryName($requestedPath)
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension($requestedPath)
+        $extension = [System.IO.Path]::GetExtension($requestedPath)
+        $candidate = Join-Path $directory ("{0}-{1}{2}" -f $stem, $index, $extension)
+        $collisionAvoided = $true
+    }
+    return [pscustomobject][ordered]@{RequestedPath=$requestedPath;OutputPath=$candidate;CollisionAvoided=$collisionAvoided}
+}
+
+function Get-RestoreSupportBundleManifest {
+    param([Parameter(Mandatory=$true)][string]$StagingPath)
+    $allowlistNames = @(Get-RestoreSupportBundleAllowlist | ForEach-Object { $_.FileName })
+    $files = @(Get-ChildItem -LiteralPath $StagingPath -File -ErrorAction Stop | Sort-Object Name)
+    $unexpected = @($files | Where-Object { $_.Name -notin $allowlistNames })
+    if ($unexpected.Count -gt 0) { throw "Support bundle staging contains a file outside the allowlist" }
+    if ($files.Count -gt $script:SupportBundleMaxFiles) { throw "Support bundle contains too many files" }
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $files) {
+        if ($file.Name -eq "manifest.json") { continue }
+        if ($file.Length -gt $script:SupportBundleMaxFileBytes) { throw "Support bundle file exceeds the per-file limit: $($file.Name)" }
+        $entries.Add([pscustomobject][ordered]@{
+            Name=$file.Name; Bytes=[int64]$file.Length; Sha256=(Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+        })
+    }
+    return [pscustomobject][ordered]@{
+        Manifest=[ordered]@{
+            SchemaVersion=$script:SupportBundleManifestSchemaVersion; Algorithm="SHA-256"
+            GeneratedAtUtc=(Get-Date).ToUniversalTime().ToString("o"); Covers="All allowlisted payload files except manifest.json"
+            Files=@($entries.ToArray())
+        }
+        Entries=@($entries.ToArray())
+    }
+}
+
+function Export-RestoreSupportBundle {
+    param(
+        [Parameter(Mandatory=$true)][string]$OutputPath,
+        [scriptblock]$HealthProvider,
+        [scriptblock]$QuickScanProvider,
+        [scriptblock]$MachineProfileProvider,
+        [scriptblock]$LogPathProvider
+    )
+    $output = Get-RestoreSupportBundleOutputPath -OutputPath $OutputPath
+    $fullPath = $output.OutputPath
     $staging = Join-Path ([System.IO.Path]::GetTempPath()) ("RestoreSupport-{0}" -f ([guid]::NewGuid().ToString("N")))
+    $archiveCreated = $false
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     try {
-        $health = Get-SystemHealthReport
-        $quick = Get-QuickScanSummary
-        [System.IO.File]::WriteAllText((Join-Path $staging "health.json"), ($health | ConvertTo-Json -Depth 12), [System.Text.Encoding]::UTF8)
-        [System.IO.File]::WriteAllText((Join-Path $staging "quick-scan.json"), ($quick | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
-        $logFiles = @(Get-ChildItem -LiteralPath (Split-Path $script:LogPath) -Filter "WindowsRestore_*.log" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 10)
-        foreach ($log in $logFiles) {
-            $safe = Get-Content -LiteralPath $log.FullName -Raw -ErrorAction SilentlyContinue
-            if ($env:USERNAME) { $safe = $safe -replace [regex]::Escape($env:USERNAME), "REDACTED_USER" }
-            if ($env:COMPUTERNAME) { $safe = $safe -replace [regex]::Escape($env:COMPUTERNAME), "REDACTED_COMPUTER" }
-            [System.IO.File]::WriteAllText((Join-Path $staging $log.Name), $safe, [System.Text.Encoding]::UTF8)
+        $redactionCounts = Get-RestoreSupportRedactionCounter
+        $allowlist = @(Get-RestoreSupportBundleAllowlist)
+        $health = if ($HealthProvider) { & $HealthProvider } else { Get-SystemHealthReport }
+        $quick = if ($QuickScanProvider) { & $QuickScanProvider } else { Get-QuickScanSummary }
+        $healthSummary = ConvertTo-RestoreSupportHealthSummary -Health $health -RedactionCounts $redactionCounts
+        $quickSummary = ConvertTo-RestoreSupportQuickSummary -QuickScan $quick
+        Write-RestoreSupportBundleTextFile -Path (Join-Path $staging "health-summary.json") -Content ($healthSummary | ConvertTo-Json -Depth 10) | Out-Null
+        Write-RestoreSupportBundleTextFile -Path (Join-Path $staging "quick-scan.json") -Content ($quickSummary | ConvertTo-Json -Depth 8) | Out-Null
+
+        $logPaths = if ($LogPathProvider) { @(& $LogPathProvider) } else {
+            $logDirectory = Split-Path -Parent $script:LogPath
+            @(Get-ChildItem -LiteralPath $logDirectory -Filter "WindowsRestore_*.log" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First $script:SupportBundleMaxLogFiles | ForEach-Object { $_.FullName })
         }
+        $logResult = Get-RedactedLogContent -Path $logPaths -RedactionCounts $redactionCounts
+        if ($logResult.IncludedCount -gt 0) {
+            Write-RestoreSupportBundleTextFile -Path (Join-Path $staging "events.log") -Content $logResult.Content -MaxBytes $script:SupportBundleMaxLogBytes | Out-Null
+        }
+
+        $rollbackCount = 0
         $rollbackDirectory = Join-Path $env:ProgramData "Restore-WindowsDefaults\rollback"
         if (Test-Path -LiteralPath $rollbackDirectory) {
-            Copy-Item -Path (Join-Path $rollbackDirectory "rollback-*.json") -Destination $staging -Force -ErrorAction SilentlyContinue
+            $rollbackCount = @(Get-ChildItem -LiteralPath $rollbackDirectory -Filter "rollback-*.json" -File -ErrorAction SilentlyContinue).Count
         }
-        $parent = Split-Path -Parent $fullPath
+        $excludedSources = @(
+            [pscustomobject][ordered]@{SourceClass="RawHealthDetails";Count=1;Reason="Only allowlisted health issue summaries are exported"},
+            [pscustomobject][ordered]@{SourceClass="HealthManagementEvidence";Count=1;Reason="Management evidence may contain identities and host metadata"},
+            [pscustomobject][ordered]@{SourceClass="RawQuickScanNamesAndRegistryDetails";Count=1;Reason="Only aggregate quick-scan counts are exported"},
+            [pscustomobject][ordered]@{SourceClass="RollbackJournals";Count=$rollbackCount;Reason="Rollback journals contain paths, registry values, and operation data"},
+            [pscustomobject][ordered]@{SourceClass="TaskXml";Count=0;Reason="Task XML is excluded by the allowlist"},
+            [pscustomobject][ordered]@{SourceClass="UnincludedLogFiles";Count=([int]$logResult.AvailableCount - [int]$logResult.IncludedCount);Reason="Only bounded redacted log segments are exported"}
+        )
+        $includedFiles = @("metadata.json","health-summary.json","quick-scan.json","redaction-report.json","manifest.json")
+        if ($logResult.IncludedCount -gt 0) { $includedFiles = @("metadata.json","health-summary.json","quick-scan.json","events.log","redaction-report.json","manifest.json") }
+        $redactionReport = [pscustomobject][ordered]@{
+            SchemaVersion=1; Policy="Explicit allowlist with redaction"
+            IncludedFiles=$includedFiles; RedactionCounts=$redactionCounts
+            ExcludedSources=$excludedSources
+            Limits=[pscustomobject][ordered]@{MaxBundleBytes=$script:SupportBundleMaxBytes;MaxFileBytes=$script:SupportBundleMaxFileBytes;MaxFiles=$script:SupportBundleMaxFiles;MaxLogBytes=$script:SupportBundleMaxLogBytes;MaxLogFiles=$script:SupportBundleMaxLogFiles;MaxCategories=$script:SupportBundleMaxCategories;MaxIssueSummaries=$script:SupportBundleMaxIssueSummaries}
+            FieldAllowlist=@($allowlist | ForEach-Object { [pscustomobject][ordered]@{FileName=$_.FileName;Format=$_.Format;Fields=@($_.Fields)} })
+        }
+        Write-RestoreSupportBundleTextFile -Path (Join-Path $staging "redaction-report.json") -Content ($redactionReport | ConvertTo-Json -Depth 10) | Out-Null
+
+        $machineProfile = if ($MachineProfileProvider) { & $MachineProfileProvider } else { Get-RestoreMachineProfile }
+        $machineMetadata = Get-RestoreSupportMachineMetadata -MachineProfile $machineProfile
+        $metadata = [pscustomobject][ordered]@{
+            SchemaVersion=1; ToolName="Restore-WindowsDefaults"; ToolVersion=$script:Version; BundleSchemaVersion=$script:SupportBundleSchemaVersion
+            CreatedAtUtc=(Get-Date).ToUniversalTime().ToString("o"); ArchiveFormat="zip"; ManifestFile="manifest.json"; ManifestAlgorithm="SHA-256"
+            RedactionReportFile="redaction-report.json"; MetadataPolicy="Allowlisted fields only"; IncludedFiles=$includedFiles
+            Platform=$machineMetadata
+            Management=$machineMetadata.Management
+        }
+        Write-RestoreSupportBundleTextFile -Path (Join-Path $staging "metadata.json") -Content ($metadata | ConvertTo-Json -Depth 10) | Out-Null
+
+        $manifestResult = Get-RestoreSupportBundleManifest -StagingPath $staging
+        Write-RestoreSupportBundleTextFile -Path (Join-Path $staging "manifest.json") -Content ($manifestResult.Manifest | ConvertTo-Json -Depth 10) | Out-Null
+        $stagedFiles = @(Get-ChildItem -LiteralPath $staging -File -ErrorAction Stop)
+        $stagedBytes = [int64](($stagedFiles | Measure-Object -Property Length -Sum).Sum)
+        if ($stagedBytes -gt $script:SupportBundleMaxBytes) { throw "Support bundle exceeds the $($script:SupportBundleMaxBytes) byte limit" }
+        $parent = [System.IO.Path]::GetDirectoryName($fullPath)
         if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
-        if (Test-Path -LiteralPath $fullPath) { Remove-Item -LiteralPath $fullPath -Force }
-        Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $fullPath -CompressionLevel Optimal -Force
+        if (Test-Path -LiteralPath $fullPath) { throw "Support bundle output path became occupied during export" }
+        Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $fullPath -CompressionLevel Optimal
+        $archiveCreated = $true
+        $archiveBytes = [int64](Get-Item -LiteralPath $fullPath).Length
+        if ($archiveBytes -gt $script:SupportBundleMaxBytes) { throw "Compressed support bundle exceeds the $($script:SupportBundleMaxBytes) byte limit" }
+        $manifestHash = (Get-FileHash -LiteralPath (Join-Path $staging "manifest.json") -Algorithm SHA256).Hash
         Write-Log "Telemetry-free support bundle exported: $fullPath" -Level Success
-        return $fullPath
+        return [pscustomobject][ordered]@{
+            Status="Exported"; Success=$true; BundleSchemaVersion=$script:SupportBundleSchemaVersion; Path=$fullPath
+            CollisionAvoided=[bool]$output.CollisionAvoided; ManifestFile="manifest.json"; ManifestSha256=$manifestHash
+            Files=@($manifestResult.Entries); RedactionReport=$redactionReport; StagedBytes=$stagedBytes; ArchiveBytes=$archiveBytes
+        }
+    } catch {
+        if ($archiveCreated -and (Test-Path -LiteralPath $fullPath)) { [System.IO.File]::Delete($fullPath) }
+        throw
     } finally {
         if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue }
     }
@@ -8324,7 +8692,8 @@ if ($PostUpdateCheck) {
 }
 
 if ($ExportSupportBundle) {
-    Write-Output (Export-RestoreSupportBundle -OutputPath $ExportSupportBundle)
+    $supportBundleResult = Export-RestoreSupportBundle -OutputPath $ExportSupportBundle
+    Write-Output ($supportBundleResult | ConvertTo-Json -Depth 12)
     exit
 }
 
