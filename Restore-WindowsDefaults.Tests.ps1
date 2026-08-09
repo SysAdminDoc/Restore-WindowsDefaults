@@ -13,6 +13,10 @@ Describe "Restore-WindowsDefaults inventory primitives" {
         @($reports.Tool) | Should -Contain "Sophia Script"
         @($reports.Tool) | Should -Contain "Win10Privacy"
         @($reports | Where-Object { $_.Confidence -eq "None" }).Count | Should -BeGreaterThan 0
+        @($reports | Where-Object { $_.CatalogStatus -eq "Verified" }).Count | Should -Be $reports.Count
+        $reports[0].CatalogVersion | Should -Be "rwd-baseline-1.0"
+        $reports[0].SupportedBuildRange | Should -Match "Windows 11"
+        $reports[0].EvidenceType | Should -Be "ExplicitIndicator"
     }
 
     It "attributes disabled services and tasks through injectable providers" {
@@ -97,6 +101,9 @@ Describe "Restore-WindowsDefaults snapshot and AppX comparisons" {
         $report.ProvisionedOnly | Should -Contain "Microsoft.WindowsCalculator"
         $report.Missing | Should -Contain "Microsoft.Windows.Photos"
         $report.MissingCount | Should -Be 1
+        $report.CatalogStatus | Should -Be "Warnings"
+        $report.CanAutoFix | Should -BeFalse
+        $report.UnknownExpectedPackages | Should -Contain "Microsoft.Windows.Photos"
     }
 
     It "round-trips an empty registry snapshot through the versioned file contract" {
@@ -303,6 +310,54 @@ Describe "Restore-WindowsDefaults external change imports" {
                 if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
             }
         }
+    }
+}
+
+Describe "Restore-WindowsDefaults baseline catalog contracts" {
+    BeforeAll {
+        $baselineProfile = [pscustomobject]@{
+            ProductFamily="Windows 11"; Edition="Professional"; Build=26100
+        }
+    }
+
+    It "publishes provenance and scope metadata for every built-in catalog entry" {
+        $report = Get-RestoreBaselineCatalogReport -MachineProfile $baselineProfile
+
+        $report.SchemaVersion | Should -Be 1
+        $report.CatalogVersion | Should -Be "rwd-baseline-1.0"
+        $report.Status | Should -Be "Ready"
+        $report.Warnings.Count | Should -Be 0
+        $report.Entries.Count | Should -BeGreaterThan 0
+        @($report.Entries | Where-Object { $_.CatalogVersion -ne "rwd-baseline-1.0" }).Count | Should -Be 0
+        @($report.Entries | Where-Object { [string]::IsNullOrWhiteSpace($_.SourceUrl) -and [string]::IsNullOrWhiteSpace($_.PolicyMapping) }).Count | Should -Be 0
+        @($report.Entries | Where-Object { [string]::IsNullOrWhiteSpace($_.SupportedBuildRange) -or $_.SupportedEditions.Count -eq 0 -or [string]::IsNullOrWhiteSpace($_.Confidence) }).Count | Should -Be 0
+        @($report.Entries | Where-Object { -not $_.CanAutoFix }).Count | Should -Be 0
+    }
+
+    It "marks custom and out-of-range catalog entries as warnings without auto-fix eligibility" {
+        $custom = @(@{Name="Unversioned policy";Path="HKCU:\Software\Restore-WindowsDefaults-Test";ValueName="Missing";Action="Remove";Category="chkMisc"})
+        $unknown = @(Get-RegistryDefaultBaselineReport -Catalog $custom -MachineProfile $baselineProfile)
+        $unsupportedProfile = [pscustomobject]@{ProductFamily="Windows 11";Edition="Professional";Build=21999}
+        $outOfRange = @(Get-RegistryDefaultBaselineReport -Catalog @($script:RegistryDefaultCatalog[0]) -MachineProfile $unsupportedProfile)
+
+        $unknown[0].CatalogStatus | Should -Be "Unknown"
+        $unknown[0].CanAutoFix | Should -BeFalse
+        $unknown[0].Warning | Should -Match "missing"
+        $outOfRange[0].CatalogStatus | Should -Be "Unsupported"
+        $outOfRange[0].CanAutoFix | Should -BeFalse
+        $outOfRange[0].Warning | Should -Match "outside"
+    }
+
+    It "reports provenance for supported AppX findings and warns on unversioned baselines" {
+        $known = Get-AppxPackageRemovalReport -ExpectedPackages @($script:CoreAppxPackageCatalog[0]) -InstalledPackages @() -ProvisionedPackages @() -MachineProfile $baselineProfile
+        $unknown = Get-AppxPackageRemovalReport -ExpectedPackages @(@{Name="Custom.Package";Role="Core"}) -InstalledPackages @() -ProvisionedPackages @() -MachineProfile $baselineProfile
+
+        $known.Findings[0].CatalogStatus | Should -Be "Verified"
+        $known.Findings[0].SourceUrl | Should -Match "release-health"
+        $known.Findings[0].Confidence | Should -Be "High"
+        $unknown.CatalogStatus | Should -Be "Warnings"
+        $unknown.CanAutoFix | Should -BeFalse
+        $unknown.Findings[0].Warning | Should -Match "missing"
     }
 }
 

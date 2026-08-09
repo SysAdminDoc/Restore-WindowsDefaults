@@ -68,6 +68,7 @@ The same script supports non-GUI workflows for automation and diagnostics:
 .\Restore-WindowsDefaults.ps1 -NoGui -CompareSnapshot .\before.json
 .\Restore-WindowsDefaults.ps1 -NoGui -WhatIf -RestoreCategories chkDefender,chkWindowsUpdate
 .\Restore-WindowsDefaults.ps1 -NoGui -PlanPath .\restore-plan.json -RestoreCategories chkDefender,chkWindowsUpdate
+.\Restore-WindowsDefaults.ps1 -NoGui -BaselineReport
 .\Restore-WindowsDefaults.ps1 -NoGui -RollbackLastRun
 .\Restore-WindowsDefaults.ps1 -NoGui -ResumeRestoreJournal
 
@@ -83,6 +84,8 @@ The same script supports non-GUI workflows for automation and diagnostics:
 ```
 
 `-NoGui` is intended for automation. The Intune and Configuration Manager wrappers under `deploy\` emit JSON compliance results by default; add `-Remediate` to run the critical security and service/task categories in an already elevated management context.
+
+The BaselineReport CLI emits the versioned registry, AppX, fingerprint, service/task, and scheduled-task catalogs with source provenance, supported build and edition ranges, confidence, and warning-only handling for unknown entries. No catalog entry with unknown provenance or unsupported scope is eligible for automatic fixes.
 
 ## What It Restores
 

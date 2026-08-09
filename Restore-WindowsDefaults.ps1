@@ -16,6 +16,7 @@ param(
     [switch]$PostUpdateCheck,
     [string]$ExportSupportBundle,
     [switch]$CapabilityReport,
+    [switch]$BaselineReport,
     [switch]$AllowManagedPolicy,
     [switch]$WhatIf,
     [string]$PlanPath,
@@ -67,6 +68,18 @@ $script:ExternalImportMaxLines = 5000
 $script:ExternalImportMaxLineBytes = 16KB
 $script:ExternalImportMaxItems = 1000
 $script:ExternalImportMaxDepth = 12
+$script:BaselineCatalogSchemaVersion = 1
+$script:BaselineCatalogVersion = "rwd-baseline-1.0"
+$script:BaselineCatalogSourceUrl = "https://github.com/SysAdminDoc/Restore-WindowsDefaults"
+$script:BaselinePolicySourceUrl = "https://learn.microsoft.com/en-us/windows/security/operating-system-security/device-management/windows-security-configuration-framework/security-compliance-toolkit-10"
+$script:BaselineAppxSourceUrl = "https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information"
+$script:BaselineSupportedProductFamilies = @("Windows 10","Windows 11")
+$script:BaselineSupportedEditions = @("Core","CoreSingleLanguage","Home","Professional","ProfessionalN","ProfessionalWorkstation","Enterprise","EnterpriseN","Education","EducationN","IoTEnterprise","IoTEnterpriseS")
+$script:BaselineBuildRangeByFamily = [ordered]@{
+    "Windows 10" = [ordered]@{Minimum=19041;Maximum=$null}
+    "Windows 11" = [ordered]@{Minimum=22000;Maximum=$null}
+}
+$script:BaselineBuildRangeLabel = "Windows 10 build 19041+; Windows 11 build 22000+"
 $script:LogPath = "$env:USERPROFILE\Desktop\WindowsRestore_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $script:ChangesCount = 0
 $script:ErrorsCount = 0
@@ -99,6 +112,7 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
     if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
     if ($CapabilityReport) { $relaunchArgs += "-CapabilityReport" }
+    if ($BaselineReport) { $relaunchArgs += "-BaselineReport" }
     if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
     if ($WhatIf) { $relaunchArgs += "-WhatIf" }
     if ($PlanPath) { $relaunchArgs += @("-PlanPath", "`"$PlanPath`"") }
@@ -124,6 +138,7 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
     if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
     if ($CapabilityReport) { $relaunchArgs += "-CapabilityReport" }
+    if ($BaselineReport) { $relaunchArgs += "-BaselineReport" }
     if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
     if ($WhatIf) { $relaunchArgs += "-WhatIf" }
     if ($PlanPath) { $relaunchArgs += @("-PlanPath", "`"$PlanPath`"") }
@@ -818,9 +833,11 @@ $script:RegistryDefaultCatalog = @(
 )
 
 function Get-RegistryDefaultBaselineReport {
-    param([object[]]$Catalog = $script:RegistryDefaultCatalog)
+    param([object[]]$Catalog = $script:RegistryDefaultCatalog,[object]$MachineProfile)
+    $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
     $findings = @()
     foreach ($entry in $Catalog) {
+        $catalog = Get-RestoreCatalogEntryEvaluation -Entry $entry -Context $context
         $current = Get-ItemProperty -LiteralPath $entry.Path -Name $entry.ValueName -ErrorAction SilentlyContinue
         $present = $current -and $current.PSObject.Properties[$entry.ValueName]
         $matchesDefault = if ($entry.Action -eq "Remove") { -not $present }
@@ -828,15 +845,22 @@ function Get-RegistryDefaultBaselineReport {
         $findings += [pscustomobject][ordered]@{
             Name=$entry.Name; Path=$entry.Path; ValueName=$entry.ValueName; Category=$entry.Category
             Action=$entry.Action; CurrentValue=if($present){$current.$($entry.ValueName)}else{$null}
-            IsDefault=$matchesDefault
+            IsDefault=$matchesDefault; CatalogSchemaVersion=$catalog.CatalogSchemaVersion; CatalogVersion=$catalog.CatalogVersion
+            SourceUrl=$catalog.SourceUrl; PolicyMapping=$catalog.PolicyMapping
+            SupportedProductFamilies=$catalog.SupportedProductFamilies; SupportedBuildRange=$catalog.SupportedBuildRange
+            SupportedEditions=$catalog.SupportedEditions; Confidence=$catalog.Confidence; EvidenceType=$catalog.EvidenceType
+            CatalogStatus=$catalog.CatalogStatus; CanAutoFix=$catalog.CanAutoFix; Warning=$catalog.Warning
         }
     }
     return @($findings)
 }
 
 function Restore-RegistryDefaultBaseline {
-    param([object[]]$Catalog = $script:RegistryDefaultCatalog)
+    param([object[]]$Catalog = $script:RegistryDefaultCatalog,[object]$MachineProfile)
+    $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
     foreach ($entry in $Catalog) {
+        $catalog = Get-RestoreCatalogEntryEvaluation -Entry $entry -Context $context
+        if (-not $catalog.CanAutoFix) { continue }
         if ($entry.Action -eq "Remove") { Remove-RegistryValue -Path $entry.Path -Name $entry.ValueName -Silent }
         elseif ($entry.Action -eq "Set") { Set-RegistryValue -Path $entry.Path -Name $entry.ValueName -Value $entry.DefaultValue -Type $entry.Type -Silent }
     }
@@ -928,13 +952,183 @@ $script:ScheduledTaskRestoreMatrix = @(
     @{Source="Maps";Tools=@("WPD");P="\Microsoft\Windows\Maps\";N="MapsUpdateTask";Category="chkTasks"}
 )
 
+function Initialize-RestoreBaselineCatalogMetadata {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][object[]]$Catalog,
+        [Parameter(Mandatory=$true)][string]$CatalogKind,
+        [Parameter(Mandatory=$true)][string]$SourceUrl,
+        [string]$PolicyMapping,
+        [ValidateSet("High","Medium","Low")][string]$Confidence="Medium",
+        [ValidateSet("ExplicitBaseline","ExplicitIndicator","InferredDefault")][string]$EvidenceType="ExplicitIndicator"
+    )
+    foreach ($entry in @($Catalog)) {
+        $entry.CatalogSchemaVersion = $script:BaselineCatalogSchemaVersion
+        $entry.CatalogVersion = $script:BaselineCatalogVersion
+        $entry.CatalogKind = $CatalogKind
+        $entry.SourceUrl = if ($entry.SourceUrl) { [string]$entry.SourceUrl } else { $SourceUrl }
+        $entry.PolicyMapping = if ($entry.PolicyMapping) { [string]$entry.PolicyMapping } else { $PolicyMapping }
+        $entry.SupportedProductFamilies = @($script:BaselineSupportedProductFamilies)
+        $entry.SupportedBuildRangeByFamily = $script:BaselineBuildRangeByFamily
+        $entry.SupportedBuildRange = $script:BaselineBuildRangeLabel
+        $entry.SupportedEditions = @($script:BaselineSupportedEditions)
+        $entry.Confidence = if ($entry.Confidence) { [string]$entry.Confidence } else { $Confidence }
+        $entry.EvidenceType = if ($entry.EvidenceType) { [string]$entry.EvidenceType } else { $EvidenceType }
+    }
+}
+
+$null = Initialize-RestoreBaselineCatalogMetadata -Catalog $script:RegistryDefaultCatalog -CatalogKind "RegistryDefault" -SourceUrl $script:BaselinePolicySourceUrl -PolicyMapping "Microsoft policy baseline; absence of the override represents the inferred default" -Confidence "High" -EvidenceType "InferredDefault"
+foreach ($registryEntry in @($script:RegistryDefaultCatalog)) {
+    $registryEntry.PolicyMapping = "Registry policy $($registryEntry.Path)\$($registryEntry.ValueName)"
+}
+$null = Initialize-RestoreBaselineCatalogMetadata -Catalog $script:CoreAppxPackageCatalog -CatalogKind "AppXBaseline" -SourceUrl $script:BaselineAppxSourceUrl -PolicyMapping "Windows inbox and Store package baseline" -Confidence "High" -EvidenceType "ExplicitBaseline"
+foreach ($appxEntry in @($script:CoreAppxPackageCatalog)) {
+    if ($appxEntry.Role -eq "Optional") { $appxEntry.Confidence = "Medium" }
+}
+$null = Initialize-RestoreBaselineCatalogMetadata -Catalog $script:DebloatToolFingerprints -CatalogKind "DebloatFingerprint" -SourceUrl $script:BaselineCatalogSourceUrl -PolicyMapping "Repository evidence indicator catalog" -Confidence "Medium" -EvidenceType "ExplicitIndicator"
+$null = Initialize-RestoreBaselineCatalogMetadata -Catalog $script:ServiceTaskFingerprintCatalog -CatalogKind "ServiceTaskFingerprint" -SourceUrl $script:BaselineCatalogSourceUrl -PolicyMapping "Repository evidence service/task catalog" -Confidence "Medium" -EvidenceType "ExplicitIndicator"
+$null = Initialize-RestoreBaselineCatalogMetadata -Catalog $script:ScheduledTaskRestoreMatrix -CatalogKind "ScheduledTaskBaseline" -SourceUrl $script:BaselineCatalogSourceUrl -PolicyMapping "Repository scheduled-task restoration matrix" -Confidence "Medium" -EvidenceType "ExplicitIndicator"
+
+function Get-RestoreBaselineContext {
+    [CmdletBinding()]
+    param([object]$MachineProfile)
+    $catalogMachineProfile = if ($MachineProfile) { $MachineProfile } elseif ($script:CapabilityProfile) { $script:CapabilityProfile } else {
+        try { Get-RestoreMachineProfile } catch { $null }
+    }
+    $family = if ($catalogMachineProfile -and $catalogMachineProfile.PSObject.Properties["ProductFamily"]) { [string]$catalogMachineProfile.ProductFamily } else { $null }
+    if ([string]::IsNullOrWhiteSpace($family) -and $catalogMachineProfile -and $catalogMachineProfile.PSObject.Properties["ProductName"]) {
+        $family = if ([string]$catalogMachineProfile.ProductName -match "Windows\s+11") { "Windows 11" } elseif ([string]$catalogMachineProfile.ProductName -match "Windows\s+10") { "Windows 10" } else { $null }
+    }
+    $edition = $null
+    foreach ($propertyName in @("Edition","EditionID","InstallationType")) {
+        if ($catalogMachineProfile -and $catalogMachineProfile.PSObject.Properties[$propertyName] -and -not [string]::IsNullOrWhiteSpace([string]$catalogMachineProfile.$propertyName)) {
+            $edition = [string]$catalogMachineProfile.$propertyName
+            break
+        }
+    }
+    $build = $null
+    foreach ($propertyName in @("Build","CurrentBuild","CurrentBuildNumber")) {
+        $candidate = 0
+        if ($catalogMachineProfile -and $catalogMachineProfile.PSObject.Properties[$propertyName] -and [int]::TryParse([string]$catalogMachineProfile.$propertyName,[ref]$candidate)) {
+            $build = $candidate
+            break
+        }
+    }
+    return [pscustomobject][ordered]@{
+        Status=if ($family -and $edition -and $null -ne $build) { "Known" } else { "Unknown" }
+        ProductFamily=$family; Edition=$edition; Build=$build; MachineProfile=$catalogMachineProfile
+    }
+}
+
+function Get-RestoreCatalogValue {
+    param([Parameter(Mandatory=$true)][object]$Entry,[Parameter(Mandatory=$true)][string]$Name)
+    if ($Entry -is [System.Collections.IDictionary] -and $Entry.Contains($Name)) { return $Entry[$Name] }
+    if ($Entry.PSObject.Properties[$Name]) { return $Entry.PSObject.Properties[$Name].Value }
+    return $null
+}
+
+function Get-RestoreCatalogEntryEvaluation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][object]$Entry,
+        [Parameter(Mandatory=$true)][object]$Context
+    )
+    $catalogVersion = [string](Get-RestoreCatalogValue -Entry $Entry -Name "CatalogVersion")
+    $sourceUrl = [string](Get-RestoreCatalogValue -Entry $Entry -Name "SourceUrl")
+    $policyMapping = [string](Get-RestoreCatalogValue -Entry $Entry -Name "PolicyMapping")
+    $families = @((Get-RestoreCatalogValue -Entry $Entry -Name "SupportedProductFamilies"))
+    $buildRanges = Get-RestoreCatalogValue -Entry $Entry -Name "SupportedBuildRangeByFamily"
+    $editions = @((Get-RestoreCatalogValue -Entry $Entry -Name "SupportedEditions"))
+    $confidence = [string](Get-RestoreCatalogValue -Entry $Entry -Name "Confidence")
+    $evidenceType = [string](Get-RestoreCatalogValue -Entry $Entry -Name "EvidenceType")
+    $missing = @()
+    if ([string]::IsNullOrWhiteSpace($catalogVersion)) { $missing += "catalog version" }
+    if ([string]::IsNullOrWhiteSpace($sourceUrl) -and [string]::IsNullOrWhiteSpace($policyMapping)) { $missing += "source URL or policy mapping" }
+    if ($families.Count -eq 0) { $missing += "supported product families" }
+    if (-not $buildRanges) { $missing += "supported build range" }
+    if ($editions.Count -eq 0) { $missing += "supported editions" }
+    if ([string]::IsNullOrWhiteSpace($confidence)) { $missing += "confidence" }
+    if ([string]::IsNullOrWhiteSpace($evidenceType)) { $missing += "evidence type" }
+    $status = "Verified"
+    $warning = $null
+    if ($missing.Count -gt 0) {
+        $status = "Unknown"
+        $warning = "Catalog entry is missing: $($missing -join ', ')"
+    } elseif ($Context.Status -ne "Known") {
+        $status = "Unknown"
+        $warning = "Operating-system build or edition is unknown; the entry is not eligible for automatic fixes"
+    } elseif ($Context.ProductFamily -notin $families) {
+        $status = "Unsupported"
+        $warning = "Catalog does not support product family $($Context.ProductFamily)"
+    } elseif ($editions -notcontains "All" -and $Context.Edition -notin $editions) {
+        $status = "Unsupported"
+        $warning = "Catalog does not support edition $($Context.Edition)"
+    } else {
+        $range = if ($buildRanges -is [System.Collections.IDictionary]) { $buildRanges[$Context.ProductFamily] } else { $null }
+        if (-not $range) {
+            $status = "Unsupported"
+            $warning = "Catalog has no build range for product family $($Context.ProductFamily)"
+        } elseif ($Context.Build -lt [int]$range.Minimum -or ($null -ne $range.Maximum -and $Context.Build -gt [int]$range.Maximum)) {
+            $status = "Unsupported"
+            $warning = "Build $($Context.Build) is outside the catalog range for $($Context.ProductFamily)"
+        }
+    }
+    return [pscustomobject][ordered]@{
+        CatalogSchemaVersion=Get-RestoreCatalogValue -Entry $Entry -Name "CatalogSchemaVersion"
+        CatalogVersion=$catalogVersion; CatalogKind=[string](Get-RestoreCatalogValue -Entry $Entry -Name "CatalogKind")
+        SourceUrl=$sourceUrl; PolicyMapping=$policyMapping
+        SupportedProductFamilies=$families; SupportedBuildRange=[string](Get-RestoreCatalogValue -Entry $Entry -Name "SupportedBuildRange")
+        SupportedBuildRangeByFamily=$buildRanges; SupportedEditions=$editions
+        Confidence=$confidence; EvidenceType=$evidenceType
+        CatalogStatus=$status; CanAutoFix=($status -eq "Verified"); Warning=$warning
+    }
+}
+
+function Get-RestoreBaselineCatalogReport {
+    [CmdletBinding()]
+    param([object]$MachineProfile)
+    $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
+    $catalogSets = @(
+        [pscustomobject]@{Kind="RegistryDefault";Entries=@($script:RegistryDefaultCatalog);NameProperty="Name"},
+        [pscustomobject]@{Kind="AppXBaseline";Entries=@($script:CoreAppxPackageCatalog);NameProperty="Name"},
+        [pscustomobject]@{Kind="DebloatFingerprint";Entries=@($script:DebloatToolFingerprints);NameProperty="Name"},
+        [pscustomobject]@{Kind="ServiceTaskFingerprint";Entries=@($script:ServiceTaskFingerprintCatalog);NameProperty="Tool"},
+        [pscustomobject]@{Kind="ScheduledTaskBaseline";Entries=@($script:ScheduledTaskRestoreMatrix);NameProperty="N"}
+    )
+    $entries = @()
+    foreach ($catalogSet in $catalogSets) {
+        foreach ($entry in @($catalogSet.Entries)) {
+            $evaluation = Get-RestoreCatalogEntryEvaluation -Entry $entry -Context $context
+            $nameValue = Get-RestoreCatalogValue -Entry $entry -Name $catalogSet.NameProperty
+            $name = if ($null -ne $nameValue) { [string]$nameValue } else { $catalogSet.Kind }
+            $entries += [pscustomobject][ordered]@{
+                CatalogKind=$catalogSet.Kind; Name=$name; CatalogSchemaVersion=$evaluation.CatalogSchemaVersion
+                CatalogVersion=$evaluation.CatalogVersion; SourceUrl=$evaluation.SourceUrl; PolicyMapping=$evaluation.PolicyMapping
+                SupportedProductFamilies=$evaluation.SupportedProductFamilies; SupportedBuildRange=$evaluation.SupportedBuildRange
+                SupportedEditions=$evaluation.SupportedEditions; Confidence=$evaluation.Confidence
+                EvidenceType=$evaluation.EvidenceType; CatalogStatus=$evaluation.CatalogStatus
+                CanAutoFix=$evaluation.CanAutoFix; Warning=$evaluation.Warning
+            }
+        }
+    }
+    $warnings = @($entries | Where-Object { $_.CatalogStatus -ne "Verified" })
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:BaselineCatalogSchemaVersion; CatalogVersion=$script:BaselineCatalogVersion
+        CapturedAtUtc=(Get-Date).ToUniversalTime().ToString("o"); Status=if ($warnings.Count) { "Warnings" } else { "Ready" }
+        SourceUrl=$script:BaselineCatalogSourceUrl; Context=$context; Entries=@($entries); Warnings=$warnings
+    }
+}
+
 function Get-DebloatToolFingerprintReport {
     param(
         [object[]]$Catalog = $script:DebloatToolFingerprints,
-        [switch]$IncludeUndetected
+        [switch]$IncludeUndetected,
+        [object]$MachineProfile
     )
+    $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
     $reports = @()
     foreach ($tool in $Catalog) {
+        $catalog = Get-RestoreCatalogEntryEvaluation -Entry $tool -Context $context
         $evidence = @()
         foreach ($indicator in @($tool.Indicators)) {
             try {
@@ -949,9 +1143,14 @@ function Get-DebloatToolFingerprintReport {
         $detected = $evidence.Count -gt 0
         if ($detected -or $IncludeUndetected) {
             $confidence = if ($evidence.Count -ge 2) { "High" } elseif ($detected) { "Medium" } else { "None" }
-            $reports += [pscustomobject]@{
-                Tool=$tool.Name; Detected=$detected; Confidence=$confidence
-                Evidence=@($evidence); FixKeys=@($tool.FixKeys)
+            $reports += [pscustomobject][ordered]@{
+                Tool=$tool.Name; Detected=$detected; Confidence=$confidence; CatalogConfidence=$catalog.Confidence
+                Evidence=@($evidence); FixKeys=if($catalog.CanAutoFix){@($tool.FixKeys)}else{@()}
+                CatalogSchemaVersion=$catalog.CatalogSchemaVersion; CatalogVersion=$catalog.CatalogVersion; CatalogKind=$catalog.CatalogKind
+                SourceUrl=$catalog.SourceUrl; PolicyMapping=$catalog.PolicyMapping; SupportedProductFamilies=$catalog.SupportedProductFamilies
+                SupportedBuildRange=$catalog.SupportedBuildRange; SupportedEditions=$catalog.SupportedEditions
+                EvidenceType=$catalog.EvidenceType; CatalogStatus=$catalog.CatalogStatus; CanAutoFix=$catalog.CanAutoFix
+                Warning=$catalog.Warning
             }
         }
     }
@@ -962,10 +1161,13 @@ function Get-ScheduledTaskRestoreMatrix {
     param(
         [object[]]$Matrix = $script:ScheduledTaskRestoreMatrix,
         [switch]$IncludeHealthy,
-        [scriptblock]$TaskProvider
+        [scriptblock]$TaskProvider,
+        [object]$MachineProfile
     )
+    $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
     $results = @()
     foreach ($entry in $Matrix) {
+        $catalog = Get-RestoreCatalogEntryEvaluation -Entry $entry -Context $context
         $task = $null
         try {
             if ($TaskProvider) { $task = & $TaskProvider $entry.P $entry.N }
@@ -973,9 +1175,14 @@ function Get-ScheduledTaskRestoreMatrix {
         } catch { $task = $null }
         $state = if (-not $task) { "Missing" } elseif ($task.State -and $task.State.ToString() -eq "Disabled") { "Disabled" } else { "Enabled" }
         if ($IncludeHealthy -or $state -ne "Enabled") {
-            $results += [pscustomobject]@{
+            $results += [pscustomobject][ordered]@{
                 ToolSources=@($entry.Tools); Source=$entry.Source; Path=$entry.P; Name=$entry.N
                 Category=$entry.Category; State=$state; NeedsRestore=($state -eq "Disabled")
+                CatalogSchemaVersion=$catalog.CatalogSchemaVersion; CatalogVersion=$catalog.CatalogVersion; CatalogKind=$catalog.CatalogKind
+                SourceUrl=$catalog.SourceUrl; PolicyMapping=$catalog.PolicyMapping; SupportedProductFamilies=$catalog.SupportedProductFamilies
+                SupportedBuildRange=$catalog.SupportedBuildRange; SupportedEditions=$catalog.SupportedEditions
+                Confidence=$catalog.Confidence; EvidenceType=$catalog.EvidenceType; CatalogStatus=$catalog.CatalogStatus
+                CanAutoFix=$catalog.CanAutoFix; Warning=$catalog.Warning
             }
         }
     }
@@ -987,10 +1194,13 @@ function Get-ServiceTaskFingerprintReport {
         [object[]]$Catalog = $script:ServiceTaskFingerprintCatalog,
         [switch]$IncludeHealthy,
         [scriptblock]$ServiceProvider,
-        [scriptblock]$TaskProvider
+        [scriptblock]$TaskProvider,
+        [object]$MachineProfile
     )
+    $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
     $results = @()
     foreach ($definition in $Catalog) {
+        $catalog = Get-RestoreCatalogEntryEvaluation -Entry $definition -Context $context
         foreach ($serviceName in @($definition.Services)) {
             $service = $null
             try {
@@ -1000,9 +1210,14 @@ function Get-ServiceTaskFingerprintReport {
             if ($service) {
                 $disabled = $service.StartType.ToString() -eq "Disabled"
                 if ($IncludeHealthy -or $disabled) {
-                    $results += [pscustomobject]@{
+                    $results += [pscustomobject][ordered]@{
                         Tool=$definition.Tool; Kind="Service"; Name=$serviceName
                         Path=$null; State=$service.StartType.ToString(); NeedsRestore=$disabled
+                        CatalogSchemaVersion=$catalog.CatalogSchemaVersion; CatalogVersion=$catalog.CatalogVersion; CatalogKind=$catalog.CatalogKind
+                        SourceUrl=$catalog.SourceUrl; PolicyMapping=$catalog.PolicyMapping; SupportedProductFamilies=$catalog.SupportedProductFamilies
+                        SupportedBuildRange=$catalog.SupportedBuildRange; SupportedEditions=$catalog.SupportedEditions
+                        Confidence=$catalog.Confidence; EvidenceType=$catalog.EvidenceType; CatalogStatus=$catalog.CatalogStatus
+                        CanAutoFix=$catalog.CanAutoFix; Warning=$catalog.Warning
                     }
                 }
             }
@@ -1016,9 +1231,14 @@ function Get-ServiceTaskFingerprintReport {
             if ($task) {
                 $disabled = $task.State -and $task.State.ToString() -eq "Disabled"
                 if ($IncludeHealthy -or $disabled) {
-                    $results += [pscustomobject]@{
+                    $results += [pscustomobject][ordered]@{
                         Tool=$definition.Tool; Kind="Task"; Name=$taskInfo.N
                         Path=$taskInfo.P; State=$task.State.ToString(); NeedsRestore=$disabled
+                        CatalogSchemaVersion=$catalog.CatalogSchemaVersion; CatalogVersion=$catalog.CatalogVersion; CatalogKind=$catalog.CatalogKind
+                        SourceUrl=$catalog.SourceUrl; PolicyMapping=$catalog.PolicyMapping; SupportedProductFamilies=$catalog.SupportedProductFamilies
+                        SupportedBuildRange=$catalog.SupportedBuildRange; SupportedEditions=$catalog.SupportedEditions
+                        Confidence=$catalog.Confidence; EvidenceType=$catalog.EvidenceType; CatalogStatus=$catalog.CatalogStatus
+                        CanAutoFix=$catalog.CanAutoFix; Warning=$catalog.Warning
                     }
                 }
             }
@@ -1146,8 +1366,10 @@ function Get-AppxPackageRemovalReport {
     param(
         [object[]]$ExpectedPackages = $script:CoreAppxPackageCatalog,
         [object[]]$InstalledPackages,
-        [object[]]$ProvisionedPackages
+        [object[]]$ProvisionedPackages,
+        [object]$MachineProfile
     )
+    $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
     if ($PSBoundParameters.ContainsKey('InstalledPackages')) { $installed = @($InstalledPackages) }
     else { $installed = @(Get-AppxPackageSafe) }
     if ($PSBoundParameters.ContainsKey('ProvisionedPackages')) { $provisioned = @($ProvisionedPackages) }
@@ -1160,20 +1382,39 @@ function Get-AppxPackageRemovalReport {
     $provisionedNames = @($provisioned | ForEach-Object {
         if ($_.DisplayName) { [string]$_.DisplayName } elseif ($_.PackageName) { [string]$_.PackageName } else { [string]$_ }
     })
-    $missing = @(); $present = @(); $provisionedOnly = @()
+    $missing = @(); $present = @(); $provisionedOnly = @(); $findings = @()
     foreach ($expected in @($ExpectedPackages)) {
         $name = if ($expected -is [string]) { $expected } elseif ($expected.Name) { [string]$expected.Name } else { [string]$expected }
-        $installedMatch = @($installedNames | Where-Object { $_ -eq $name -or $_ -like "${name}_*" }).Count -gt 0
-        $provisionedMatch = @($provisionedNames | Where-Object { $_ -eq $name -or $_ -like "${name}_*" }).Count -gt 0
-        if ($installedMatch) { $present += $name }
-        elseif ($provisionedMatch) { $provisionedOnly += $name }
+        $role = if ($expected -is [string]) { $null } else { [string](Get-RestoreCatalogValue -Entry $expected -Name "Role") }
+        $catalog = if ($expected -is [string]) {
+            [pscustomobject][ordered]@{CatalogSchemaVersion=$null;CatalogVersion=$null;CatalogKind=$null;SourceUrl=$null;PolicyMapping=$null;SupportedProductFamilies=@();SupportedBuildRange=$null;SupportedEditions=@();Confidence=$null;EvidenceType=$null;CatalogStatus="Unknown";CanAutoFix=$false;Warning="Package is not linked to a versioned baseline catalog"}
+        } else { Get-RestoreCatalogEntryEvaluation -Entry $expected -Context $context }
+        $installedMatch = @($installedNames | Where-Object { $_ -eq $name -or $_ -like ($name + "_*") }).Count -gt 0
+        $provisionedMatch = @($provisionedNames | Where-Object { $_ -eq $name -or $_ -like ($name + "_*") }).Count -gt 0
+        $status = if ($installedMatch) { "Present" } elseif ($provisionedMatch) { "ProvisionedOnly" } else { "Missing" }
+        if ($status -eq "Present") { $present += $name }
+        elseif ($status -eq "ProvisionedOnly") { $provisionedOnly += $name }
         else { $missing += $name }
+        $findings += [pscustomobject][ordered]@{
+            Name=$name; Role=$role; Status=$status; CatalogSchemaVersion=$catalog.CatalogSchemaVersion
+            CatalogVersion=$catalog.CatalogVersion; CatalogKind=$catalog.CatalogKind; SourceUrl=$catalog.SourceUrl
+            PolicyMapping=$catalog.PolicyMapping; SupportedProductFamilies=$catalog.SupportedProductFamilies
+            SupportedBuildRange=$catalog.SupportedBuildRange; SupportedEditions=$catalog.SupportedEditions
+            Confidence=$catalog.Confidence; EvidenceType=$catalog.EvidenceType; CatalogStatus=$catalog.CatalogStatus
+            CanAutoFix=$catalog.CanAutoFix; Warning=$catalog.Warning
+        }
     }
+    $catalogWarnings = @($findings | Where-Object { $_.CatalogStatus -ne "Verified" })
+    $confidence = if ($catalogWarnings.Count) { "Unknown" } elseif (@($findings | Where-Object Confidence -eq "Medium").Count) { "Medium" } else { "High" }
     return [pscustomobject][ordered]@{
         ExpectedCount=@($ExpectedPackages).Count; InstalledCount=$installedNames.Count
         ProvisionedCount=$provisionedNames.Count; Present=@($present)
         ProvisionedOnly=@($provisionedOnly); Missing=@($missing)
         MissingCount=$missing.Count; ProvisionedOnlyCount=$provisionedOnly.Count
+        SchemaVersion=$script:BaselineCatalogSchemaVersion; CatalogVersion=$script:BaselineCatalogVersion
+        CatalogKind="AppXBaseline"; CatalogStatus=if($catalogWarnings.Count){"Warnings"}else{"Verified"}
+        Confidence=$confidence; CanAutoFix=($catalogWarnings.Count -eq 0); Findings=@($findings)
+        UnknownExpectedPackages=@($catalogWarnings.Name); Warnings=@($catalogWarnings | ForEach-Object { $_.Warning })
     }
 }
 
@@ -4126,6 +4367,8 @@ function Invoke-RestoreActionPlan {
 
 function Get-SystemHealthReport {
     $report = [ordered]@{}
+    $baselineContext = Get-RestoreBaselineContext
+    $script:BaselineCatalogContext = $baselineContext
     $addCat = {
         param($name, $fn, $issues, $details, $sev, $keys)
         if (!$details -or $details.Count -eq 0) { $details = $issues }
@@ -4136,21 +4379,25 @@ function Get-SystemHealthReport {
     }
 
     # --- Debloat tool fingerprints and source-attributed service/task evidence ---
-    $detectedTools = @(Get-DebloatToolFingerprintReport)
+    $detectedTools = @(Get-DebloatToolFingerprintReport -MachineProfile $baselineContext.MachineProfile)
     $toolDetails = @()
     $toolFixKeys = @()
     foreach ($tool in $detectedTools) {
         $toolDetails += "$($tool.Tool) detected ($($tool.Confidence) confidence)"
+        if ($tool.CatalogVersion) { $toolDetails += "  Catalog $($tool.CatalogVersion); source $($tool.SourceUrl); scope $($tool.SupportedBuildRange); catalog confidence $($tool.CatalogConfidence)" }
         $toolDetails += @($tool.Evidence | ForEach-Object { "  $_" })
-        $toolFixKeys += @($tool.FixKeys)
+        if ($tool.CanAutoFix) { $toolFixKeys += @($tool.FixKeys) }
+        elseif ($tool.Warning) { $toolDetails += "  Catalog warning: $($tool.Warning)" }
     }
     $fingerprintFindings = @()
     if ($detectedTools.Count -gt 0) {
-        $fingerprintFindings = @(Get-ServiceTaskFingerprintReport)
+        $fingerprintFindings = @(Get-ServiceTaskFingerprintReport -MachineProfile $baselineContext.MachineProfile)
         foreach ($finding in $fingerprintFindings) {
             $stateText = if ($finding.Kind -eq "Service") { "service $($finding.Name)" } else { "task $($finding.Path)$($finding.Name)" }
             $toolDetails += "$($finding.Tool): $stateText is $($finding.State)"
-            if ($finding.Kind -eq "Service") { $toolFixKeys += "chkServices" } else { $toolFixKeys += "chkTasks" }
+            if ($finding.CanAutoFix) {
+                if ($finding.Kind -eq "Service") { $toolFixKeys += "chkServices" } else { $toolFixKeys += "chkTasks" }
+            } elseif ($finding.Warning) { $toolDetails += "  Catalog warning: $($finding.Warning)" }
         }
     }
     $toolFixKeys = @($toolFixKeys | Select-Object -Unique)
@@ -4160,7 +4407,7 @@ function Get-SystemHealthReport {
     $toolSeverity = if ($fingerprintFindings.Count -gt 0) { "Medium" } elseif ($detectedTools.Count -gt 0) { "Low" } else { "OK" }
     & $addCat "DebloatTools" "Debloat Tool Footprints" $toolIssues $toolDetails $toolSeverity $toolFixKeys
     $script:ToolFingerprintReport = $detectedTools
-    $script:TaskRestoreMatrixReport = @(Get-ScheduledTaskRestoreMatrix)
+    $script:TaskRestoreMatrixReport = @(Get-ScheduledTaskRestoreMatrix -MachineProfile $baselineContext.MachineProfile)
 
     # --- Windows Defender ---
     $issues = @(); $details = @()
@@ -4314,14 +4561,18 @@ function Get-SystemHealthReport {
     # --- Store/Apps ---
     $issues = @(); $details = @()
     $appCatalog = @($script:CoreAppxPackageCatalog | Where-Object { $_.Role -eq "Core" })
-    $appReport = Get-AppxPackageRemovalReport -ExpectedPackages $appCatalog
+    $appReport = Get-AppxPackageRemovalReport -ExpectedPackages $appCatalog -MachineProfile $baselineContext.MachineProfile
     $script:AppxRemovalReport = $appReport
+    if ($appReport.Findings.Count) { $details += "Baseline catalog $($appReport.CatalogVersion); source $script:BaselineAppxSourceUrl; confidence $($appReport.Confidence)" }
     foreach ($missingName in @($appReport.Missing)) {
         $friendly = ($appCatalog | Where-Object { $_.Name -eq $missingName } | Select-Object -First 1).Name
         $issues += "$friendly removed"; $details += "Missing from current user and provisioned image: $missingName"
     }
     foreach ($provisionedName in @($appReport.ProvisionedOnly)) {
         $details += "Provisioned but not registered for current user: $provisionedName"
+    }
+    foreach ($catalogWarning in @($appReport.Warnings)) {
+        $details += "Baseline catalog warning: $catalogWarning"
     }
     & $addCat "StoreApps" "Windows Apps" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkAppx")
 
@@ -6828,6 +7079,12 @@ Set-Alias -Name Restore-LocalGroupPolicyDefaults -Value Restore-LocalGroupPolicy
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
+
+if ($BaselineReport) {
+    $catalogReportDocument = Get-RestoreBaselineCatalogReport
+    Write-Output ($catalogReportDocument | ConvertTo-Json -Depth 30)
+    exit 0
+}
 
 if ($CapabilityReport) {
     $capabilityKeys = if ($RestoreCategories) { @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { $null }
