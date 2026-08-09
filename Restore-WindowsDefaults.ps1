@@ -8,7 +8,11 @@ param(
     [switch]$SecurityReset,
     [switch]$RebuildSearch,
     [switch]$ScheduleRestore,
+    [switch]$CancelScheduledRestore,
+    [switch]$ScheduledRestoreStatus,
     [switch]$ResumeScheduledRestore,
+    [ValidateRange(1,168)][int]$ScheduleExpiryHours = 24,
+    [string]$ScheduledRestorePath,
     [switch]$ResumeRestoreJournal,
     [switch]$RollbackLastRun,
     [string]$RestoreCategories,
@@ -74,8 +78,17 @@ $script:RollbackJournalSchemaVersion = 2
 $script:RollbackJournalMaxEntries = 10
 $script:RollbackJournalMaxBytes = 50MB
 $script:RollbackInlineFileBytes = 4MB
+$script:RollbackDirectoryOverride = $null
 $script:ActiveRollbackJournalPath = $null
 $script:ActiveRollbackJournal = $null
+$script:ScheduledRestoreSchemaVersion = 2
+$script:ScheduledRestoreDefaultExpiryHours = 24
+$script:ScheduledRestoreMaxBytes = 1MB
+$script:ScheduledRestoreDirectoryOverride = $null
+$script:ScheduledRestoreRunOncePathOverride = $null
+$script:ScheduledRestoreRunOnceReadProvider = $null
+$script:ScheduledRestoreRunOnceWriteProvider = $null
+$script:ScheduledRestoreRunOnceRemoveProvider = $null
 $script:ExternalImportSchemaVersion = 2
 $script:ExternalImportMaxBytes = 2MB
 $script:ExternalImportMaxLines = 5000
@@ -118,7 +131,11 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($SecurityReset) { $relaunchArgs += "-SecurityReset" }
     if ($RebuildSearch) { $relaunchArgs += "-RebuildSearch" }
     if ($ScheduleRestore) { $relaunchArgs += "-ScheduleRestore" }
+    if ($CancelScheduledRestore) { $relaunchArgs += "-CancelScheduledRestore" }
+    if ($ScheduledRestoreStatus) { $relaunchArgs += "-ScheduledRestoreStatus" }
     if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
+    if ($ScheduleExpiryHours -ne 24) { $relaunchArgs += @("-ScheduleExpiryHours", $ScheduleExpiryHours) }
+    if ($ScheduledRestorePath) { $relaunchArgs += @("-ScheduledRestorePath", "`"$ScheduledRestorePath`"") }
     if ($ResumeRestoreJournal) { $relaunchArgs += "-ResumeRestoreJournal" }
     if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
     if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
@@ -146,7 +163,11 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($SecurityReset) { $relaunchArgs += "-SecurityReset" }
     if ($RebuildSearch) { $relaunchArgs += "-RebuildSearch" }
     if ($ScheduleRestore) { $relaunchArgs += "-ScheduleRestore" }
+    if ($CancelScheduledRestore) { $relaunchArgs += "-CancelScheduledRestore" }
+    if ($ScheduledRestoreStatus) { $relaunchArgs += "-ScheduledRestoreStatus" }
     if ($ResumeScheduledRestore) { $relaunchArgs += "-ResumeScheduledRestore" }
+    if ($ScheduleExpiryHours -ne 24) { $relaunchArgs += @("-ScheduleExpiryHours", $ScheduleExpiryHours) }
+    if ($ScheduledRestorePath) { $relaunchArgs += @("-ScheduledRestorePath", "`"$ScheduledRestorePath`"") }
     if ($ResumeRestoreJournal) { $relaunchArgs += "-ResumeRestoreJournal" }
     if ($RollbackLastRun) { $relaunchArgs += "-RollbackLastRun" }
     if ($RestoreCategories) { $relaunchArgs += @("-RestoreCategories", "`"$RestoreCategories`"") }
@@ -6133,7 +6154,7 @@ function Get-RestoreImpactPreview {
 function Get-RestoreRollbackDirectory {
     [CmdletBinding()]
     param([switch]$Create)
-    $directory = Join-Path $env:ProgramData "Restore-WindowsDefaults\rollback"
+    $directory = if ($script:RollbackDirectoryOverride) { [System.IO.Path]::GetFullPath([string]$script:RollbackDirectoryOverride) } else { Join-Path $env:ProgramData "Restore-WindowsDefaults\rollback" }
     if ($Create -and -not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
     return $directory
 }
@@ -6702,59 +6723,326 @@ function Resume-RestoreRollbackJournal {
     return [pscustomobject]@{Success=($result.Errors -eq 0);State=$finalState;JournalPath=$JournalPath;Errors=[int]$result.Errors;Changed=[int]$result.Changed}
 }
 
+function Get-RestoreScheduledDirectory {
+    $directory = if ($script:ScheduledRestoreDirectoryOverride) { [System.IO.Path]::GetFullPath([string]$script:ScheduledRestoreDirectoryOverride) } else { Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled" }
+    return $directory
+}
+
+function Get-RestoreScheduledRunOncePath {
+    if ($script:ScheduledRestoreRunOncePathOverride) { return [string]$script:ScheduledRestoreRunOncePathOverride }
+    return "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
+}
+
+function Get-RestoreScheduledRunOnceValue {
+    [CmdletBinding()]
+    param([string]$Path=(Get-RestoreScheduledRunOncePath),[string]$Name="RestoreWindowsDefaults")
+    if ($script:ScheduledRestoreRunOnceReadProvider) { return (& $script:ScheduledRestoreRunOnceReadProvider $Path $Name) }
+    try { return (Get-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop).$Name } catch { return $null }
+}
+
+function Set-RestoreScheduledRunOnceValue {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][string]$Path,[string]$Name="RestoreWindowsDefaults",[Parameter(Mandatory=$true)][string]$Value)
+    if (-not $PSCmdlet.ShouldProcess("RunOnce:$Name", "register scheduled restore boot trigger")) { return $false }
+    if ($script:ScheduledRestoreRunOnceWriteProvider) { return (& $script:ScheduledRestoreRunOnceWriteProvider $Path $Name $Value) }
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+    Set-ItemProperty -LiteralPath $Path -Name $Name -Value $Value -Type String -Force -ErrorAction Stop
+    return $true
+}
+
+function Remove-RestoreScheduledRunOnceValue {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([string]$Path=(Get-RestoreScheduledRunOncePath),[string]$Name="RestoreWindowsDefaults")
+    if (-not $PSCmdlet.ShouldProcess("RunOnce:$Name", "remove scheduled restore boot trigger")) { return $false }
+    if ($script:ScheduledRestoreRunOnceRemoveProvider) { return (& $script:ScheduledRestoreRunOnceRemoveProvider $Path $Name) }
+    Remove-ItemProperty -LiteralPath $Path -Name $Name -Force -ErrorAction SilentlyContinue
+    return $true
+}
+
+function Get-RestoreScheduledJobIntegrityPayload {
+    param([Parameter(Mandatory=$true)][object]$Job)
+    $payload = [ordered]@{}
+    foreach ($property in @($Job.PSObject.Properties)) {
+        if ($property.Name -ne "Integrity") { $payload[$property.Name] = $property.Value }
+    }
+    return [pscustomobject]$payload
+}
+
+function Set-RestoreScheduledJobIntegrity {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Job)
+    if (-not $PSCmdlet.ShouldProcess("scheduled restore job", "refresh integrity hash")) { return $Job }
+    $Job.Integrity = [pscustomobject][ordered]@{
+        Algorithm="SHA256"; JobHash=(Get-RestoreJsonSha256 -Value (Get-RestoreScheduledJobIntegrityPayload -Job $Job))
+    }
+    return $Job
+}
+
+function Write-RestoreScheduledJob {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Job,[Parameter(Mandatory=$true)][string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $PSCmdlet.ShouldProcess($fullPath, "write the scheduled restore job")) { return $null }
+    $null = Set-RestoreScheduledJobIntegrity -Job $Job -Confirm:$false
+    return (Write-RestoreAtomicJson -Path $fullPath -Value $Job -Depth 30)
+}
+
+function Test-RestoreScheduledPathUnder {
+    param([Parameter(Mandatory=$true)][string]$Path,[Parameter(Mandatory=$true)][string]$Directory)
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $fullDirectory = [System.IO.Path]::GetFullPath($Directory).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        return $fullPath.StartsWith($fullDirectory + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Test-RestoreScheduledRollbackReference {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $directory = Get-RestoreRollbackDirectory
+    return (Test-RestoreScheduledPathUnder -Path $Path -Directory $directory) -and ([System.IO.Path]::GetFileName($Path) -match '^journal-[^\\/]+\.json$')
+}
+
+function Read-RestoreScheduledJob {
+    [CmdletBinding()]
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $directory = Get-RestoreScheduledDirectory
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-RestoreScheduledPathUnder -Path $fullPath -Directory $directory)) { throw "Scheduled restore path is outside the job directory" }
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "Scheduled restore job not found: $fullPath" }
+    $file = Get-Item -LiteralPath $fullPath -ErrorAction Stop
+    if ($file.Length -gt $script:ScheduledRestoreMaxBytes) { throw "Scheduled restore job exceeds the maximum supported size" }
+    try { $job = [System.IO.File]::ReadAllText($fullPath) | ConvertFrom-Json -ErrorAction Stop } catch { throw "Scheduled restore job is not valid JSON: $($_.Exception.Message)" }
+    if ([int]$job.SchemaVersion -ne $script:ScheduledRestoreSchemaVersion) { throw "Unsupported scheduled restore schema: $($job.SchemaVersion)" }
+    if (-not $job.PSObject.Properties["Integrity"] -or [string]$job.Integrity.Algorithm -ne "SHA256") { throw "Scheduled restore job integrity metadata is missing" }
+    $expectedHash = (Get-RestoreJsonSha256 -Value (Get-RestoreScheduledJobIntegrityPayload -Job $job))
+    if ([string]$job.Integrity.JobHash -ne $expectedHash) { throw "Scheduled restore job integrity validation failed" }
+    if ([string]$job.JobId -notmatch '^[0-9a-fA-F-]{36}$') { throw "Scheduled restore job identifier is invalid" }
+    if ([string]$job.PlanHash -notmatch '^[a-fA-F0-9]{64}$') { throw "Scheduled restore plan hash is invalid" }
+    if (-not $job.PSObject.Properties["RollbackReference"] -or -not (Test-RestoreScheduledRollbackReference -Path ([string]$job.RollbackReference.Path))) { throw "Scheduled restore rollback reference is invalid" }
+    if ([string]$job.Status -notin @("Scheduled","Executing","Completed","Failed","Cancelled","Expired","RegistrationFailed")) { throw "Scheduled restore job state is invalid: $($job.Status)" }
+    $created = [DateTime]::Parse([string]$job.CreatedAtUtc).ToUniversalTime()
+    $expires = [DateTime]::Parse([string]$job.ExpiresAtUtc).ToUniversalTime()
+    if ($expires -le $created) { throw "Scheduled restore expiry must be after creation" }
+    $job | Add-Member -NotePropertyName JobPath -NotePropertyValue $fullPath -Force
+    return $job
+}
+
+function Get-RestoreScheduledJobPath {
+    param([string]$JobPath)
+    if ($JobPath) { return @([System.IO.Path]::GetFullPath($JobPath)) }
+    $directory = Get-RestoreScheduledDirectory
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) { return @() }
+    return @(Get-ChildItem -LiteralPath $directory -Filter "restore-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTimeUtc -Descending | ForEach-Object FullName)
+}
+
+function ConvertTo-RestoreScheduledJobStatus {
+    param([Parameter(Mandatory=$true)][object]$Job)
+    $expires = [DateTime]::Parse([string]$Job.ExpiresAtUtc).ToUniversalTime()
+    $expired = $Job.Status -in @("Scheduled","Executing") -and (Get-Date).ToUniversalTime() -ge $expires
+    $incomplete = $Job.Status -eq "Scheduled" -and [string]$Job.RegistrationState -ne "Registered"
+    [pscustomobject][ordered]@{
+        JobId=$Job.JobId; JobPath=$Job.JobPath; Status=if($expired){"Expired"}elseif($incomplete){"RegistrationIncomplete"}else{[string]$Job.Status}; StoredStatus=$Job.Status
+        Owner=$Job.Owner; OwnerComputer=$Job.OwnerComputer; CreatedAtUtc=$Job.CreatedAtUtc; ExpiresAtUtc=$Job.ExpiresAtUtc
+        SelectedKeys=@($Job.SelectedKeys); RestoreScope=$Job.RestoreScope; OfflineImagePath=$Job.OfflineImagePath
+        PlanHash=$Job.PlanHash; RollbackReference=$Job.RollbackReference; AttemptCount=[int]$Job.AttemptCount
+        RunOnceRegistered=[bool]$Job.RunOnceRegistered; IsExpired=$expired; LastError=$Job.LastError
+    }
+}
+
+function Get-ScheduledRestoreState {
+    [CmdletBinding()]
+    param([string]$JobPath,[switch]$IncludeCompleted)
+    $jobs = New-Object System.Collections.Generic.List[object]
+    foreach ($path in @(Get-RestoreScheduledJobPath -JobPath $JobPath)) {
+        try {
+            $job = Read-RestoreScheduledJob -Path $path
+            if ($IncludeCompleted -or $job.Status -notin @("Completed","Cancelled")) { $jobs.Add((ConvertTo-RestoreScheduledJobStatus -Job $job)) }
+        } catch {
+            $jobs.Add([pscustomobject][ordered]@{JobId=$null;JobPath=$path;Status="Invalid";StoredStatus=$null;Owner=$null;OwnerComputer=$null;CreatedAtUtc=$null;ExpiresAtUtc=$null;SelectedKeys=@();RestoreScope=$null;OfflineImagePath=$null;PlanHash=$null;RollbackReference=$null;AttemptCount=0;RunOnceRegistered=$false;IsExpired=$false;LastError=$_.Exception.Message})
+        }
+    }
+    $runOnce = Get-RestoreScheduledRunOnceValue
+    $active = @($jobs | Where-Object Status -in @("Scheduled","Executing") | Select-Object -First 1)
+    return [pscustomobject][ordered]@{
+        SchemaVersion=$script:ScheduledRestoreSchemaVersion; CheckedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
+        Status=if($jobs.Count -eq 0){"NotFound"}elseif($active.Count -gt 0){$active[0].Status}else{$jobs[0].Status}
+        Job=$active | Select-Object -First 1; Jobs=@($jobs.ToArray()); RunOnceRegistered=($null -ne $runOnce)
+        RunOnceCommand=$runOnce
+    }
+}
+
+function Update-RestoreScheduledJob {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory=$true)][object]$Job,
+        [Parameter(Mandatory=$true)][string]$JobPath,
+        [Parameter(Mandatory=$true)][ValidateSet("Scheduled","Executing","Completed","Failed","Cancelled","Expired","RegistrationFailed")][string]$Status,
+        [object]$Result,
+        [string]$LastError
+    )
+    $Job.Status = $Status
+    $Job.LastError = $LastError
+    $Job.LastResult = $Result
+    $Job.UpdatedAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+    if ($Status -eq "Executing") { $Job.AttemptCount = [int]$Job.AttemptCount + 1; $Job.LastAttemptAtUtc = $Job.UpdatedAtUtc; $Job.ConsumedAtUtc = $Job.UpdatedAtUtc }
+    if ($Status -in @("Completed","Failed","Cancelled","Expired","RegistrationFailed")) { $Job.CompletedAtUtc = $Job.UpdatedAtUtc }
+    Write-RestoreScheduledJob -Job $Job -Path $JobPath | Out-Null
+    return $Job
+}
+
+function Remove-RestoreScheduledJobArtifact {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Job,[Parameter(Mandatory=$true)][string]$JobPath)
+    if (-not $PSCmdlet.ShouldProcess($JobPath, "remove scheduled restore state and rollback reference")) { return $false }
+    $currentRunOnce = Get-RestoreScheduledRunOnceValue
+    if ($null -ne $currentRunOnce -and ([string]::IsNullOrWhiteSpace([string]$Job.RunOnce.Command) -or [string]$currentRunOnce -ne [string]$Job.RunOnce.Command)) {
+        throw "RunOnce command does not match the scheduled job; refusing to remove unrelated boot state"
+    }
+    if ($null -ne $currentRunOnce) {
+        Remove-RestoreScheduledRunOnceValue -Confirm:$false | Out-Null
+    }
+    if (Test-Path -LiteralPath $JobPath -PathType Leaf) { [System.IO.File]::Delete([System.IO.Path]::GetFullPath($JobPath)) }
+    $journalPath = [string]$Job.RollbackReference.Path
+    if (Test-RestoreScheduledRollbackReference -Path $journalPath -and (Test-Path -LiteralPath $journalPath -PathType Leaf)) { [System.IO.File]::Delete([System.IO.Path]::GetFullPath($journalPath)) }
+}
+
 function Register-RestoreAtNextBoot {
     [CmdletBinding(SupportsShouldProcess=$true)]
     param(
         [Parameter(Mandatory=$true)][string[]]$SelectedKeys,
         [switch]$CreateRestorePoint,
         [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
-        [string]$OfflineImagePath
+        [string]$OfflineImagePath,
+        [ValidateRange(1,168)][int]$ScheduleExpiryHours = $script:ScheduledRestoreDefaultExpiryHours
     )
     if ($SelectedKeys.Count -eq 0) { throw "At least one restore category is required" }
-    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath)
+    $machineProfile = if ($script:CapabilityProfile) { $script:CapabilityProfile } else { Get-RestoreMachineProfile }
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $machineProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath)
     $blockedCapabilities = @($capabilityEvaluations | Where-Object { -not $_.CanMutate })
     if ($blockedCapabilities.Count -gt 0) {
         throw ("Capability gate blocked scheduling: " + (($blockedCapabilities | ForEach-Object { "$($_.Key): $($_.Reason)" }) -join "; "))
     }
-    if (-not $PSCmdlet.ShouldProcess("next-boot restore job", "register the selected restore plan")) { return $null }
-    $directory = Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled"
-    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
-    $statePath = Join-Path $directory ("restore-{0}.json" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
-    $state = [pscustomobject][ordered]@{
-        SchemaVersion=1; CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
-        SelectedKeys=@($SelectedKeys); CreateRestorePoint=[bool]$CreateRestorePoint
-        ScopeSchemaVersion=$script:ScopeSchemaVersion; RestoreScope=$RestoreScope; OfflineImagePath=$OfflineImagePath
+    $actionPlan = Get-RestoreActionPlan -SelectedKeys $SelectedKeys -MachineProfile $machineProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -CreateRestorePoint:$CreateRestorePoint -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath
+    if ($actionPlan.Status -ne "Ready" -or $actionPlan.OpaqueOperationCount -gt 0) {
+        throw "Scheduled restore requires a fully executable action plan; status=$($actionPlan.Status), opaque operations=$($actionPlan.OpaqueOperationCount)"
     }
-    [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
-    $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
-    if (-not (Test-Path -LiteralPath $runOncePath)) { New-Item -Path $runOncePath -Force | Out-Null }
-    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -NoGui -ResumeScheduledRestore"
-    Set-ItemProperty -Path $runOncePath -Name "RestoreWindowsDefaults" -Value $command -Type String -Force
-    Write-Log "Restore scheduled for next boot: $(Split-Path $statePath -Leaf)" -Level Success
-    return $statePath
+    $existing = Get-ScheduledRestoreState
+    if (@($existing.Jobs | Where-Object { $_.Status -in @("Scheduled","Executing","RegistrationIncomplete") }).Count -gt 0) {
+        throw "An active scheduled restore already exists; cancel or resume it before registering another job"
+    }
+    if (-not $PSCmdlet.ShouldProcess("next-boot restore job", "register the selected restore plan")) { return $null }
+    $directory = Get-RestoreScheduledDirectory
+    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    $jobId = [guid]::NewGuid().ToString()
+    $statePath = Join-Path $directory ("restore-{0}.json" -f $jobId)
+    $journalPath = $null
+    $stateWritten = $false
+    $runOnceWritten = $false
+    $now = (Get-Date).ToUniversalTime()
+    $command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -NoGui -ResumeScheduledRestore -ScheduledRestorePath `"$statePath`""
+    try {
+        $journalPath = New-RestoreRollbackJournal -ActionPlan $actionPlan -SelectedKeys $SelectedKeys
+        if (-not $journalPath) { throw "Rollback journal creation was skipped" }
+        $owner = if ($env:USERDOMAIN) { "$env:USERDOMAIN\$env:USERNAME" } else { [string]$env:USERNAME }
+        $state = [pscustomobject][ordered]@{
+            SchemaVersion=$script:ScheduledRestoreSchemaVersion; JobId=$jobId; Status="Scheduled"; RegistrationState="Preparing"
+            CreatedAtUtc=$now.ToString("o"); UpdatedAtUtc=$now.ToString("o"); ExpiresAtUtc=$now.AddHours($ScheduleExpiryHours).ToString("o")
+            Owner=$owner; OwnerComputer=$env:COMPUTERNAME; SelectedKeys=@($SelectedKeys); CreateRestorePoint=[bool]$CreateRestorePoint
+            RestoreScope=$RestoreScope; OfflineImagePath=$OfflineImagePath; ScopeSchemaVersion=$script:ScopeSchemaVersion
+            PlanHash=$actionPlan.PlanHash; ActionPlanStatus=$actionPlan.Status; RollbackReference=[pscustomobject][ordered]@{Path=$journalPath;PlanHash=$actionPlan.PlanHash;JournalState="Prepared"}
+            RunOnceRegistered=$false; RunOnce=[pscustomobject][ordered]@{Name="RestoreWindowsDefaults";Command=$command;RegisteredAtUtc=$null}
+            AttemptCount=0; LastAttemptAtUtc=$null; ConsumedAtUtc=$null; CompletedAtUtc=$null; LastError=$null; LastResult=$null
+            JobPath=$statePath; Integrity=$null
+        }
+        if (-not (Write-RestoreScheduledJob -Job $state -Path $statePath)) { throw "Scheduled restore state write was skipped" }
+        $stateWritten = $true
+        if (-not (Set-RestoreScheduledRunOnceValue -Path (Get-RestoreScheduledRunOncePath) -Name "RestoreWindowsDefaults" -Value $command -Confirm:$false)) { throw "Scheduled restore RunOnce registration was skipped" }
+        $runOnceWritten = $true
+        $state.RunOnceRegistered = $true
+        $state.RegistrationState = "Registered"
+        $state.RunOnce.RegisteredAtUtc = (Get-Date).ToUniversalTime().ToString("o")
+        if (-not (Write-RestoreScheduledJob -Job $state -Path $statePath)) { throw "Scheduled restore registration state update was skipped" }
+        Write-Log "Restore scheduled for next boot: $(Split-Path $statePath -Leaf); expires $($state.ExpiresAtUtc)" -Level Success
+        return $statePath
+    } catch {
+        if ($runOnceWritten) { Remove-RestoreScheduledRunOnceValue -Path (Get-RestoreScheduledRunOncePath) -Name "RestoreWindowsDefaults" -Confirm:$false | Out-Null }
+        if ($stateWritten -and (Test-Path -LiteralPath $statePath -PathType Leaf)) { [System.IO.File]::Delete([System.IO.Path]::GetFullPath($statePath)) }
+        if ($journalPath -and (Test-RestoreScheduledRollbackReference -Path $journalPath) -and (Test-Path -LiteralPath $journalPath -PathType Leaf)) { [System.IO.File]::Delete([System.IO.Path]::GetFullPath($journalPath)) }
+        throw
+    }
 }
 
 function Invoke-ScheduledRestore {
     [CmdletBinding(SupportsShouldProcess=$true)]
-    param()
-    $statePath = @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled") -Filter "restore-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
-    if (-not $statePath) { throw "No scheduled restore state is available" }
-    $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    $scheduledScope = if ($state.PSObject.Properties["RestoreScope"]) { [string]$state.RestoreScope } else { $null }
-    $scheduledImagePath = if ($state.PSObject.Properties["OfflineImagePath"]) { [string]$state.OfflineImagePath } else { $null }
-    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @($state.SelectedKeys) -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $scheduledScope -OfflineImagePath $scheduledImagePath)
+    param([string]$JobPath)
+    $status = Get-ScheduledRestoreState -JobPath $JobPath -IncludeCompleted
+    if ($status.Status -eq "NotFound") { return [pscustomobject][ordered]@{Status="NotFound";Success=$false;Idempotent=$true;ExitCode=1;JobPath=$null} }
+    if ($status.Status -eq "Invalid") { return [pscustomobject][ordered]@{Status="Invalid";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$status.Jobs[0].JobPath;Reason=$status.Jobs[0].LastError} }
+    $selected = if ($JobPath) { $JobPath } elseif ($status.Job) { $status.Job.JobPath } else { @($status.Jobs | Select-Object -First 1).JobPath }
+    try { $job = Read-RestoreScheduledJob -Path $selected } catch { return [pscustomobject][ordered]@{Status="Invalid";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$selected;Reason=$_.Exception.Message} }
+    $effective = ConvertTo-RestoreScheduledJobStatus -Job $job
+    if ($effective.Status -eq "Expired") {
+        if ($job.Status -ne "Expired") { Update-RestoreScheduledJob -Job $job -JobPath $selected -Status Expired -LastError "Scheduled restore expired before execution" | Out-Null }
+        try { Remove-RestoreScheduledJobArtifact -Job $job -JobPath $selected -Confirm:$false } catch { Write-Verbose "Could not remove expired scheduled restore artifacts: $($_.Exception.Message)" }
+        return [pscustomobject][ordered]@{Status="Expired";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$selected;ExpiresAtUtc=$job.ExpiresAtUtc}
+    }
+    if ($job.Status -eq "Completed") { return [pscustomobject][ordered]@{Status="Completed";Success=$true;Idempotent=$true;ExitCode=0;JobPath=$selected;Result=$job.LastResult} }
+    if ($job.Status -eq "Cancelled") { return [pscustomobject][ordered]@{Status="Cancelled";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$selected} }
+    if ($job.Status -eq "Scheduled" -and (-not $job.RunOnceRegistered -or [string]$job.RegistrationState -ne "Registered")) {
+        return [pscustomobject][ordered]@{Status="RegistrationIncomplete";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$selected;Reason="Scheduled job registration was not completed"}
+    }
+    $currentRunOnce = Get-RestoreScheduledRunOnceValue
+    if ($job.Status -eq "Scheduled" -and $null -ne $currentRunOnce -and [string]$currentRunOnce -ne [string]$job.RunOnce.Command) {
+        return [pscustomobject][ordered]@{Status="RegistrationInvalid";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$selected;Reason="RunOnce command does not match the scheduled job"}
+    }
+    $journalPath = [string]$job.RollbackReference.Path
+    try { $journal = Read-RestoreRollbackJournal -Path $journalPath } catch { Update-RestoreScheduledJob -Job $job -JobPath $selected -Status Failed -LastError $_.Exception.Message | Out-Null; return [pscustomobject][ordered]@{Status="Failed";Success=$false;Idempotent=$false;ExitCode=1;JobPath=$selected;Reason=$_.Exception.Message} }
+    if ([string]$journal.PlanHash -ne [string]$job.PlanHash) { Update-RestoreScheduledJob -Job $job -JobPath $selected -Status Failed -LastError "Rollback journal plan hash does not match scheduled job" | Out-Null; return [pscustomobject][ordered]@{Status="Failed";Success=$false;Idempotent=$false;ExitCode=1;JobPath=$selected;Reason="Rollback journal plan hash does not match scheduled job"} }
+    if ($journal.State -eq "Committed") { Update-RestoreScheduledJob -Job $job -JobPath $selected -Status Completed -Result ([pscustomobject]@{State="Committed";JournalPath=$journalPath}) | Out-Null; return [pscustomobject][ordered]@{Status="Completed";Success=$true;Idempotent=$true;ExitCode=0;JobPath=$selected;Result=$job.LastResult} }
+    $machineProfile = if ($script:CapabilityProfile) { $script:CapabilityProfile } else { Get-RestoreMachineProfile }
+    $scheduledScope = if ($job.PSObject.Properties["RestoreScope"]) { [string]$job.RestoreScope } else { "CurrentUser" }
+    $scheduledImagePath = if ($job.PSObject.Properties["OfflineImagePath"]) { [string]$job.OfflineImagePath } else { $null }
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @($job.SelectedKeys) -MachineProfile $machineProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $scheduledScope -OfflineImagePath $scheduledImagePath)
     $blockedCapabilities = @($capabilityEvaluations | Where-Object { -not $_.CanMutate })
     if ($blockedCapabilities.Count -gt 0) {
-        throw ("Capability gate blocked scheduled restore: " + (($blockedCapabilities | ForEach-Object { "$($_.Key): $($_.Reason)" }) -join "; "))
+        $reason = "Capability gate blocked scheduled restore: " + (($blockedCapabilities | ForEach-Object { "$($_.Key): $($_.Reason)" }) -join "; ")
+        Update-RestoreScheduledJob -Job $job -JobPath $selected -Status Failed -LastError $reason | Out-Null
+        return [pscustomobject][ordered]@{Status="Failed";Success=$false;Idempotent=$false;ExitCode=1;JobPath=$selected;Reason=$reason}
     }
-    if (-not $PSCmdlet.ShouldProcess("scheduled restore job", "consume and execute the selected restore plan")) { return $false }
-    $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
-    Remove-RegistryValue -Path $runOncePath -Name "RestoreWindowsDefaults" -Silent
-    $result = Invoke-RestoreSelection -SelectedKeys @($state.SelectedKeys) -CreateRollbackSnapshot -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $scheduledScope -OfflineImagePath $scheduledImagePath
-    if ($result.ExitCode -ne 0) { throw "Scheduled restore did not complete successfully (exit code $($result.ExitCode))" }
-    Invoke-RestoreFileMutation -Action Remove -Path $statePath -Silent
-    Write-Log "Scheduled restore completed" -Level Success
-    return $true
+    if (-not $PSCmdlet.ShouldProcess("scheduled restore job $($job.JobId)", "consume and execute the verified rollback journal")) { return [pscustomobject][ordered]@{Status="Skipped";Success=$false;Idempotent=$false;ExitCode=2;JobPath=$selected} }
+    try {
+        Update-RestoreScheduledJob -Job $job -JobPath $selected -Status Executing -LastError $null | Out-Null
+        if ($null -ne $currentRunOnce) { Remove-RestoreScheduledRunOnceValue -Confirm:$false | Out-Null }
+        $result = Resume-RestoreRollbackJournal -JournalPath $journalPath
+        $finalStatus = if ($result.State -eq "Committed" -and $result.Success) { "Completed" } else { "Failed" }
+        Update-RestoreScheduledJob -Job $job -JobPath $selected -Status $finalStatus -Result $result -LastError $(if($finalStatus -eq "Failed"){"Scheduled restore journal did not commit"}else{$null}) | Out-Null
+        if ($finalStatus -eq "Completed") { Write-Log "Scheduled restore completed: $($job.JobId)" -Level Success }
+        return [pscustomobject][ordered]@{Status=$finalStatus;Success=($finalStatus -eq "Completed");Idempotent=$false;ExitCode=if($finalStatus -eq "Completed"){0}else{1};JobPath=$selected;Result=$result}
+    } catch {
+        Update-RestoreScheduledJob -Job $job -JobPath $selected -Status Failed -LastError $_.Exception.Message | Out-Null
+        return [pscustomobject][ordered]@{Status="Failed";Success=$false;Idempotent=$false;ExitCode=1;JobPath=$selected;Reason=$_.Exception.Message}
+    }
+}
+
+function Unregister-ScheduledRestore {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([string]$JobPath)
+    $status = Get-ScheduledRestoreState -JobPath $JobPath -IncludeCompleted
+    if ($status.Status -eq "NotFound") { return [pscustomobject][ordered]@{Status="NotFound";Success=$false;Idempotent=$true;ExitCode=1} }
+    if ($status.Status -eq "Invalid") { return [pscustomobject][ordered]@{Status="Invalid";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$status.Jobs[0].JobPath;Reason=$status.Jobs[0].LastError} }
+    $selected = if ($JobPath) { $JobPath } elseif ($status.Job) { $status.Job.JobPath } else { @($status.Jobs | Select-Object -First 1).JobPath }
+    $job = Read-RestoreScheduledJob -Path $selected
+    if ($job.Status -eq "Completed") { return [pscustomobject][ordered]@{Status="Completed";Success=$false;Idempotent=$true;ExitCode=0;JobPath=$selected} }
+    if ($job.Status -eq "Cancelled") { return [pscustomobject][ordered]@{Status="Cancelled";Success=$true;Idempotent=$true;ExitCode=0;JobPath=$selected} }
+    if ($job.Status -eq "Executing") { return [pscustomobject][ordered]@{Status="Executing";Success=$false;Idempotent=$true;ExitCode=2;JobPath=$selected;Reason="An executing scheduled restore cannot be cancelled safely"} }
+    if (-not $PSCmdlet.ShouldProcess("scheduled restore job $($job.JobId)", "cancel and remove all scheduled state")) { return [pscustomobject][ordered]@{Status="Skipped";Success=$false;Idempotent=$false;ExitCode=2;JobPath=$selected} }
+    try {
+        Remove-RestoreScheduledJobArtifact -Job $job -JobPath $selected -Confirm:$false
+        return [pscustomobject][ordered]@{Status="Cancelled";Success=$true;Idempotent=$false;ExitCode=0;JobPath=$selected;JobId=$job.JobId}
+    } catch {
+        return [pscustomobject][ordered]@{Status="CancelFailed";Success=$false;Idempotent=$false;ExitCode=1;JobPath=$selected;Reason=$_.Exception.Message}
+    }
 }
 
 function Get-PostUpdateSecurityRecheck {
@@ -7238,6 +7526,7 @@ function Show-MainWindow {
                             <ComboBoxItem Content="Offline image (CLI workflow)" Tag="OfflineImage"/>
                         </ComboBox>
                     </StackPanel>
+                    <Button x:Name="btnCancelScheduled" Content="Cancel Scheduled" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="12,8" Margin="0,0,6,0"/>
                     <Button x:Name="btnScheduleCustom" Content="Schedule Next Reboot" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="12,8" Margin="0,0,6,0"/>
                     <Button x:Name="btnRunCustom" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="16,8" Background="#238636" Foreground="White" BorderBrush="#238636">
                         <TextBlock Text="Run Selected Fixes" FontWeight="SemiBold"/></Button>
@@ -7327,7 +7616,7 @@ function Show-MainWindow {
         'btnFixAll', 'btnFixDetected', 'btnFixSecurity', 'btnCustom', 'btnScanOnly',
         'chkAutoRestore', 'btnClose',
         'btnBack', 'btnSelectAll', 'btnSelectNone', 'btnSelectSafe',
-        'chkContainer', 'chkAutoRestoreC', 'cmbAppxScope', 'btnRunCustom', 'btnScheduleCustom',
+        'chkContainer', 'chkAutoRestoreC', 'cmbAppxScope', 'btnRunCustom', 'btnScheduleCustom', 'btnCancelScheduled',
         'txtProgressTitle', 'txtProgressSub', 'progressBar', 'timelineScrubber', 'txtProgressPercent', 'txtProgressStep',
         'txtConsole', 'txtStatus', 'btnReboot', 'btnLater', 'btnRollback', 'btnViewLog',
         'btnImportManifest', 'quickScanPanel', 'quickScanStats',
@@ -7885,6 +8174,21 @@ function Show-MainWindow {
         }
     })
 
+    $ui.btnCancelScheduled.Add_Click({
+        try {
+            $cancelResult = Unregister-ScheduledRestore
+            if ($cancelResult.Status -eq "Cancelled") {
+                [System.Windows.MessageBox]::Show("The scheduled restore and its RunOnce, job, and rollback state were removed.", "Scheduled Restore Cancelled", "OK", "Information")
+            } elseif ($cancelResult.Status -eq "NotFound") {
+                [System.Windows.MessageBox]::Show("No active scheduled restore was found.", "No Scheduled Restore", "OK", "Information")
+            } else {
+                [System.Windows.MessageBox]::Show("Scheduled restore state: $($cancelResult.Status)`n$($cancelResult.Reason)", "Scheduled Restore", "OK", "Warning")
+            }
+        } catch {
+            [System.Windows.MessageBox]::Show("Could not cancel the scheduled restore: $($_.Exception.Message)", "Schedule Error", "OK", "Error")
+        }
+    })
+
     $ui.btnSelectAll.Add_Click({ foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = $true } } })
     $ui.btnSelectNone.Add_Click({ foreach ($c in $allChkNames) { if ($ui[$c]) { $ui[$c].IsChecked = $false } } })
     $ui.btnSelectSafe.Add_Click({
@@ -8042,9 +8346,22 @@ if ($ResumeRestoreJournal) {
     exit (if($resumeResult.Success){0}else{1})
 }
 
+if ($ScheduledRestoreStatus) {
+    $scheduledStatus = Get-ScheduledRestoreState -JobPath $ScheduledRestorePath -IncludeCompleted
+    Write-Output ($scheduledStatus | ConvertTo-Json -Depth 30)
+    exit (if($scheduledStatus.Status -in @("Invalid","RegistrationIncomplete")){2}else{0})
+}
+
+if ($CancelScheduledRestore) {
+    $cancelResult = Unregister-ScheduledRestore -JobPath $ScheduledRestorePath
+    Write-Output ($cancelResult | ConvertTo-Json -Depth 30)
+    exit ([int]$cancelResult.ExitCode)
+}
+
 if ($ResumeScheduledRestore) {
-    Invoke-ScheduledRestore
-    exit
+    $scheduledResult = Invoke-ScheduledRestore -JobPath $ScheduledRestorePath
+    Write-Output ($scheduledResult | ConvertTo-Json -Depth 30)
+    exit ([int]$scheduledResult.ExitCode)
 }
 
 if ($SecurityReset) {
@@ -8070,7 +8387,8 @@ if ($RestoreTier) {
 if ($ScheduleRestore) {
     $scheduledKeys = if ($RestoreCategories) { @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         else { @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkServices","chkTasks") }
-    Register-RestoreAtNextBoot -SelectedKeys $scheduledKeys -CreateRestorePoint -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath
+    $scheduledPath = Register-RestoreAtNextBoot -SelectedKeys $scheduledKeys -CreateRestorePoint -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath -ScheduleExpiryHours $ScheduleExpiryHours
+    Write-Output ([pscustomobject][ordered]@{Status="Scheduled";Success=$true;JobPath=$scheduledPath;ExpiryHours=$ScheduleExpiryHours} | ConvertTo-Json -Depth 20)
     exit
 }
 

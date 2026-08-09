@@ -88,12 +88,17 @@ The same script supports non-GUI workflows for automation and diagnostics:
 .\Restore-WindowsDefaults.ps1 -ExportSupportBundle .\support.zip
 
 # Schedule selected categories for the next boot
-.\Restore-WindowsDefaults.ps1 -ScheduleRestore -RestoreCategories chkDefender,chkWindowsUpdate,chkTasks
+.\Restore-WindowsDefaults.ps1 -ScheduleRestore -RestoreCategories chkDefender,chkWindowsUpdate,chkTasks -ScheduleExpiryHours 24
+.\Restore-WindowsDefaults.ps1 -NoGui -ScheduledRestoreStatus
+.\Restore-WindowsDefaults.ps1 -NoGui -CancelScheduledRestore
+.\Restore-WindowsDefaults.ps1 -NoGui -ResumeScheduledRestore
 ```
 
 `-NoGui` is intended for automation. The Intune and Configuration Manager wrappers under `deploy\` emit JSON compliance results by default; add `-Remediate` to run the critical security and service/task categories in an already elevated management context.
 
 AppX scope is selected with `-RestoreScope CurrentUser|AllUsers|Provisioned|OfflineImage`. `CurrentUser` observes online registration and is the only AppX mutation scope supported by the online executor. `AllUsers` observes registrations for existing users, `Provisioned` observes the online image, and `OfflineImage` observes a mounted image through `-OfflineImagePath`; those targets are explicitly read-only or unsupported in the online restore plan. Registry snapshots and plan operations likewise declare `CurrentUser`, `Machine`, `AllUsers`, or `MachineAndUser` hive scope.
+
+Scheduled restores are versioned, integrity-checked jobs with an owner, plan hash, rollback-journal reference, and configurable 1–168 hour expiry (24 hours by default). `-ScheduledRestoreStatus` reports stale or incomplete registration without replaying it; `-CancelScheduledRestore` removes the matching RunOnce value, job state, and prepared rollback journal. Resume consumes the job once and later resume calls return an idempotent result.
 
 Restore and remediation JSON includes a structured outcome for each executable operation: `Changed`, `Skipped`, `Unsupported`, `Failed`, or `VerificationFailed`, with native exit code, bounded stdout/stderr, and failure taxonomy where applicable. Registry, file, service, task, AppX, optional-feature, and environment-variable operations are checked with fresh postcondition reads after execution. Native commands and restore points are reported as `NotObservable` when no deterministic reader exists. `-PostUpdateCheck` performs an independent fresh verification pass and reports `VerificationStatus`, `VerificationReport`, and structured `PendingRebootState`; a pending reboot or partial verification is never hidden by a successful process exit.
 

@@ -889,6 +889,185 @@ Describe "Restore-WindowsDefaults native outcomes and verification" {
     }
 }
 
+Describe "Restore-WindowsDefaults scheduled restore lifecycle" {
+    It "registers a validated expiring job, cancels all artifacts, and cleans partial registration" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-schedule-lifecycle-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $oldScheduledDirectory = $script:ScheduledRestoreDirectoryOverride
+        $oldRollbackDirectory = $script:RollbackDirectoryOverride
+        $oldRunOncePath = $script:ScheduledRestoreRunOncePathOverride
+        $oldReadProvider = $script:ScheduledRestoreRunOnceReadProvider
+        $oldWriteProvider = $script:ScheduledRestoreRunOnceWriteProvider
+        $oldRemoveProvider = $script:ScheduledRestoreRunOnceRemoveProvider
+        $oldCapabilityProfile = $script:CapabilityProfile
+        $oldSnapshotPaths = $script:RegistrySnapshotPaths
+        $runOnceStore = [hashtable]::Synchronized(@{Value=$null})
+        try {
+            $script:ScheduledRestoreDirectoryOverride = Join-Path $root "scheduled"
+            $script:RollbackDirectoryOverride = Join-Path $root "rollback"
+            $script:ScheduledRestoreRunOncePathOverride = "TestRunOnce"
+            $script:ScheduledRestoreRunOnceReadProvider = { $runOnceStore.Value }.GetNewClosure()
+            $script:ScheduledRestoreRunOnceWriteProvider = { $runOnceStore.Value=$args[2]; $true }.GetNewClosure()
+            $script:ScheduledRestoreRunOnceRemoveProvider = { $runOnceStore.Value=$null; $true }.GetNewClosure()
+            $script:RegistrySnapshotPaths = @()
+            $management = [pscustomobject]@{IsManaged=$false;IsKnown=$true;DomainJoined=$false;MdmEnrolled=$false}
+            $osProvider = { [pscustomobject]@{ProductName="Windows 11 Pro";ProductFamily="Windows 11";EditionID="Professional";CurrentBuild=26100;Architecture="AMD64";Locale="en-US";IsWindows=$true;IsOnline=$true;PowerShellMajor=5;IsWindowsPowerShell=$true;IsAdministrator=$true} }
+            $script:CapabilityProfile = Get-RestoreMachineProfile -OperatingSystemProvider $osProvider -ManagementState $management
+
+            $jobPath = Register-RestoreAtNextBoot -SelectedKeys @("chkBing") -ScheduleExpiryHours 3 -Confirm:$false
+            $job = Read-RestoreScheduledJob -Path $jobPath
+            $job.SchemaVersion | Should -Be 2
+            $job.Status | Should -Be "Scheduled"
+            $job.Owner | Should -Not -BeNullOrEmpty
+            $job.PlanHash | Should -Match '^[a-f0-9]{64}$'
+            Test-Path -LiteralPath $job.RollbackReference.Path | Should -BeTrue
+            $job.Integrity.JobHash | Should -Match '^[a-f0-9]{64}$'
+            ([DateTime]::Parse($job.ExpiresAtUtc)) | Should -BeGreaterThan ([DateTime]::Parse($job.CreatedAtUtc))
+            $runOnceStore.Value | Should -Match "ResumeScheduledRestore"
+            (Get-ScheduledRestoreState).Status | Should -Be "Scheduled"
+
+            $cancelled = Unregister-ScheduledRestore -JobPath $jobPath -Confirm:$false
+            $cancelled.Status | Should -Be "Cancelled"
+            $runOnceStore.Value | Should -BeNullOrEmpty
+            Test-Path -LiteralPath $jobPath | Should -BeFalse
+            Test-Path -LiteralPath $job.RollbackReference.Path | Should -BeFalse
+
+            $script:ScheduledRestoreRunOnceWriteProvider = { throw "injected RunOnce failure" }.GetNewClosure()
+            { Register-RestoreAtNextBoot -SelectedKeys @("chkBing") -Confirm:$false } | Should -Throw
+            @(Get-ChildItem -LiteralPath $script:ScheduledRestoreDirectoryOverride -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+            @(Get-ChildItem -LiteralPath $script:RollbackDirectoryOverride -File -ErrorAction SilentlyContinue).Count | Should -Be 0
+        } finally {
+            $script:ScheduledRestoreDirectoryOverride = $oldScheduledDirectory
+            $script:RollbackDirectoryOverride = $oldRollbackDirectory
+            $script:ScheduledRestoreRunOncePathOverride = $oldRunOncePath
+            $script:ScheduledRestoreRunOnceReadProvider = $oldReadProvider
+            $script:ScheduledRestoreRunOnceWriteProvider = $oldWriteProvider
+            $script:ScheduledRestoreRunOnceRemoveProvider = $oldRemoveProvider
+            $script:CapabilityProfile = $oldCapabilityProfile
+            $script:RegistrySnapshotPaths = $oldSnapshotPaths
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "resumes a prepared scheduled journal once and makes later resumes idempotent" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-schedule-resume-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $keyPath = "HKCU:\Software\RwdScheduledResume-$([guid]::NewGuid().ToString('N'))"
+        $oldScheduledDirectory = $script:ScheduledRestoreDirectoryOverride
+        $oldRollbackDirectory = $script:RollbackDirectoryOverride
+        $oldRunOncePath = $script:ScheduledRestoreRunOncePathOverride
+        $oldReadProvider = $script:ScheduledRestoreRunOnceReadProvider
+        $oldWriteProvider = $script:ScheduledRestoreRunOnceWriteProvider
+        $oldRemoveProvider = $script:ScheduledRestoreRunOnceRemoveProvider
+        $oldCapabilityProfile = $script:CapabilityProfile
+        $oldSnapshotPaths = $script:RegistrySnapshotPaths
+        $runOnceStore = [hashtable]::Synchronized(@{Value="test-runonce"})
+        try {
+            $script:ScheduledRestoreDirectoryOverride = Join-Path $root "scheduled"
+            $script:RollbackDirectoryOverride = Join-Path $root "rollback"
+            $script:ScheduledRestoreRunOncePathOverride = "TestRunOnce"
+            $script:ScheduledRestoreRunOnceReadProvider = { $runOnceStore.Value }.GetNewClosure()
+            $script:ScheduledRestoreRunOnceWriteProvider = { $runOnceStore.Value=$args[2]; $true }.GetNewClosure()
+            $script:ScheduledRestoreRunOnceRemoveProvider = { $runOnceStore.Value=$null; $true }.GetNewClosure()
+            $script:RegistrySnapshotPaths = @()
+            $management = [pscustomobject]@{IsManaged=$false;IsKnown=$true;DomainJoined=$false;MdmEnrolled=$false}
+            $osProvider = { [pscustomobject]@{ProductName="Windows 11 Pro";ProductFamily="Windows 11";EditionID="Professional";CurrentBuild=26100;Architecture="AMD64";Locale="en-US";IsWindows=$true;IsOnline=$true;PowerShellMajor=5;IsWindowsPowerShell=$true;IsAdministrator=$true} }
+            $script:CapabilityProfile = Get-RestoreMachineProfile -OperatingSystemProvider $osProvider -ManagementState $management
+            $plan = [pscustomobject]@{
+                PlanHash=('a' * 64); Profile=$script:CapabilityProfile
+                Operations=@([pscustomobject]@{
+                    OperationId="op-0001"; CategoryKey="chkBing"; Kind="RegistryValue"; Action="Set"; Target="$keyPath\Value"; Scope="CurrentUser"; Risk="Low"
+                    Before=[pscustomobject]@{Exists=$false;KeyExists=$false;Path=$keyPath;Name="Value";Type=$null;Value=$null}
+                    After=[pscustomobject]@{Exists=$true;Path=$keyPath;Name="Value";Type="DWord";Value=41}
+                    RollbackAction="Restore before state"; Exact=$true; CanExecute=$true; Reason=$null; Source="test"; Dependency="test"; Verification="value exists"; Metadata=$null
+                })
+            }
+            $journalPath = Join-Path $script:RollbackDirectoryOverride "journal-scheduled-test.json"
+            New-RestoreRollbackJournal -ActionPlan $plan -SelectedKeys @("chkBing") -OutputPath $journalPath -BeforeRegistry ([pscustomobject]@{SchemaVersion=1;Entries=@()}) -Confirm:$false | Out-Null
+            $jobPath = Join-Path $script:ScheduledRestoreDirectoryOverride "restore-scheduled-test.json"
+            $now = (Get-Date).ToUniversalTime()
+            $job = [pscustomobject][ordered]@{
+                SchemaVersion=$script:ScheduledRestoreSchemaVersion; JobId=([guid]::NewGuid().ToString()); Status="Scheduled"; RegistrationState="Registered"
+                CreatedAtUtc=$now.ToString("o"); UpdatedAtUtc=$now.ToString("o"); ExpiresAtUtc=$now.AddHours(2).ToString("o")
+                Owner="test"; OwnerComputer="test"; SelectedKeys=@("chkBing"); CreateRestorePoint=$false; RestoreScope="CurrentUser"; OfflineImagePath=$null; ScopeSchemaVersion=1
+                PlanHash=$plan.PlanHash; ActionPlanStatus="Ready"; RollbackReference=[pscustomobject][ordered]@{Path=$journalPath;PlanHash=$plan.PlanHash;JournalState="Prepared"}
+                RunOnceRegistered=$true; RunOnce=[pscustomobject][ordered]@{Name="RestoreWindowsDefaults";Command="test-runonce";RegisteredAtUtc=$now.ToString("o")}
+                AttemptCount=0; LastAttemptAtUtc=$null; ConsumedAtUtc=$null; CompletedAtUtc=$null; LastError=$null; LastResult=$null; JobPath=$jobPath; Integrity=$null
+            }
+            Write-RestoreScheduledJob -Job $job -Path $jobPath -Confirm:$false | Out-Null
+
+            $first = Invoke-ScheduledRestore -JobPath $jobPath -Confirm:$false
+            $first.Status | Should -Be "Completed"
+            $first.Success | Should -BeTrue
+            (Get-ItemProperty -LiteralPath $keyPath -Name "Value").Value | Should -Be 41
+            (Read-RestoreRollbackJournal -Path $journalPath).State | Should -Be "Committed"
+            (Read-RestoreScheduledJob -Path $jobPath).Status | Should -Be "Completed"
+
+            $second = Invoke-ScheduledRestore -JobPath $jobPath -Confirm:$false
+            $second.Status | Should -Be "Completed"
+            $second.Idempotent | Should -BeTrue
+            (Get-ItemProperty -LiteralPath $keyPath -Name "Value").Value | Should -Be 41
+        } finally {
+            $script:ScheduledRestoreDirectoryOverride = $oldScheduledDirectory
+            $script:RollbackDirectoryOverride = $oldRollbackDirectory
+            $script:ScheduledRestoreRunOncePathOverride = $oldRunOncePath
+            $script:ScheduledRestoreRunOnceReadProvider = $oldReadProvider
+            $script:ScheduledRestoreRunOnceWriteProvider = $oldWriteProvider
+            $script:ScheduledRestoreRunOnceRemoveProvider = $oldRemoveProvider
+            $script:CapabilityProfile = $oldCapabilityProfile
+            $script:RegistrySnapshotPaths = $oldSnapshotPaths
+            if (Test-Path -LiteralPath $keyPath) { Remove-Item -LiteralPath $keyPath -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "reports and consumes stale jobs without replaying their journal" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-schedule-expiry-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $oldScheduledDirectory = $script:ScheduledRestoreDirectoryOverride
+        $oldRollbackDirectory = $script:RollbackDirectoryOverride
+        $oldRunOncePath = $script:ScheduledRestoreRunOncePathOverride
+        $oldReadProvider = $script:ScheduledRestoreRunOnceReadProvider
+        $oldWriteProvider = $script:ScheduledRestoreRunOnceWriteProvider
+        $oldRemoveProvider = $script:ScheduledRestoreRunOnceRemoveProvider
+        $oldCapabilityProfile = $script:CapabilityProfile
+        $oldSnapshotPaths = $script:RegistrySnapshotPaths
+        $runOnceStore = [hashtable]::Synchronized(@{Value=$null})
+        try {
+            $script:ScheduledRestoreDirectoryOverride = Join-Path $root "scheduled"
+            $script:RollbackDirectoryOverride = Join-Path $root "rollback"
+            $script:ScheduledRestoreRunOncePathOverride = "TestRunOnce"
+            $script:ScheduledRestoreRunOnceReadProvider = { $runOnceStore.Value }.GetNewClosure()
+            $script:ScheduledRestoreRunOnceWriteProvider = { $runOnceStore.Value=$args[2]; $true }.GetNewClosure()
+            $script:ScheduledRestoreRunOnceRemoveProvider = { $runOnceStore.Value=$null; $true }.GetNewClosure()
+            $script:RegistrySnapshotPaths = @()
+            $management = [pscustomobject]@{IsManaged=$false;IsKnown=$true;DomainJoined=$false;MdmEnrolled=$false}
+            $osProvider = { [pscustomobject]@{ProductName="Windows 11 Pro";ProductFamily="Windows 11";EditionID="Professional";CurrentBuild=26100;Architecture="AMD64";Locale="en-US";IsWindows=$true;IsOnline=$true;PowerShellMajor=5;IsWindowsPowerShell=$true;IsAdministrator=$true} }
+            $script:CapabilityProfile = Get-RestoreMachineProfile -OperatingSystemProvider $osProvider -ManagementState $management
+            $jobPath = Register-RestoreAtNextBoot -SelectedKeys @("chkBing") -ScheduleExpiryHours 1 -Confirm:$false
+            $job = Read-RestoreScheduledJob -Path $jobPath
+            $job.CreatedAtUtc = (Get-Date).ToUniversalTime().AddHours(-2).ToString("o")
+            $job.ExpiresAtUtc = (Get-Date).ToUniversalTime().AddMinutes(-1).ToString("o")
+            Write-RestoreScheduledJob -Job $job -Path $jobPath -Confirm:$false | Out-Null
+
+            (Get-ScheduledRestoreState).Status | Should -Be "Expired"
+            $stale = Invoke-ScheduledRestore -JobPath $jobPath -Confirm:$false
+            $stale.Status | Should -Be "Expired"
+            $stale.Idempotent | Should -BeTrue
+            $runOnceStore.Value | Should -BeNullOrEmpty
+            Test-Path -LiteralPath $jobPath | Should -BeFalse
+            Test-Path -LiteralPath $job.RollbackReference.Path | Should -BeFalse
+        } finally {
+            $script:ScheduledRestoreDirectoryOverride = $oldScheduledDirectory
+            $script:RollbackDirectoryOverride = $oldRollbackDirectory
+            $script:ScheduledRestoreRunOncePathOverride = $oldRunOncePath
+            $script:ScheduledRestoreRunOnceReadProvider = $oldReadProvider
+            $script:ScheduledRestoreRunOnceWriteProvider = $oldWriteProvider
+            $script:ScheduledRestoreRunOnceRemoveProvider = $oldRemoveProvider
+            $script:CapabilityProfile = $oldCapabilityProfile
+            $script:RegistrySnapshotPaths = $oldSnapshotPaths
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
 Describe "Restore-WindowsDefaults scope contracts" {
     It "declares independent AppX scopes and mutation permissions" {
         $scopes = @(Get-RestoreScopeCatalog)

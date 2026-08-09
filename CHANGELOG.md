@@ -14,6 +14,7 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 - Replaced run snapshots with v2 atomic rollback journals containing per-operation state, SHA-256 integrity, resumable execution, tamper refusal, inverse adapters, and legacy snapshot compatibility.
 - Added bounded native-command outcomes with exit codes, stderr, reboot-required and failure-taxonomy states, independent fresh postcondition verification, explicit pending-reboot reporting, and structured propagation through CLI, GUI, Intune, and Configuration Manager results.
 - Added explicit AppX scope contracts for current-user, all-existing-user, provisioned-image, and offline-image observations, with read-only capability gates, scope-aware registry metadata, CLI/GUI selectors, and scheduled-state propagation.
+- Hardened next-boot restore into an expiring, integrity-checked job with owner/plan/rollback metadata, failure-safe two-phase registration, status and cancellation commands, stale-job refusal, and idempotent journal-backed resume.
 
 ## [v4.4.0] - 2026-08-03
 
