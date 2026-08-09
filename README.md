@@ -25,6 +25,7 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 - **Import undo manifest** - Load JSON manifests from Debloat-Win11 v1.1.0 for precise restoration
 - **Debloat fingerprinting** - Detects evidence from O&O ShutUp10, WPD, ThisIsWin11, Sophia Script, and Win10Privacy without executing their code
 - **Baseline inventory** - Exports and compares registry/AppX state, including provisioned-package and offline-WIM comparisons
+- **Explicit restore scopes** - Names current-user, all-existing-user, provisioned-image, and offline-image AppX observations; only current-user online registration is executable by the restore executor
 - **Managed-device safety** - Reports structured domain, MDM, Group Policy, local-policy, and account-join provenance; managed values and categories are skipped by default unless an explicit operator override is recorded
 - **Independent restore verification** - Records bounded native-command exit codes, stderr, failure taxonomy, fresh postconditions, and pending-reboot state in CLI, GUI, and deployment-wrapper results
 - **Operational recovery** - Adds security reset, Search index rebuild, Store/WinGet repair, privacy-slider repair, integrity-checked rollback journals, and next-boot restore scheduling
@@ -72,6 +73,10 @@ The same script supports non-GUI workflows for automation and diagnostics:
 .\Restore-WindowsDefaults.ps1 -NoGui -BaselineReport
 .\Restore-WindowsDefaults.ps1 -NoGui -CapabilityReport -RestoreCategories chkDefender,chkWindowsUpdate
 .\Restore-WindowsDefaults.ps1 -NoGui -CapabilityReport -AllowManagedPolicy -RestoreCategories chkDefender,chkWindowsUpdate
+.\Restore-WindowsDefaults.ps1 -NoGui -CapabilityReport -RestoreCategories chkAppx -RestoreScope CurrentUser
+.\Restore-WindowsDefaults.ps1 -NoGui -WhatIf -RestoreCategories chkAppx -RestoreScope AllUsers
+.\Restore-WindowsDefaults.ps1 -NoGui -WhatIf -RestoreCategories chkAppx -RestoreScope Provisioned
+.\Restore-WindowsDefaults.ps1 -NoGui -CapabilityReport -RestoreCategories chkAppx -RestoreScope OfflineImage -OfflineImagePath D:\MountedImage
 .\Restore-WindowsDefaults.ps1 -NoGui -RollbackLastRun
 .\Restore-WindowsDefaults.ps1 -NoGui -ResumeRestoreJournal
 
@@ -87,6 +92,8 @@ The same script supports non-GUI workflows for automation and diagnostics:
 ```
 
 `-NoGui` is intended for automation. The Intune and Configuration Manager wrappers under `deploy\` emit JSON compliance results by default; add `-Remediate` to run the critical security and service/task categories in an already elevated management context.
+
+AppX scope is selected with `-RestoreScope CurrentUser|AllUsers|Provisioned|OfflineImage`. `CurrentUser` observes online registration and is the only AppX mutation scope supported by the online executor. `AllUsers` observes registrations for existing users, `Provisioned` observes the online image, and `OfflineImage` observes a mounted image through `-OfflineImagePath`; those targets are explicitly read-only or unsupported in the online restore plan. Registry snapshots and plan operations likewise declare `CurrentUser`, `Machine`, `AllUsers`, or `MachineAndUser` hive scope.
 
 Restore and remediation JSON includes a structured outcome for each executable operation: `Changed`, `Skipped`, `Unsupported`, `Failed`, or `VerificationFailed`, with native exit code, bounded stdout/stderr, and failure taxonomy where applicable. Registry, file, service, task, AppX, optional-feature, and environment-variable operations are checked with fresh postcondition reads after execution. Native commands and restore points are reported as `NotObservable` when no deterministic reader exists. `-PostUpdateCheck` performs an independent fresh verification pass and reports `VerificationStatus`, `VerificationReport`, and structured `PendingRebootState`; a pending reboot or partial verification is never hidden by a successful process exit.
 

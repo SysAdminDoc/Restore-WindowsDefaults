@@ -888,3 +888,92 @@ Describe "Restore-WindowsDefaults native outcomes and verification" {
         $pending.Signals[0].PSObject.Properties.Name | Should -Contain "EvidenceType"
     }
 }
+
+Describe "Restore-WindowsDefaults scope contracts" {
+    It "declares independent AppX scopes and mutation permissions" {
+        $scopes = @(Get-RestoreScopeCatalog)
+
+        @($scopes.Scope) | Should -Contain "CurrentUser"
+        @($scopes.Scope) | Should -Contain "AllUsers"
+        @($scopes.Scope) | Should -Contain "Provisioned"
+        @($scopes.Scope) | Should -Contain "OfflineImage"
+        ($scopes | Where-Object Scope -eq "CurrentUser").CanMutate | Should -BeTrue
+        ($scopes | Where-Object Scope -eq "AllUsers").CanMutate | Should -BeFalse
+        ($scopes | Where-Object Scope -eq "Provisioned").CanMutate | Should -BeFalse
+        ($scopes | Where-Object Scope -eq "OfflineImage").CanMutate | Should -BeFalse
+        ($scopes | Where-Object Scope -eq "OfflineImage").Status | Should -Be "ReadOnly"
+    }
+
+    It "keeps current-user, all-user, provisioned, and combined observations distinct" {
+        $expected = @(@{Name="Test.Package";Role="Core"})
+        $installed = @([pscustomobject]@{Name="Test.Package"})
+        $provisioned = @([pscustomobject]@{DisplayName="Test.Package"})
+
+        $current = Get-AppxPackageRemovalReport -ExpectedPackages $expected -InstalledPackages $installed -Scope CurrentUser
+        $allUsers = Get-AppxPackageRemovalReport -ExpectedPackages $expected -InstalledPackages $installed -Scope AllUsers
+        $image = Get-AppxPackageRemovalReport -ExpectedPackages $expected -ProvisionedPackages $provisioned -Scope Provisioned
+        $combined = Get-AppxPackageRemovalReport -ExpectedPackages $expected -InstalledPackages $installed -ProvisionedPackages $provisioned -Scope Combined
+
+        $current.Scope | Should -Be "CurrentUser"
+        $current.CurrentUserOnlyObservation | Should -BeTrue
+        $current.MachineWideObservation | Should -BeFalse
+        $current.Findings[0].Status | Should -Be "Present"
+        $allUsers.Scope | Should -Be "AllUsers"
+        $allUsers.MachineWideObservation | Should -BeTrue
+        $allUsers.ScopeStatus | Should -Be "ReadOnly"
+        $image.Scope | Should -Be "Provisioned"
+        $image.Findings[0].Status | Should -Be "Provisioned"
+        $combined.Scope | Should -Be "Combined"
+        $combined.Findings[0].Status | Should -Be "Present"
+    }
+
+    It "gates read-only scopes without blocking unrelated categories" {
+        $scopeManagement = [pscustomobject]@{ IsManaged=$false; IsKnown=$true; DomainJoined=$false; MdmEnrolled=$false }
+        $scopeProvider = {
+            [pscustomobject]@{
+                ProductName="Windows 11 Pro"; ProductFamily="Windows 11"; EditionID="Professional"
+                DisplayVersion="25H2"; CurrentBuild=26100; Architecture="AMD64"; Locale="en-US"
+                IsWindows=$true; IsOnline=$true; PowerShellMajor=5; IsWindowsPowerShell=$true; IsAdministrator=$true
+            }
+        }
+        $scopeProfile = Get-RestoreMachineProfile -OperatingSystemProvider $scopeProvider -ManagementState $scopeManagement
+        $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @("chkAppx","chkTheme") -MachineProfile $scopeProfile -RestoreScope AllUsers)
+        $appx = $evaluations | Where-Object Key -eq "chkAppx"
+        $theme = $evaluations | Where-Object Key -eq "chkTheme"
+
+        $appx.Scope | Should -Be "AllUsers"
+        $appx.ScopeStatus | Should -Be "ReadOnly"
+        $appx.CanMutate | Should -BeFalse
+        $appx.Reason | Should -Match "AllUsers"
+        $theme.CanMutate | Should -BeTrue
+
+        $offline = @(Get-RestoreCapabilityEvaluation -SelectedKeys @("chkAppx") -MachineProfile $scopeProfile -RestoreScope OfflineImage)[0]
+        $offline.CanMutate | Should -BeFalse
+        $offline.Reason | Should -Match "OfflineImage scope requires -OfflineImagePath"
+
+        $plan = Get-RestoreActionPlan -SelectedKeys @("chkAppx") -MachineProfile $scopeProfile -RestoreScope Provisioned
+        $plan.Status | Should -Be "Blocked"
+        $plan.RequestedRestoreScope | Should -Be "Provisioned"
+        $gate = @($plan.Operations | Where-Object Kind -eq "CapabilityGate")[0]
+        $gate.Metadata.RequestedScope | Should -Be "Provisioned"
+        $gate.Metadata.ScopeStatus | Should -Be "ReadOnly"
+    }
+
+    It "declares registry hive scope in observations and plan state" {
+        (Get-RestoreRegistryScope -Path "HKCU:\Software\Restore-WindowsDefaults-Test").ToString() | Should -Be "CurrentUser"
+        (Get-RestoreRegistryScope -Path "HKLM:\SOFTWARE\Restore-WindowsDefaults-Test").ToString() | Should -Be "Machine"
+        (Get-RestoreRegistryScope -Path "HKU:\.DEFAULT\Software\Restore-WindowsDefaults-Test").ToString() | Should -Be "AllUsers"
+        (Get-RestoreRegistryScope -Path "HKCR:\Restore-WindowsDefaults-Test").ToString() | Should -Be "MachineAndUser"
+        (Get-RestoreRegistryScope -Path "HKEY_CURRENT_USER\Software\Restore-WindowsDefaults-Test").ToString() | Should -Be "CurrentUser"
+        (Get-RestoreRegistryPlanState -Path "HKCU:\Software\Restore-WindowsDefaults-Missing" -Name "Value").Scope | Should -Be "CurrentUser"
+    }
+
+    It "fails closed for offline image observations without a mounted image path" {
+        $report = Get-AppxPackageRemovalReport -ExpectedPackages @(@{Name="Test.Package";Role="Core"}) -Scope OfflineImage
+
+        $report.ScopeStatus | Should -Be "Unsupported"
+        $report.ScopeReason | Should -Match "image path"
+        $report.CanAutoFix | Should -BeFalse
+        $report.Findings[0].Status | Should -Be "Unavailable"
+    }
+}

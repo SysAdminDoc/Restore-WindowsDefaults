@@ -19,6 +19,8 @@ param(
     [switch]$BaselineReport,
     [switch]$AllowManagedPolicy,
     [switch]$WhatIf,
+    [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
+    [string]$OfflineImagePath,
     [string]$PlanPath,
     [string[]]$RemoteComputerName,
     [string]$RemoteScriptPath
@@ -54,6 +56,10 @@ $script:CapabilityExitCode = 0
 $script:ManagementState = $null
 $script:ManagedPolicyOverrideRequested = [bool]$AllowManagedPolicy
 $script:WhatIfRequested = [bool]$WhatIf
+$script:ScopeSchemaVersion = 1
+$script:RequestedRestoreScope = $RestoreScope
+$script:RequestedOfflineImagePath = $OfflineImagePath
+$script:DefaultAppxRestoreScope = "CurrentUser"
 $script:NativeCommandSchemaVersion = 1
 $script:NativeCommandMaxOutputBytes = 256KB
 $script:NativeCommandResults = New-Object System.Collections.Generic.List[object]
@@ -123,6 +129,8 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($BaselineReport) { $relaunchArgs += "-BaselineReport" }
     if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
     if ($WhatIf) { $relaunchArgs += "-WhatIf" }
+    if ($RestoreScope) { $relaunchArgs += @("-RestoreScope", $RestoreScope) }
+    if ($OfflineImagePath) { $relaunchArgs += @("-OfflineImagePath", "`"$OfflineImagePath`"") }
     if ($PlanPath) { $relaunchArgs += @("-PlanPath", "`"$PlanPath`"") }
     if ($RemoteComputerName) { $relaunchArgs += @("-RemoteComputerName", "`"$($RemoteComputerName -join ',')`"") }
     if ($RemoteScriptPath) { $relaunchArgs += @("-RemoteScriptPath", "`"$RemoteScriptPath`"") }
@@ -149,6 +157,8 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($BaselineReport) { $relaunchArgs += "-BaselineReport" }
     if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
     if ($WhatIf) { $relaunchArgs += "-WhatIf" }
+    if ($RestoreScope) { $relaunchArgs += @("-RestoreScope", $RestoreScope) }
+    if ($OfflineImagePath) { $relaunchArgs += @("-OfflineImagePath", "`"$OfflineImagePath`"") }
     if ($PlanPath) { $relaunchArgs += @("-PlanPath", "`"$PlanPath`"") }
     if ($RemoteComputerName) { $relaunchArgs += @("-RemoteComputerName", "`"$($RemoteComputerName -join ',')`"") }
     if ($RemoteScriptPath) { $relaunchArgs += @("-RemoteScriptPath", "`"$RemoteScriptPath`"") }
@@ -178,6 +188,45 @@ function Get-AppxPackageSafe {
         if ($AllUsers) { return @(Get-AppxPackage -AllUsers $Name -EA Stop) }
         else { return (Get-AppxPackage $Name -EA Stop) }
     } catch { return $null }
+}
+
+function Get-RestoreScopeCatalog {
+    return @(
+        [pscustomobject][ordered]@{
+            Scope="CurrentUser"; Target="Online AppX packages registered for the current user"; Resource="AppX"
+            ObservationCommand="Get-AppxPackage"; MutationCommand="Add-AppxPackage -Register"; CanObserve=$true; CanMutate=$true
+            RequiresAdministrator=$false; RequiresOnline=$true; RequiresImage=$false; Status="Supported"
+            Reason="Current-user AppX registration is supported by the online restore executor"
+        },
+        [pscustomobject][ordered]@{
+            Scope="AllUsers"; Target="Online AppX packages registered for all existing users"; Resource="AppX"
+            ObservationCommand="Get-AppxPackage -AllUsers"; MutationCommand=$null; CanObserve=$true; CanMutate=$false
+            RequiresAdministrator=$true; RequiresOnline=$true; RequiresImage=$false; Status="ReadOnly"
+            Reason="All-user inventory is observable, but Add-AppxPackage registration remains per-user"
+        },
+        [pscustomobject][ordered]@{
+            Scope="Provisioned"; Target="Online AppX packages provisioned for future users"; Resource="AppX"
+            ObservationCommand="Get-AppxProvisionedPackage -Online"; MutationCommand=$null; CanObserve=$true; CanMutate=$false
+            RequiresAdministrator=$true; RequiresOnline=$true; RequiresImage=$false; Status="ReadOnly"
+            Reason="Provisioned-package servicing is a separate image operation and is not part of online registration"
+        },
+        [pscustomobject][ordered]@{
+            Scope="OfflineImage"; Target="AppX packages provisioned in a mounted offline image"; Resource="AppX"
+            ObservationCommand="Get-AppxProvisionedPackage -Path"; MutationCommand=$null; CanObserve=$true; CanMutate=$false
+            RequiresAdministrator=$true; RequiresOnline=$false; RequiresImage=$true; Status="ReadOnly"
+            Reason="Mounted offline-image observation is read-only; mutation requires the separate bounded offline workflow"
+        }
+    )
+}
+
+function Get-RestoreRegistryScope {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $normalized = $Path -replace '^Microsoft\.PowerShell\.Core\\Registry::', ''
+    if ($normalized -match '^(?:HKCU:|HKEY_CURRENT_USER(?:\\|$))') { return "CurrentUser" }
+    if ($normalized -match '^(?:HKLM:|HKEY_LOCAL_MACHINE(?:\\|$))') { return "Machine" }
+    if ($normalized -match '^(?:HKU:|HKEY_USERS(?:\\|$))') { return "AllUsers" }
+    if ($normalized -match '^(?:HKCR:|HKEY_CLASSES_ROOT(?:\\|$))') { return "MachineAndUser" }
+    return "Unknown"
 }
 
 # ============================================================================
@@ -279,7 +328,7 @@ function Remove-RegistryValue {
         if ($script:ActionPlanCapture) {
             $before = Get-RestoreRegistryPlanState -Path $Path -Name $Name
             $exists = $before.Exists -eq $true
-            Add-RestoreActionPlanOperation -Kind "RegistryValue" -Action $(if($exists){"Remove"}else{"NoOp"}) -Target "$Path\$Name" -Before $before -After ([pscustomobject]@{Exists=$false;Path=$Path;Name=$Name;Type=$null;Value=$null}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" }) -CanExecute:$exists -Reason $(if($exists){$null}else{"Registry value is already absent"}) -Verification "Registry value is absent"
+            Add-RestoreActionPlanOperation -Kind "RegistryValue" -Action $(if($exists){"Remove"}else{"NoOp"}) -Target "$Path\$Name" -Before $before -After ([pscustomobject]@{Exists=$false;Path=$Path;Name=$Name;Type=$null;Value=$null}) -Scope (Get-RestoreRegistryScope -Path $Path) -CanExecute:$exists -Reason $(if($exists){$null}else{"Registry value is already absent"}) -Verification "Registry value is absent"
             return $false
         }
         if (Test-Path $Path) {
@@ -306,7 +355,7 @@ function Set-RegistryValue {
     try {
         $before = Get-RestoreRegistryPlanState -Path $Path -Name $Name
         if ($script:ActionPlanCapture) {
-            Add-RestoreActionPlanOperation -Kind "RegistryValue" -Action "Set" -Target "$Path\$Name" -Before $before -After ([pscustomobject]@{Exists=$true;Path=$Path;Name=$Name;Type=$Type;Value=$Value}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" })
+            Add-RestoreActionPlanOperation -Kind "RegistryValue" -Action "Set" -Target "$Path\$Name" -Before $before -After ([pscustomobject]@{Exists=$true;Path=$Path;Name=$Name;Type=$Type;Value=$Value}) -Scope (Get-RestoreRegistryScope -Path $Path)
             return $false
         }
         if ($script:WhatIfRequested) { return $false }
@@ -334,7 +383,7 @@ function Remove-RegistryKey {
     try {
         if ($script:ActionPlanCapture) {
             $exists = Test-Path -LiteralPath $Path
-            Add-RestoreActionPlanOperation -Kind "RegistryKey" -Action $(if($exists){"Remove"}else{"NoOp"}) -Target $Path -Before ([pscustomobject]@{Exists=$exists;Path=$Path}) -After ([pscustomobject]@{Exists=$false;Path=$Path}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" }) -RollbackAction "Restore captured key state" -CanExecute:$exists -Reason $(if($exists){$null}else{"Registry key is already absent"}) -Verification "Registry key is absent"
+            Add-RestoreActionPlanOperation -Kind "RegistryKey" -Action $(if($exists){"Remove"}else{"NoOp"}) -Target $Path -Before ([pscustomobject]@{Exists=$exists;Path=$Path}) -After ([pscustomobject]@{Exists=$false;Path=$Path}) -Scope (Get-RestoreRegistryScope -Path $Path) -RollbackAction "Restore captured key state" -CanExecute:$exists -Reason $(if($exists){$null}else{"Registry key is already absent"}) -Verification "Registry key is absent"
             return $false
         }
         if (Test-Path $Path) {
@@ -358,7 +407,7 @@ function New-RestoreRegistryKey {
         $exists = Test-Path -LiteralPath $Path
         $needsChange = -not $exists
         if ($script:ActionPlanCapture) {
-            Add-RestoreActionPlanOperation -Kind "RegistryKey" -Action $(if($needsChange){"Ensure"}else{"NoOp"}) -Target $Path -Before ([pscustomobject]@{Exists=$exists;Path=$Path}) -After ([pscustomobject]@{Exists=$true;Path=$Path}) -Scope $(if ($Path -like "HKCU:*") { "CurrentUser" } else { "Machine" }) -RollbackAction "Remove key if it was created by this plan" -CanExecute:$needsChange -Reason $(if($needsChange){$null}else{"Registry key already exists"}) -Verification "Registry key exists"
+            Add-RestoreActionPlanOperation -Kind "RegistryKey" -Action $(if($needsChange){"Ensure"}else{"NoOp"}) -Target $Path -Before ([pscustomobject]@{Exists=$exists;Path=$Path}) -After ([pscustomobject]@{Exists=$true;Path=$Path}) -Scope (Get-RestoreRegistryScope -Path $Path) -RollbackAction "Remove key if it was created by this plan" -CanExecute:$needsChange -Reason $(if($needsChange){$null}else{"Registry key already exists"}) -Verification "Registry key exists"
             return $false
         }
         if ($script:WhatIfRequested -or -not $needsChange) { return $false }
@@ -483,17 +532,56 @@ function Get-RestoreScheduledTaskPlanState {
 }
 
 function Get-RestoreAppxPlanState {
-    param([Parameter(Mandatory=$true)][string]$PackageName,[string]$Scope="CurrentUser")
-    $allUsers = $Scope -in @("AllUsers","Provisioned")
-    $packages = @(Get-AppxPackageSafe -Name $PackageName -AllUsers:$allUsers | Where-Object { $_ })
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$PackageName,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$Scope="CurrentUser",
+        [string]$ImagePath
+    )
+    $packages = @()
+    $scopeStatus = "Supported"
+    $scopeReason = $null
+    $isProvisionedScope = $Scope -in @("Provisioned","OfflineImage")
+    try {
+        switch ($Scope) {
+            "CurrentUser" { $packages = @(Get-AppxPackageSafe -Name $PackageName | Where-Object { $_ }) }
+            "AllUsers" { $packages = @(Get-AppxPackageSafe -Name $PackageName -AllUsers | Where-Object { $_ }) }
+            "Provisioned" {
+                $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
+                    $_.DisplayName -eq $PackageName -or $_.PackageName -eq $PackageName -or $_.PackageName -like ($PackageName + "_*")
+                })
+                $packages = @($provisioned)
+            }
+            "OfflineImage" {
+                if ([string]::IsNullOrWhiteSpace($ImagePath)) {
+                    $scopeStatus = "Unsupported"; $scopeReason = "OfflineImage scope requires an image path"
+                } elseif (-not (Test-Path -LiteralPath $ImagePath -PathType Container)) {
+                    $scopeStatus = "Unsupported"; $scopeReason = "Offline image path is not a mounted directory"
+                } else {
+                    $provisioned = @(Get-AppxProvisionedPackage -Path $ImagePath -ErrorAction Stop | Where-Object {
+                        $_.DisplayName -eq $PackageName -or $_.PackageName -eq $PackageName -or $_.PackageName -like ($PackageName + "_*")
+                    })
+                    $packages = @($provisioned)
+                }
+            }
+        }
+    } catch {
+        $scopeStatus = "Unavailable"
+        $scopeReason = "Could not read $Scope AppX state: $($_.Exception.Message)"
+    }
     $summaries = @($packages | ForEach-Object {
         [pscustomobject][ordered]@{
             Name=[string]$_.Name; FullName=[string]$_.PackageFullName; Version=[string]$_.Version
             InstallLocation=[string]$_.InstallLocation; PackageFamilyName=[string]$_.PackageFamilyName
+            DisplayName=[string]$_.DisplayName; ProvisionedPackageName=[string]$_.PackageName
         }
     })
     return [pscustomobject][ordered]@{
-        PackageName=$PackageName; Scope=$Scope; Installed=($summaries.Count -gt 0); Packages=$summaries
+        SchemaVersion=$script:ScopeSchemaVersion; PackageName=$PackageName; Scope=$Scope; ImagePath=$ImagePath
+        ScopeStatus=$scopeStatus; ScopeReason=$scopeReason; IsProvisioned=$isProvisionedScope
+        Installed=if($isProvisionedScope){$false}else{($summaries.Count -gt 0)}
+        Provisioned=if($isProvisionedScope){($summaries.Count -gt 0)}else{$false}
+        Present=($summaries.Count -gt 0); Packages=$summaries
     }
 }
 
@@ -816,30 +904,34 @@ function Invoke-RestoreAppxRegistration {
         [Parameter(Mandatory=$true)][string]$PackageName,
         [string]$ManifestPath,
         [string]$PackageFamilyName,
-        [string]$Scope="CurrentUser",
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$Scope="CurrentUser",
+        [string]$ImagePath,
         [switch]$Silent
     )
     $target = if($ManifestPath){"$PackageName ($ManifestPath)"}else{"$PackageName ($PackageFamilyName)"}
-    $before = Get-RestoreAppxPlanState -PackageName $PackageName -Scope $Scope
+    if ($Scope -ne "CurrentUser") {
+        return [pscustomobject][ordered]@{Status="Unsupported";Success=$false;Changed=$false;Scope=$Scope;Target=$target;Reason="AppX registration is only supported for CurrentUser; $Scope is observation-only in the online restore executor"}
+    }
+    $before = Get-RestoreAppxPlanState -PackageName $PackageName -Scope $Scope -ImagePath $ImagePath
     $before | Add-Member -NotePropertyName ManifestPath -NotePropertyValue $ManifestPath
     $before | Add-Member -NotePropertyName PackageFamilyName -NotePropertyValue $PackageFamilyName
-    $after = [pscustomobject][ordered]@{PackageName=$PackageName;Installed=$true;Scope=$Scope;ManifestPath=$ManifestPath;PackageFamilyName=$PackageFamilyName}
+    $after = [pscustomobject][ordered]@{PackageName=$PackageName;Installed=$true;Provisioned=$false;Scope=$Scope;ImagePath=$ImagePath;ManifestPath=$ManifestPath;PackageFamilyName=$PackageFamilyName}
     if ($script:ActionPlanCapture) {
-        Add-RestoreActionPlanOperation -Kind "AppX" -Action "Register" -Target $target -Before $before -After $after -Scope $Scope -RollbackAction "Restore captured AppX package state" -Risk "High" -Verification "Package is present in the requested scope" -Metadata ([pscustomobject]@{PackageName=$PackageName;ManifestPath=$ManifestPath;PackageFamilyName=$PackageFamilyName;Scope=$Scope})
-        return [pscustomobject]@{Success=$false;Planned=$true;Target=$target}
+        Add-RestoreActionPlanOperation -Kind "AppX" -Action "Register" -Target "$target [$Scope]" -Before $before -After $after -Scope $Scope -RollbackAction "Restore captured AppX package state" -Risk "High" -Verification "Package is present in the requested scope" -Metadata ([pscustomobject]@{PackageName=$PackageName;ManifestPath=$ManifestPath;PackageFamilyName=$PackageFamilyName;Scope=$Scope;ImagePath=$ImagePath})
+        return [pscustomobject][ordered]@{Status="Planned";Success=$false;Changed=$false;Planned=$true;Scope=$Scope;Target=$target}
     }
-    if ($script:WhatIfRequested) { return [pscustomobject]@{Success=$false;Planned=$true;Target=$target} }
+    if ($script:WhatIfRequested) { return [pscustomobject][ordered]@{Status="Planned";Success=$false;Changed=$false;Planned=$true;Scope=$Scope;Target=$target} }
     try {
-        if (-not $PSCmdlet.ShouldProcess($target, "register AppX package")) { return [pscustomobject]@{Success=$false;Skipped=$true;Target=$target} }
+        if (-not $PSCmdlet.ShouldProcess("$target [$Scope]", "register AppX package")) { return [pscustomobject][ordered]@{Status="Skipped";Success=$false;Changed=$false;Skipped=$true;Scope=$Scope;Target=$target} }
         if ($ManifestPath) { Add-AppxPackage -DisableDevelopmentMode -Register $ManifestPath -ErrorAction Stop }
         elseif ($PackageFamilyName) { Add-AppxPackage -RegisterByFamilyName -MainPackage $PackageFamilyName -ErrorAction Stop }
         else { throw "ManifestPath or PackageFamilyName is required" }
         if (-not $Silent) { Write-Log "Registered AppX package: $PackageName" -Level Success }
         $script:ChangesCount++
-        return [pscustomobject]@{Success=$true;Target=$target}
+        return [pscustomobject][ordered]@{Status="Changed";Success=$true;Changed=$true;Scope=$Scope;Target=$target}
     } catch {
         if (-not $Silent) { Write-Log "Could not register AppX package $PackageName - $($_.Exception.Message)" -Level Warning }
-        return [pscustomobject]@{Success=$false;Target=$target;Error=$_.Exception.Message}
+        return [pscustomobject][ordered]@{Status="Failed";Success=$false;Changed=$false;Scope=$Scope;Target=$target;FailureReason=$_.Exception.Message;Error=$_.Exception.Message}
     }
 }
 
@@ -967,7 +1059,7 @@ function Get-RegistryDefaultBaselineReport {
         $matchesDefault = if ($entry.Action -eq "Remove") { -not $present }
             else { $present -and (($current.$($entry.ValueName) | ConvertTo-Json -Compress) -eq ($entry.DefaultValue | ConvertTo-Json -Compress)) }
         $findings += [pscustomobject][ordered]@{
-            Name=$entry.Name; Path=$entry.Path; ValueName=$entry.ValueName; Category=$entry.Category
+            Name=$entry.Name; Path=$entry.Path; Scope=(Get-RestoreRegistryScope -Path $entry.Path); ValueName=$entry.ValueName; Category=$entry.Category
             Action=$entry.Action; CurrentValue=if($present){$current.$($entry.ValueName)}else{$null}
             IsDefault=$matchesDefault; CatalogSchemaVersion=$catalog.CatalogSchemaVersion; CatalogVersion=$catalog.CatalogVersion
             SourceUrl=$catalog.SourceUrl; PolicyMapping=$catalog.PolicyMapping
@@ -1406,7 +1498,7 @@ function Get-RegistrySnapshot {
                     elseif ($value -is [int] -or $value -is [int32] -or $value -is [bool]) { "DWord" }
                     else { "String" }
                 $entries.Add([pscustomobject][ordered]@{
-                    Path=$keyPath; Name=[string]$propertyName; Type=$valueType; Value=$value
+                    Path=$keyPath; Scope=(Get-RestoreRegistryScope -Path $keyPath); Name=[string]$propertyName; Type=$valueType; Value=$value
                 })
             }
         }
@@ -1416,6 +1508,7 @@ function Get-RegistrySnapshot {
         SchemaVersion=$script:RegistrySnapshotSchemaVersion
         CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
         ComputerName=$env:COMPUTERNAME
+        ScopeModel="CurrentUser/Machine/AllUsers registry hives; offline image registry is not mounted by this snapshot"
         Entries=$entryArray
     }
 }
@@ -1487,18 +1580,47 @@ function Compare-RegistrySnapshot {
 }
 
 function Get-AppxPackageRemovalReport {
+    [CmdletBinding()]
     param(
         [object[]]$ExpectedPackages = $script:CoreAppxPackageCatalog,
         [object[]]$InstalledPackages,
         [object[]]$ProvisionedPackages,
-        [object]$MachineProfile
+        [object]$MachineProfile,
+        [ValidateSet("Combined","CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$Scope="Combined",
+        [string]$OfflineImagePath
     )
     $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
-    if ($PSBoundParameters.ContainsKey('InstalledPackages')) { $installed = @($InstalledPackages) }
-    else { $installed = @(Get-AppxPackageSafe) }
-    if ($PSBoundParameters.ContainsKey('ProvisionedPackages')) { $provisioned = @($ProvisionedPackages) }
-    else {
-        try { $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) } catch { $provisioned = @() }
+    $scopeDescriptor = if ($Scope -eq "Combined") {
+        [pscustomobject][ordered]@{Scope="Combined";Target="Current-user registration plus online provisioned image";Status="Supported";Reason="Combined observation keeps user and provisioned state distinct";CanObserve=$true;CanMutate=$false}
+    } else {
+        @(Get-RestoreScopeCatalog | Where-Object Scope -eq $Scope | Select-Object -First 1)
+    }
+    $scopeStatus = if ($scopeDescriptor) { [string]$scopeDescriptor.Status } else { "Unsupported" }
+    $scopeReason = if ($scopeDescriptor) { [string]$scopeDescriptor.Reason } else { "AppX scope is not declared" }
+    $installed = @()
+    $provisioned = @()
+    if ($Scope -in @("Combined","CurrentUser","AllUsers")) {
+        if ($PSBoundParameters.ContainsKey('InstalledPackages')) { $installed = @($InstalledPackages) }
+        else {
+            try { $installed = if ($Scope -eq "AllUsers") { @(Get-AppxPackageSafe -AllUsers) } else { @(Get-AppxPackageSafe) } }
+            catch { $scopeStatus = "Unavailable"; $scopeReason = "Could not read $Scope AppX state: $($_.Exception.Message)" }
+        }
+    }
+    if ($Scope -in @("Combined","Provisioned")) {
+        if ($PSBoundParameters.ContainsKey('ProvisionedPackages')) { $provisioned = @($ProvisionedPackages) }
+        else {
+            try { $provisioned = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop) }
+            catch { $scopeStatus = "Unavailable"; $scopeReason = "Could not read online provisioned AppX state: $($_.Exception.Message)" }
+        }
+    } elseif ($Scope -eq "OfflineImage") {
+        if ([string]::IsNullOrWhiteSpace($OfflineImagePath)) {
+            $scopeStatus = "Unsupported"; $scopeReason = "OfflineImage scope requires an image path"
+        } elseif (-not (Test-Path -LiteralPath $OfflineImagePath -PathType Container)) {
+            $scopeStatus = "Unsupported"; $scopeReason = "Offline image path is not a mounted directory"
+        } else {
+            try { $provisioned = @(Get-AppxProvisionedPackage -Path $OfflineImagePath -ErrorAction Stop) }
+            catch { $scopeStatus = "Unavailable"; $scopeReason = "Could not read offline provisioned AppX state: $($_.Exception.Message)" }
+        }
     }
     $installedNames = @($installed | ForEach-Object {
         if ($_.Name) { [string]$_.Name } elseif ($_.PackageName) { [string]$_.PackageName } else { [string]$_ }
@@ -1515,12 +1637,15 @@ function Get-AppxPackageRemovalReport {
         } else { Get-RestoreCatalogEntryEvaluation -Entry $expected -Context $context }
         $installedMatch = @($installedNames | Where-Object { $_ -eq $name -or $_ -like ($name + "_*") }).Count -gt 0
         $provisionedMatch = @($provisionedNames | Where-Object { $_ -eq $name -or $_ -like ($name + "_*") }).Count -gt 0
-        $status = if ($installedMatch) { "Present" } elseif ($provisionedMatch) { "ProvisionedOnly" } else { "Missing" }
-        if ($status -eq "Present") { $present += $name }
+        $status = if ($scopeStatus -notin @("Supported","ReadOnly")) { "Unavailable" }
+            elseif ($Scope -in @("Provisioned","OfflineImage")) { if ($provisionedMatch) { "Provisioned" } else { "Missing" } }
+            elseif ($Scope -eq "Combined") { if ($installedMatch) { "Present" } elseif ($provisionedMatch) { "ProvisionedOnly" } else { "Missing" } }
+            elseif ($installedMatch) { "Present" } else { "Missing" }
+        if ($status -eq "Present" -or $status -eq "Provisioned") { $present += $name }
         elseif ($status -eq "ProvisionedOnly") { $provisionedOnly += $name }
-        else { $missing += $name }
+        elseif ($status -eq "Missing") { $missing += $name }
         $findings += [pscustomobject][ordered]@{
-            Name=$name; Role=$role; Status=$status; CatalogSchemaVersion=$catalog.CatalogSchemaVersion
+            Name=$name; Role=$role; Scope=$Scope; ScopeStatus=$scopeStatus; ScopeReason=$scopeReason; Status=$status; CatalogSchemaVersion=$catalog.CatalogSchemaVersion
             CatalogVersion=$catalog.CatalogVersion; CatalogKind=$catalog.CatalogKind; SourceUrl=$catalog.SourceUrl
             PolicyMapping=$catalog.PolicyMapping; SupportedProductFamilies=$catalog.SupportedProductFamilies
             SupportedBuildRange=$catalog.SupportedBuildRange; SupportedEditions=$catalog.SupportedEditions
@@ -1531,13 +1656,16 @@ function Get-AppxPackageRemovalReport {
     $catalogWarnings = @($findings | Where-Object { $_.CatalogStatus -ne "Verified" })
     $confidence = if ($catalogWarnings.Count) { "Unknown" } elseif (@($findings | Where-Object Confidence -eq "Medium").Count) { "Medium" } else { "High" }
     return [pscustomobject][ordered]@{
+        ScopeSchemaVersion=$script:ScopeSchemaVersion; Scope=$Scope; ScopeStatus=$scopeStatus; ScopeReason=$scopeReason
+        ScopeTarget=if($scopeDescriptor){$scopeDescriptor.Target}else{"Unknown AppX scope"}; OfflineImagePath=$OfflineImagePath
+        MachineWideObservation=($Scope -in @("AllUsers","Provisioned","OfflineImage")); CurrentUserOnlyObservation=($Scope -eq "CurrentUser")
         ExpectedCount=@($ExpectedPackages).Count; InstalledCount=$installedNames.Count
         ProvisionedCount=$provisionedNames.Count; Present=@($present)
         ProvisionedOnly=@($provisionedOnly); Missing=@($missing)
         MissingCount=$missing.Count; ProvisionedOnlyCount=$provisionedOnly.Count
         SchemaVersion=$script:BaselineCatalogSchemaVersion; CatalogVersion=$script:BaselineCatalogVersion
         CatalogKind="AppXBaseline"; CatalogStatus=if($catalogWarnings.Count){"Warnings"}else{"Verified"}
-        Confidence=$confidence; CanAutoFix=($catalogWarnings.Count -eq 0); Findings=@($findings)
+        Confidence=$confidence; CanAutoFix=($catalogWarnings.Count -eq 0 -and $scopeStatus -eq "Supported"); Findings=@($findings)
         UnknownExpectedPackages=@($catalogWarnings.Name); Warnings=@($catalogWarnings | ForEach-Object { $_.Warning })
     }
 }
@@ -1566,9 +1694,11 @@ function Compare-AppxPackageBaseline {
             if ($_ -match 'PackageName\s*:\s*(\S+)') { $Matches[1] }
         })
     } else { throw "Specify BaselinePath or WimPath" }
-    $report = Get-AppxPackageRemovalReport -ExpectedPackages $baselineNames -InstalledPackages $InstalledPackages -ProvisionedPackages $ProvisionedPackages
+    $report = Get-AppxPackageRemovalReport -ExpectedPackages $baselineNames -InstalledPackages $InstalledPackages -ProvisionedPackages $ProvisionedPackages -Scope "Combined"
     $report | Add-Member -NotePropertyName BaselinePath -NotePropertyValue $BaselinePath
     $report | Add-Member -NotePropertyName WimPath -NotePropertyValue $WimPath
+    $report | Add-Member -NotePropertyName BaselineScope -NotePropertyValue $(if($WimPath){"OfflineImage"}else{"ExternalBaseline"})
+    $report | Add-Member -NotePropertyName BaselineScopeStatus -NotePropertyValue $(if($WimPath){"ReadOnlyEvidence"}else{"ReadOnlyEvidence"})
     return $report
 }
 
@@ -1979,8 +2109,8 @@ function Restore-StoreWingetServiceChain {
             $manifest = if ($package.InstallLocation) { Join-Path $package.InstallLocation "AppxManifest.xml" } else { $null }
             if ($manifest -and (Test-Path -LiteralPath $manifest)) {
                 try {
-                    $registration = Invoke-RestoreAppxRegistration -PackageName $packageName -ManifestPath $manifest -Scope "AllUsers" -Silent
-                    if ($registration.Success -or $registration.Planned) { Write-Log "Re-registered $packageName" -Level Success }
+                    $registration = Invoke-RestoreAppxRegistration -PackageName $packageName -ManifestPath $manifest -Scope "CurrentUser" -Silent
+                    if ($registration.Success -or $registration.Planned) { Write-Log "Re-registered $packageName for the current user (source: AllUsers inventory)" -Level Success }
                 } catch { Write-Log "Could not re-register $packageName" -Level Warning }
             }
         }
@@ -3820,7 +3950,13 @@ function Restore-WindowsFeatures {
 
 function Restore-AppxPackages {
     Write-Log "=== APPX PACKAGE RESTORATION ===" -Level Section
-    Write-Log "Attempting to reinstall removed Windows Store apps..." -Level Info
+    $scope = if($script:RequestedRestoreScope){[string]$script:RequestedRestoreScope}else{$script:DefaultAppxRestoreScope}
+    Write-Log "Target AppX scope: $scope" -Level Info
+    if ($scope -ne "CurrentUser") {
+        Write-Log "AppX scope $scope is observation-only; no online registration was attempted" -Level Warning
+        return
+    }
+    Write-Log "Attempting to reinstall removed Windows Store apps for the current user..." -Level Info
 
     # Core Windows packages that should be present on a stock install
     $corePackages = @(
@@ -3914,7 +4050,7 @@ function Restore-AppxPackages {
             foreach ($op in $otherPkgs) {
                 if ($op.InstallLocation -and (Test-Path "$($op.InstallLocation)\AppxManifest.xml")) {
                     try {
-                        $registration = Invoke-RestoreAppxRegistration -PackageName $name -ManifestPath "$($op.InstallLocation)\AppxManifest.xml" -Scope "CurrentUser" -Silent
+                        $registration = Invoke-RestoreAppxRegistration -PackageName $name -ManifestPath "$($op.InstallLocation)\AppxManifest.xml" -Scope $scope -Silent
                         if ($registration.Success -or $registration.Planned) {
                             $installed++; $success = $true
                             Write-Log "Reinstalled: $name (manifest)" -Level Success
@@ -3929,7 +4065,7 @@ function Restore-AppxPackages {
         # Method 2: Try package family name
         $familyName = "${name}_${pub}"
         try {
-            $registration = Invoke-RestoreAppxRegistration -PackageName $name -PackageFamilyName $familyName -Scope "CurrentUser" -Silent
+            $registration = Invoke-RestoreAppxRegistration -PackageName $name -PackageFamilyName $familyName -Scope $scope -Silent
             if ($registration.Success -or $registration.Planned) {
                 $installed++
                 Write-Log "Reinstalled: $name (family)" -Level Success
@@ -4133,6 +4269,7 @@ function Get-RestoreCapabilityCatalog {
     )
     $userScopedKeys = @("chkPrivacy","chkSync","chkNotifications","chkBgApps","chkEnvVars","chkDevicePrivacy","chkTaskbar","chkExplorer","chkStartMenu","chkTheme","chkClipboard","chkOneDrive","chkAccount")
     $highRiskKeys = @("chkDefender","chkFirewall","chkWindowsUpdate","chkUAC","chkSecurityUI","chkCrypto","chkFeatures","chkAppx","chkGroupPolicy","chkHostsFile")
+    $appxScopeCapabilities = @(Get-RestoreScopeCatalog)
     $catalog = [ordered]@{}
     foreach ($key in @($FunctionMap.Keys | Sort-Object)) {
         $managed = $key -in $managedPolicyKeys
@@ -4146,7 +4283,8 @@ function Get-RestoreCapabilityCatalog {
             RequiresAdministrator=$true; RequiresOnline=$true
             ManagedPolicyAction=if ($managed) { "Skip" } else { "Allow" }
             PolicyOwnership=if ($managed) { "Organization" } else { "LocalDefault" }
-            Scope=if ($key -in $userScopedKeys) { "CurrentUser" } else { "MachineAndUser" }
+            Scope=if ($key -eq "chkAppx") { $script:DefaultAppxRestoreScope } elseif ($key -in $userScopedKeys) { "CurrentUser" } else { "MachineAndUser" }
+            ScopeCapabilities=if ($key -eq "chkAppx") { $appxScopeCapabilities } else { @([pscustomobject][ordered]@{Scope=if($key -in $userScopedKeys){"CurrentUser"}else{"MachineAndUser"};Target=if($key -in $userScopedKeys){"Current-user settings"}else{"Machine-wide settings"};CanObserve=$true;CanMutate=$true;Status="Supported";Reason="Category scope is explicitly declared"}) }
             Risk=if ($key -in $highRiskKeys) { "High" } else { "Medium" }
         }
     }
@@ -4158,7 +4296,9 @@ function Get-RestoreCapabilityEvaluation {
     param(
         [Parameter(Mandatory=$true)][string[]]$SelectedKeys,
         [object]$MachineProfile,
-        [switch]$AllowManagedPolicy
+        [switch]$AllowManagedPolicy,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
+        [string]$OfflineImagePath
     )
     if (-not $MachineProfile) { $MachineProfile = Get-RestoreMachineProfile }
     $catalog = Get-RestoreCapabilityCatalog
@@ -4172,6 +4312,11 @@ function Get-RestoreCapabilityEvaluation {
         $managementOwnership = if ($management -and $management.PSObject.Properties['Ownership']) { [string]$management.Ownership } else { "Unknown" }
         $managementDecision = "NotEvaluated"
         $operatorOverride = [bool]$AllowManagedPolicy
+        $requestedScope = if ($definition -and $key -eq "chkAppx") { if($RestoreScope){$RestoreScope}else{[string]$definition.Scope} } elseif ($definition) { [string]$definition.Scope } else { "Unknown" }
+        $scopeCapabilities = if ($definition -and $definition.PSObject.Properties['ScopeCapabilities']) { @($definition.ScopeCapabilities) } else { @() }
+        $scopeCapability = @($scopeCapabilities | Where-Object { $_.Scope -eq $requestedScope } | Select-Object -First 1)
+        $scopeStatus = if ($scopeCapability.Count -eq 1) { [string]$scopeCapability[0].Status } else { "Unsupported" }
+        $scopeReason = if ($scopeCapability.Count -eq 1) { [string]$scopeCapability[0].Reason } else { "Requested scope '$requestedScope' is not declared for restore category '$key'" }
         if (-not $definition) {
             $status = "Unsupported"
             $reasons.Add("Restore category is not declared in the capability catalog")
@@ -4181,6 +4326,11 @@ function Get-RestoreCapabilityEvaluation {
         } elseif ($MachineProfile.Status -ne "Ready") {
             $status = "Unknown"
             foreach ($profileIssue in @($MachineProfile.ValidationIssues)) { $reasons.Add([string]$profileIssue) }
+        }
+        if ($key -eq "chkAppx" -and $requestedScope -eq "OfflineImage" -and [string]::IsNullOrWhiteSpace($OfflineImagePath)) {
+            $status = "Unsupported"; $reasons.Add("OfflineImage scope requires -OfflineImagePath")
+        } elseif ($definition -and $key -eq "chkAppx" -and $scopeStatus -notin @("Supported")) {
+            $status = "Unsupported"; $reasons.Add("Scope '$requestedScope' is ${scopeStatus}: $scopeReason")
         }
         if ($definition -and $status -eq "Supported") {
             if ($MachineProfile.ProductFamily -notin @($definition.SupportedProductFamilies)) {
@@ -4233,7 +4383,8 @@ function Get-RestoreCapabilityEvaluation {
             Key=$key; CapabilityId=if($definition){$definition.CapabilityId}else{$key}
             Status=$status; CanMutate=($status -eq "Supported")
             Reason=($reasons -join "; "); Reasons=@($reasons)
-            Scope=if($definition){$definition.Scope}else{"Unknown"}
+            Scope=$requestedScope; RequestedScope=$requestedScope; ScopeStatus=$scopeStatus; ScopeReason=$scopeReason
+            ScopeCapabilities=$scopeCapabilities; OfflineImagePath=$OfflineImagePath
             Risk=if($definition){$definition.Risk}else{"Unknown"}
             PolicyOwnership=if($definition){$definition.PolicyOwnership}else{"Unknown"}
             ManagementOwnership=$managementOwnership; ManagementDecision=$managementDecision
@@ -4250,11 +4401,13 @@ function Get-RestoreCapabilityReport {
     param(
         [string[]]$SelectedKeys,
         [object]$MachineProfile,
-        [switch]$AllowManagedPolicy
+        [switch]$AllowManagedPolicy,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
+        [string]$OfflineImagePath
     )
     if (-not $MachineProfile) { $MachineProfile = Get-RestoreMachineProfile }
     $keys = if ($SelectedKeys -and $SelectedKeys.Count -gt 0) { @($SelectedKeys | Select-Object -Unique) } else { @((Get-RestoreFunctionMap).Keys | Sort-Object) }
-    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $MachineProfile -AllowManagedPolicy:$AllowManagedPolicy)
+    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $MachineProfile -AllowManagedPolicy:$AllowManagedPolicy -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath)
     return [pscustomobject][ordered]@{
         SchemaVersion=$script:CapabilitySchemaVersion; ToolVersion=$script:Version
         GeneratedAtUtc=(Get-Date).ToUniversalTime().ToString("o")
@@ -4263,6 +4416,8 @@ function Get-RestoreCapabilityReport {
         ManagementEvidence=if($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['Evidence']){@($MachineProfile.Management.Evidence)}else{@()}
         ManagedPolicyOverride=[bool]$AllowManagedPolicy
         ManagementDecision=if($AllowManagedPolicy){"OverrideRequested"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsManaged){"SkipByDefault"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsKnown){"ReviewLocal"}else{"Unknown"}
+        ScopeSchemaVersion=$script:ScopeSchemaVersion; RequestedRestoreScope=$RestoreScope; OfflineImagePath=$OfflineImagePath
+        ScopeCapabilities=@(Get-RestoreScopeCatalog)
         PendingRebootState=(Get-RestorePendingRebootState)
         SupportedCount=@($evaluations | Where-Object CanMutate).Count
         BlockedCount=@($evaluations | Where-Object { -not $_.CanMutate }).Count
@@ -4275,15 +4430,19 @@ function Invoke-RestoreSelection {
     param(
         [Parameter(Mandatory=$true)][string[]]$SelectedKeys,
         [switch]$CreateRollbackSnapshot,
-        [switch]$AllowManagedPolicy
+        [switch]$AllowManagedPolicy,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
+        [string]$OfflineImagePath
     )
     $keys = @($SelectedKeys | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     $map = Get-RestoreFunctionMap
     $machineProfile = Get-RestoreMachineProfile
+    $script:RequestedRestoreScope = $RestoreScope
+    $script:RequestedOfflineImagePath = $OfflineImagePath
     $script:NativeCommandResults = New-Object System.Collections.Generic.List[object]
     $script:LastVerificationReport = $null
-    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy)
-    $actionPlan = Get-RestoreActionPlan -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy
+    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath)
+    $actionPlan = Get-RestoreActionPlan -SelectedKeys $keys -MachineProfile $machineProfile -AllowManagedPolicy:$AllowManagedPolicy -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath
     $script:CapabilityProfile = $machineProfile
     $script:CapabilityEvaluations = $evaluations
     $script:LastActionPlan = $actionPlan
@@ -4294,7 +4453,7 @@ function Invoke-RestoreSelection {
             CapabilityStatus=$evaluation.Status; ExecutionMode="CapabilityGate"; ActionPlanStatus="Blocked"; Reason=$evaluation.Reason
             PolicyOwnership=$evaluation.PolicyOwnership; ManagementOwnership=$evaluation.ManagementOwnership
             ManagedPolicyDecision=$evaluation.ManagedPolicyDecision; OperatorOverride=$evaluation.OperatorOverride
-            ManagementEvidence=$evaluation.ManagementEvidence
+            ManagementEvidence=$evaluation.ManagementEvidence; RequestedScope=$evaluation.RequestedScope; ScopeStatus=$evaluation.ScopeStatus; ScopeReason=$evaluation.ScopeReason
         }
         Write-Log "Skipped $($evaluation.Key): $($evaluation.Reason)" -Level Warning
     }
@@ -4329,11 +4488,11 @@ function Invoke-RestoreSelection {
             $script:CategoryResults[$key].Changed = $changed
             $script:CategoryResults[$key].Errors = $errors
             $script:CategoryResults[$key].Status = $status
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;ExecutionMode=$executionMode;ActionPlanStatus=$categoryPlan[0].Status;Reason=$null;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence;VerificationFailedCount=if($planResult){$planResult.VerificationFailedCount}else{0};NotObservableCount=if($planResult){$planResult.NotObservableCount}else{0};PendingReboot=if($planResult){[bool]$planResult.PendingReboot}else{$false};Operations=if($planResult){@($planResult.Operations)}else{@()}}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status=$status;Changed=$changed;Errors=$errors;CapabilityStatus=$evaluation.Status;ExecutionMode=$executionMode;ActionPlanStatus=$categoryPlan[0].Status;Reason=$null;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence;RequestedScope=$evaluation.RequestedScope;ScopeStatus=$evaluation.ScopeStatus;ScopeReason=$evaluation.ScopeReason;VerificationFailedCount=if($planResult){$planResult.VerificationFailedCount}else{0};NotObservableCount=if($planResult){$planResult.NotObservableCount}else{0};PendingReboot=if($planResult){[bool]$planResult.PendingReboot}else{$false};Operations=if($planResult){@($planResult.Operations)}else{@()}}
         } catch {
             $script:CategoryResults[$key].Status = "Error"
             $script:CategoryResults[$key].Errors++
-            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;ExecutionMode=if($useActionPlan){"ActionPlan"}else{"LegacyReviewRequired"};ActionPlanStatus=if($categoryPlan.Count -eq 1){$categoryPlan[0].Status}else{"Unknown"};Reason=$_.Exception.Message;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence;VerificationFailedCount=0;NotObservableCount=0;PendingReboot=$false;Operations=@()}
+            $results[$key] = [pscustomobject][ordered]@{Key=$key;Status="Error";Changed=([int]($script:ChangesCount - $beforeChanges));Errors=1;CapabilityStatus=$evaluation.Status;ExecutionMode=if($useActionPlan){"ActionPlan"}else{"LegacyReviewRequired"};ActionPlanStatus=if($categoryPlan.Count -eq 1){$categoryPlan[0].Status}else{"Unknown"};Reason=$_.Exception.Message;PolicyOwnership=$evaluation.PolicyOwnership;ManagementOwnership=$evaluation.ManagementOwnership;ManagedPolicyDecision=$evaluation.ManagedPolicyDecision;OperatorOverride=$evaluation.OperatorOverride;ManagementEvidence=$evaluation.ManagementEvidence;RequestedScope=$evaluation.RequestedScope;ScopeStatus=$evaluation.ScopeStatus;ScopeReason=$evaluation.ScopeReason;VerificationFailedCount=0;NotObservableCount=0;PendingReboot=$false;Operations=@()}
             Write-Log "Error in $key : $($_.Exception.Message)" -Level Error
         }
     }
@@ -4356,6 +4515,8 @@ function Invoke-RestoreSelection {
         Profile=$machineProfile; ManagementState=$machineProfile.Management
         ManagementEvidence=if($machineProfile.Management -and $machineProfile.Management.PSObject.Properties['Evidence']){@($machineProfile.Management.Evidence)}else{@()}
         ManagedPolicyOverride=[bool]$AllowManagedPolicy
+        ScopeSchemaVersion=$script:ScopeSchemaVersion; RequestedRestoreScope=$RestoreScope; OfflineImagePath=$OfflineImagePath
+        ScopeCapabilities=@(Get-RestoreScopeCatalog)
         ActionPlanHash=$actionPlan.PlanHash; ActionPlanStatus=$actionPlan.Status
         Categories=$resultValues; NativeCommands=@($script:NativeCommandResults.ToArray()); VerificationFailedCount=$verificationFailures; NotObservableCount=$notObservable
         VerificationStatus=$verificationReport.Status; VerificationReport=$verificationReport
@@ -4369,7 +4530,8 @@ function Invoke-RestoreSelection {
 function Get-RestoreRegistryPlanState {
     param([Parameter(Mandatory=$true)][string]$Path,[Parameter(Mandatory=$true)][string]$Name)
     $keyExists = Test-Path -LiteralPath $Path
-    $missing = [pscustomobject][ordered]@{ Exists=$false; KeyExists=$keyExists; Path=$Path; Name=$Name; Type=$null; Value=$null }
+    $scope = Get-RestoreRegistryScope -Path $Path
+    $missing = [pscustomobject][ordered]@{ Exists=$false; KeyExists=$keyExists; Path=$Path; Scope=$scope; Name=$Name; Type=$null; Value=$null }
     try {
         if (-not $keyExists) { return $missing }
         $properties = Get-ItemProperty -LiteralPath $Path -ErrorAction Stop
@@ -4380,9 +4542,9 @@ function Get-RestoreRegistryPlanState {
             elseif ($value -is [long] -or $value -is [int64]) { "QWord" }
             elseif ($value -is [int] -or $value -is [int32] -or $value -is [bool]) { "DWord" }
             else { "String" }
-        return [pscustomobject][ordered]@{ Exists=$true; KeyExists=$true; Path=$Path; Name=$Name; Type=$valueType; Value=$value }
+        return [pscustomobject][ordered]@{ Exists=$true; KeyExists=$true; Path=$Path; Scope=$scope; Name=$Name; Type=$valueType; Value=$value }
     } catch {
-        return [pscustomobject][ordered]@{ Exists=$null; KeyExists=$keyExists; Path=$Path; Name=$Name; Type=$null; Value=$null; ReadError=$_.Exception.Message }
+        return [pscustomobject][ordered]@{ Exists=$null; KeyExists=$keyExists; Path=$Path; Scope=$scope; Name=$Name; Type=$null; Value=$null; ReadError=$_.Exception.Message }
     }
 }
 
@@ -4450,8 +4612,11 @@ function Test-RestoreActionPlanPrecondition {
             "AppX" {
                 if ($Operation.Before.PackageName) {
                     $scope = if($Operation.Before.Scope){[string]$Operation.Before.Scope}else{if($Operation.After.Scope){[string]$Operation.After.Scope}else{"CurrentUser"}}
-                    $appxState = Get-RestoreAppxPlanState -PackageName $Operation.Before.PackageName -Scope $scope
-                    if ($appxState.Installed -ne [bool]$Operation.Before.Installed) { return [pscustomobject]@{Matches=$false;Reason="AppX package presence changed"} }
+                    $imagePath = if($Operation.Before.ImagePath){[string]$Operation.Before.ImagePath}elseif($Operation.After.ImagePath){[string]$Operation.After.ImagePath}elseif($Operation.Metadata.ImagePath){[string]$Operation.Metadata.ImagePath}else{$null}
+                    $appxState = Get-RestoreAppxPlanState -PackageName $Operation.Before.PackageName -Scope $scope -ImagePath $imagePath
+                    $beforePresent = if($scope -in @("Provisioned","OfflineImage")){[bool]$Operation.Before.Provisioned}else{[bool]$Operation.Before.Installed}
+                    $currentPresent = if($scope -in @("Provisioned","OfflineImage")){[bool]$appxState.Provisioned}else{[bool]$appxState.Installed}
+                    if ($currentPresent -ne $beforePresent) { return [pscustomobject]@{Matches=$false;Reason="AppX package presence changed in scope $scope"} }
                 }
             }
             "OptionalFeature" {
@@ -4534,11 +4699,15 @@ function Test-RestoreActionPlanPostcondition {
             "AppX" {
                 $packageName = if ($Operation.After.PackageName) { [string]$Operation.After.PackageName } else { [string]$Operation.Before.PackageName }
                 $scope = if ($Operation.After.Scope) { [string]$Operation.After.Scope } elseif ($Operation.Before.Scope) { [string]$Operation.Before.Scope } else { "CurrentUser" }
-                $current = Get-RestoreAppxPlanState -PackageName $packageName -Scope $scope
-                $expectedInstalled = if ($Operation.After.PSObject.Properties['Installed']) { [bool]$Operation.After.Installed } else { $true }
-                $postconditionMatches = [bool]$current.Installed -eq $expectedInstalled
+                $imagePath = if($Operation.After.ImagePath){[string]$Operation.After.ImagePath}elseif($Operation.Before.ImagePath){[string]$Operation.Before.ImagePath}elseif($Operation.Metadata.ImagePath){[string]$Operation.Metadata.ImagePath}else{$null}
+                $current = Get-RestoreAppxPlanState -PackageName $packageName -Scope $scope -ImagePath $imagePath
+                $expectedPresent = if($scope -in @("Provisioned","OfflineImage")) {
+                    if ($Operation.After.PSObject.Properties['Provisioned']) { [bool]$Operation.After.Provisioned } else { $true }
+                } elseif ($Operation.After.PSObject.Properties['Installed']) { [bool]$Operation.After.Installed } else { $true }
+                $currentPresent = if($scope -in @("Provisioned","OfflineImage")){[bool]$current.Provisioned}else{[bool]$current.Installed}
+                $postconditionMatches = $currentPresent -eq $expectedPresent -and $current.ScopeStatus -in @("Supported","ReadOnly")
                 $status = if ($postconditionMatches) { "Verified" } else { "VerificationFailed" }
-                $reason = if ($postconditionMatches) { "Fresh AppX state matches the requested scope" } else { "Fresh AppX state does not match the requested scope" }
+                $reason = if ($postconditionMatches) { "Fresh AppX state matches the requested scope $scope" } else { "Fresh AppX state does not match the requested scope $scope" }
             }
             "OptionalFeature" {
                 $feature = Get-WindowsOptionalFeature -FeatureName $Operation.Target -Online -ErrorAction Stop
@@ -4682,11 +4851,15 @@ function Get-RestoreActionPlan {
         [object]$HealthReport,
         [object]$MachineProfile,
         [switch]$AllowManagedPolicy,
-        [switch]$CreateRestorePoint
+        [switch]$CreateRestorePoint,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
+        [string]$OfflineImagePath
     )
     $keys = @($SelectedKeys | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
     if (-not $MachineProfile) { $MachineProfile = Get-RestoreMachineProfile }
-    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $MachineProfile -AllowManagedPolicy:$AllowManagedPolicy)
+    $script:RequestedRestoreScope = $RestoreScope
+    $script:RequestedOfflineImagePath = $OfflineImagePath
+    $evaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $keys -MachineProfile $MachineProfile -AllowManagedPolicy:$AllowManagedPolicy -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath)
     $operations = New-Object System.Collections.Generic.List[object]
     $categoryPlans = New-Object System.Collections.Generic.List[object]
     $functionMap = Get-RestoreFunctionMap
@@ -4703,6 +4876,7 @@ function Get-RestoreActionPlan {
                 Reason=$evaluation.Reason; Source="Capability catalog"; Dependency="Capability:$($evaluation.Key)"
                 Verification="Capability evaluation remains supported"; Metadata=[pscustomobject][ordered]@{
                     ManagementDecision=$evaluation.ManagedPolicyDecision; OperatorOverride=$evaluation.OperatorOverride
+                    RequestedScope=$evaluation.RequestedScope; ScopeStatus=$evaluation.ScopeStatus; ScopeReason=$evaluation.ScopeReason
                     PolicyOwnership=$evaluation.ManagementOwnership; ManagementEvidence=$evaluation.ManagementEvidence
                     Reason=$evaluation.Reason
                 }
@@ -4745,6 +4919,7 @@ function Get-RestoreActionPlan {
             Key=$evaluation.Key; CapabilityStatus=$evaluation.Status; CanMutate=$evaluation.CanMutate
             ExactOperationCount=$categoryExact; OpaqueOperationCount=$categoryOpaque
             PolicyOwnership=$evaluation.ManagementOwnership; ManagedPolicyDecision=$evaluation.ManagedPolicyDecision
+            RequestedScope=$evaluation.RequestedScope; ScopeStatus=$evaluation.ScopeStatus; ScopeReason=$evaluation.ScopeReason
             OperatorOverride=$evaluation.OperatorOverride; ManagementEvidence=$evaluation.ManagementEvidence
             Status=if (-not $evaluation.CanMutate) { "Blocked" } elseif ($categoryOpaque -gt 0) { "ReviewRequired" } else { "Ready" }
         })
@@ -4780,6 +4955,8 @@ function Get-RestoreActionPlan {
         ManagementEvidence=if($MachineProfile.Management -and $MachineProfile.Management.PSObject.Properties['Evidence']){@($MachineProfile.Management.Evidence)}else{@()}
         ManagedPolicyOverride=[bool]$AllowManagedPolicy
         ManagementDecision=if($AllowManagedPolicy){"OverrideRequested"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsManaged){"SkipByDefault"}elseif($MachineProfile.Management -and $MachineProfile.Management.IsKnown){"ReviewLocal"}else{"Unknown"}
+        ScopeSchemaVersion=$script:ScopeSchemaVersion; RequestedRestoreScope=$RestoreScope; OfflineImagePath=$OfflineImagePath
+        ScopeCapabilities=@(Get-RestoreScopeCatalog)
         PendingRebootState=(Get-RestorePendingRebootState)
         ExactOperationCount=@($operationArray | Where-Object Exact).Count; OpaqueOperationCount=$opaqueCount
         CapabilityBlockedCount=$blockedCount; HealthReportAvailable=($null -ne $HealthReport)
@@ -4845,7 +5022,7 @@ function Invoke-RestoreActionPlanOperation {
         }
         "AppX" {
             if ($Operation.Metadata) {
-                $appxResult = Invoke-RestoreAppxRegistration -PackageName $Operation.Metadata.PackageName -ManifestPath $Operation.Metadata.ManifestPath -PackageFamilyName $Operation.Metadata.PackageFamilyName -Scope $Operation.Metadata.Scope -Silent
+                $appxResult = Invoke-RestoreAppxRegistration -PackageName $Operation.Metadata.PackageName -ManifestPath $Operation.Metadata.ManifestPath -PackageFamilyName $Operation.Metadata.PackageFamilyName -Scope $Operation.Metadata.Scope -ImagePath $Operation.Metadata.ImagePath -Silent
                 return $appxResult
             }
         }
@@ -4967,11 +5144,12 @@ function Get-SystemHealthReport {
     $managementDecision = if ($managementState.PSObject.Properties['Decision']) { [string]$managementState.Decision } else { "Unknown" }
     $managementOwnership = if ($managementState.PSObject.Properties['Ownership']) { [string]$managementState.Ownership } else { "Unknown" }
     $addCat = {
-        param($name, $fn, $issues, $details, $sev, $keys, $policyProvenance)
+        param($name, $fn, $issues, $details, $sev, $keys, $policyProvenance, $observationScope)
         if (!$details -or $details.Count -eq 0) { $details = $issues }
         $report[$name] = @{
             FriendlyName=$fn; Issues=[array]$issues; Details=[array]$details
             Severity=$sev; IssueCount=([array]$issues).Count; FixKeys=$keys
+            ObservationScope=$observationScope; ScopeStatus=if($observationScope){"Declared"}else{$null}
             PolicyProvenance=[array]$policyProvenance; ManagementEvidence=$managementEvidence
             ManagementOwnership=$managementOwnership; ManagementDecision=$managementDecision
             DsregStatus=if($managementState.PSObject.Properties['DsregStatus']){[string]$managementState.DsregStatus}else{"Unknown"}
@@ -5066,9 +5244,9 @@ function Get-SystemHealthReport {
         }
     }
     if (!(Get-AppxPackageSafe -Name "Microsoft.SecHealthUI") -and !(Get-AppxPackageSafe -Name "Microsoft.Windows.SecHealthUI")) {
-        $issues += "Windows Security app removed"; $details += "AppX: SecHealthUI package missing"
+        $issues += "Windows Security app is missing for the current user"; $details += "AppX (CurrentUser): SecHealthUI package missing"
     }
-    & $addCat "SecurityUI" "Windows Security App" $issues $details $(if($issues.Count){"High"}else{"OK"}) @("chkSecurityUI")
+    & $addCat "SecurityUI" "Windows Security App" $issues $details $(if($issues.Count){"High"}else{"OK"}) @("chkSecurityUI") @() "CurrentUser"
 
     # --- Windows Update ---
     $issues = @(); $details = @()
@@ -5183,7 +5361,7 @@ function Get-SystemHealthReport {
     if ($appReport.Findings.Count) { $details += "Baseline catalog $($appReport.CatalogVersion); source $script:BaselineAppxSourceUrl; confidence $($appReport.Confidence)" }
     foreach ($missingName in @($appReport.Missing)) {
         $friendly = ($appCatalog | Where-Object { $_.Name -eq $missingName } | Select-Object -First 1).Name
-        $issues += "$friendly removed"; $details += "Missing from current user and provisioned image: $missingName"
+        $issues += "$friendly missing from the observed AppX scopes"; $details += "Missing from current-user registration and online provisioned image: $missingName"
     }
     foreach ($provisionedName in @($appReport.ProvisionedOnly)) {
         $details += "Provisioned but not registered for current user: $provisionedName"
@@ -5191,7 +5369,7 @@ function Get-SystemHealthReport {
     foreach ($catalogWarning in @($appReport.Warnings)) {
         $details += "Baseline catalog warning: $catalogWarning"
     }
-    & $addCat "StoreApps" "Windows Apps" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkAppx")
+    & $addCat "StoreApps" "Windows Apps" $issues $details $(if($issues.Count){"Medium"}else{"OK"}) @("chkAppx") @() $appReport.Scope
 
     # --- Crypto ---
     $issues = @(); $details = @()
@@ -5910,9 +6088,14 @@ function Compare-RegExportSnapshot {
 }
 
 function Get-RestoreImpactPreview {
-    param([string[]]$SelectedKeys,[object]$HealthReport=$script:HealthReport)
+    param(
+        [string[]]$SelectedKeys,
+        [object]$HealthReport=$script:HealthReport,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
+        [string]$OfflineImagePath
+    )
     $preview = @()
-    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath)
     $capabilityMap = @{}
     foreach ($evaluation in $capabilityEvaluations) { $capabilityMap[$evaluation.Key] = $evaluation }
     foreach ($key in @($SelectedKeys)) {
@@ -5933,6 +6116,9 @@ function Get-RestoreImpactPreview {
             CanMutate=if ($capabilityMap[$key]) { [bool]$capabilityMap[$key].CanMutate } else { $false }
             CapabilityReason=if ($capabilityMap[$key]) { $capabilityMap[$key].Reason } else { "Category is not declared in the capability catalog" }
             Scope=if ($capabilityMap[$key]) { $capabilityMap[$key].Scope } else { "Unknown" }
+            ScopeStatus=if ($capabilityMap[$key]) { $capabilityMap[$key].ScopeStatus } else { "Unknown" }
+            ScopeReason=if ($capabilityMap[$key]) { $capabilityMap[$key].ScopeReason } else { "Unknown" }
+            ScopeCapabilities=if ($capabilityMap[$key]) { @($capabilityMap[$key].ScopeCapabilities) } else { @() }
             Risk=if ($capabilityMap[$key]) { $capabilityMap[$key].Risk } else { "Unknown" }
             PolicyOwnership=if ($capabilityMap[$key]) { $capabilityMap[$key].PolicyOwnership } else { "Unknown" }
             ManagementOwnership=if ($capabilityMap[$key]) { $capabilityMap[$key].ManagementOwnership } else { "Unknown" }
@@ -6249,14 +6435,33 @@ function Invoke-RestoreScheduledTaskRegistration {
 
 function Invoke-RestoreAppxRemoval {
     [CmdletBinding(SupportsShouldProcess=$true)]
-    param([Parameter(Mandatory=$true)][string]$PackageName,[string]$Scope="CurrentUser")
-    $allUsers = $Scope -in @("AllUsers","Provisioned")
-    $packages = @(Get-AppxPackageSafe -Name $PackageName -AllUsers:$allUsers | Where-Object { $_ })
+    param(
+        [Parameter(Mandatory=$true)][string]$PackageName,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$Scope="CurrentUser",
+        [string]$ImagePath
+    )
+    $packages = @()
+    $provisioned = $Scope -in @("Provisioned","OfflineImage")
+    if ($Scope -eq "CurrentUser") { $packages = @(Get-AppxPackageSafe -Name $PackageName | Where-Object { $_ }) }
+    elseif ($Scope -eq "AllUsers") { $packages = @(Get-AppxPackageSafe -Name $PackageName -AllUsers | Where-Object { $_ }) }
+    elseif ($Scope -eq "Provisioned") {
+        $packages = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {
+            $_.DisplayName -eq $PackageName -or $_.PackageName -eq $PackageName -or $_.PackageName -like ($PackageName + "_*")
+        })
+    } elseif ([string]::IsNullOrWhiteSpace($ImagePath) -or -not (Test-Path -LiteralPath $ImagePath -PathType Container)) {
+        throw "OfflineImage removal requires a mounted image directory"
+    } else {
+        $packages = @(Get-AppxProvisionedPackage -Path $ImagePath -ErrorAction Stop | Where-Object {
+            $_.DisplayName -eq $PackageName -or $_.PackageName -eq $PackageName -or $_.PackageName -like ($PackageName + "_*")
+        })
+    }
     if ($packages.Count -eq 0) { return $false }
     if (-not $PSCmdlet.ShouldProcess("$PackageName ($Scope)", "remove AppX package")) { return $false }
     foreach ($package in $packages) {
-        if ($allUsers) { Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop }
-        else { Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop }
+        if (-not $provisioned -and $Scope -eq "AllUsers") { Remove-AppxPackage -Package $package.PackageFullName -AllUsers -ErrorAction Stop }
+        elseif (-not $provisioned) { Remove-AppxPackage -Package $package.PackageFullName -ErrorAction Stop }
+        elseif ($Scope -eq "Provisioned") { Remove-AppxProvisionedPackage -Online -PackageName $package.PackageName -ErrorAction Stop | Out-Null }
+        else { Remove-AppxProvisionedPackage -Path $ImagePath -PackageName $package.PackageName -ErrorAction Stop | Out-Null }
     }
     $script:ChangesCount++
     return $true
@@ -6499,9 +6704,14 @@ function Resume-RestoreRollbackJournal {
 
 function Register-RestoreAtNextBoot {
     [CmdletBinding(SupportsShouldProcess=$true)]
-    param([Parameter(Mandatory=$true)][string[]]$SelectedKeys,[switch]$CreateRestorePoint)
+    param(
+        [Parameter(Mandatory=$true)][string[]]$SelectedKeys,
+        [switch]$CreateRestorePoint,
+        [ValidateSet("CurrentUser","AllUsers","Provisioned","OfflineImage")][string]$RestoreScope = "CurrentUser",
+        [string]$OfflineImagePath
+    )
     if ($SelectedKeys.Count -eq 0) { throw "At least one restore category is required" }
-    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $SelectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath)
     $blockedCapabilities = @($capabilityEvaluations | Where-Object { -not $_.CanMutate })
     if ($blockedCapabilities.Count -gt 0) {
         throw ("Capability gate blocked scheduling: " + (($blockedCapabilities | ForEach-Object { "$($_.Key): $($_.Reason)" }) -join "; "))
@@ -6513,6 +6723,7 @@ function Register-RestoreAtNextBoot {
     $state = [pscustomobject][ordered]@{
         SchemaVersion=1; CreatedAt=(Get-Date).ToUniversalTime().ToString("o")
         SelectedKeys=@($SelectedKeys); CreateRestorePoint=[bool]$CreateRestorePoint
+        ScopeSchemaVersion=$script:ScopeSchemaVersion; RestoreScope=$RestoreScope; OfflineImagePath=$OfflineImagePath
     }
     [System.IO.File]::WriteAllText($statePath, ($state | ConvertTo-Json -Depth 8), [System.Text.Encoding]::UTF8)
     $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
@@ -6529,7 +6740,9 @@ function Invoke-ScheduledRestore {
     $statePath = @(Get-ChildItem -LiteralPath (Join-Path $env:ProgramData "Restore-WindowsDefaults\scheduled") -Filter "restore-*.json" -File -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1).FullName
     if (-not $statePath) { throw "No scheduled restore state is available" }
     $state = Get-Content -LiteralPath $statePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @($state.SelectedKeys) -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+    $scheduledScope = if ($state.PSObject.Properties["RestoreScope"]) { [string]$state.RestoreScope } else { $null }
+    $scheduledImagePath = if ($state.PSObject.Properties["OfflineImagePath"]) { [string]$state.OfflineImagePath } else { $null }
+    $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys @($state.SelectedKeys) -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $scheduledScope -OfflineImagePath $scheduledImagePath)
     $blockedCapabilities = @($capabilityEvaluations | Where-Object { -not $_.CanMutate })
     if ($blockedCapabilities.Count -gt 0) {
         throw ("Capability gate blocked scheduled restore: " + (($blockedCapabilities | ForEach-Object { "$($_.Key): $($_.Reason)" }) -join "; "))
@@ -6537,7 +6750,7 @@ function Invoke-ScheduledRestore {
     if (-not $PSCmdlet.ShouldProcess("scheduled restore job", "consume and execute the selected restore plan")) { return $false }
     $runOncePath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"
     Remove-RegistryValue -Path $runOncePath -Name "RestoreWindowsDefaults" -Silent
-    $result = Invoke-RestoreSelection -SelectedKeys @($state.SelectedKeys) -CreateRollbackSnapshot -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested
+    $result = Invoke-RestoreSelection -SelectedKeys @($state.SelectedKeys) -CreateRollbackSnapshot -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $scheduledScope -OfflineImagePath $scheduledImagePath
     if ($result.ExitCode -ne 0) { throw "Scheduled restore did not complete successfully (exit code $($result.ExitCode))" }
     Invoke-RestoreFileMutation -Action Remove -Path $statePath -Silent
     Write-Log "Scheduled restore completed" -Level Success
@@ -7015,7 +7228,16 @@ function Show-MainWindow {
             </ScrollViewer>
             <Border Grid.Row="2" Background="#161b22" Padding="14,8" BorderBrush="#30363d" BorderThickness="0,1,0,0">
                 <DockPanel>
-                    <CheckBox x:Name="chkAutoRestoreC" Content="Create restore point first" IsChecked="True" DockPanel.Dock="Left" VerticalAlignment="Center"/>
+                    <StackPanel Orientation="Horizontal" DockPanel.Dock="Left" VerticalAlignment="Center">
+                        <CheckBox x:Name="chkAutoRestoreC" Content="Create restore point first" IsChecked="True" VerticalAlignment="Center"/>
+                        <TextBlock Text="AppX scope:" Foreground="#8b949e" FontSize="11" Margin="16,0,5,0" VerticalAlignment="Center"/>
+                        <ComboBox x:Name="cmbAppxScope" Width="185" Height="25" SelectedIndex="0" VerticalAlignment="Center">
+                            <ComboBoxItem Content="Current user (online)" Tag="CurrentUser"/>
+                            <ComboBoxItem Content="All existing users (read-only)" Tag="AllUsers"/>
+                            <ComboBoxItem Content="Provisioned image (read-only)" Tag="Provisioned"/>
+                            <ComboBoxItem Content="Offline image (CLI workflow)" Tag="OfflineImage"/>
+                        </ComboBox>
+                    </StackPanel>
                     <Button x:Name="btnScheduleCustom" Content="Schedule Next Reboot" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="12,8" Margin="0,0,6,0"/>
                     <Button x:Name="btnRunCustom" DockPanel.Dock="Right" HorizontalAlignment="Right" Padding="16,8" Background="#238636" Foreground="White" BorderBrush="#238636">
                         <TextBlock Text="Run Selected Fixes" FontWeight="SemiBold"/></Button>
@@ -7105,7 +7327,7 @@ function Show-MainWindow {
         'btnFixAll', 'btnFixDetected', 'btnFixSecurity', 'btnCustom', 'btnScanOnly',
         'chkAutoRestore', 'btnClose',
         'btnBack', 'btnSelectAll', 'btnSelectNone', 'btnSelectSafe',
-        'chkContainer', 'chkAutoRestoreC', 'btnRunCustom', 'btnScheduleCustom',
+        'chkContainer', 'chkAutoRestoreC', 'cmbAppxScope', 'btnRunCustom', 'btnScheduleCustom',
         'txtProgressTitle', 'txtProgressSub', 'progressBar', 'timelineScrubber', 'txtProgressPercent', 'txtProgressStep',
         'txtConsole', 'txtStatus', 'btnReboot', 'btnLater', 'btnRollback', 'btnViewLog',
         'btnImportManifest', 'quickScanPanel', 'quickScanStats',
@@ -7312,6 +7534,12 @@ function Show-MainWindow {
         $ui.chkContainer.Children.Add($grpBorder) | Out-Null
     }
 
+    if ($ui.ContainsKey('cmbAppxScope') -and $ui.ContainsKey('chkAppx')) {
+        $ui.cmbAppxScope.IsEnabled = [bool]$ui.chkAppx.IsChecked
+        $ui.chkAppx.Add_Checked({ $ui.cmbAppxScope.IsEnabled = $true })
+        $ui.chkAppx.Add_Unchecked({ $ui.cmbAppxScope.IsEnabled = $false })
+    }
+
     # ================================================================
     # PRESETS AND RUN LOGIC
     # ================================================================
@@ -7322,21 +7550,24 @@ function Show-MainWindow {
     if ($managementState.IsManaged) { $safeDefaults = @($safeDefaults | Where-Object { $_ -notin @("chkSync","chkOneDrive","chkAccount") }) }
 
     $runRestore = {
-        param($selectedKeys, $doRestorePoint, $scanOnlyMode)
+        param($selectedKeys, $doRestorePoint, $scanOnlyMode, $restoreScope)
+        $scopeValue = if ([string]::IsNullOrWhiteSpace([string]$restoreScope)) { $script:DefaultAppxRestoreScope } else { [string]$restoreScope }
+        $script:RequestedRestoreScope = $scopeValue
+        $script:RequestedOfflineImagePath = $null
         $ui.pageHome.Visibility = "Collapsed"
         $ui.pageCustom.Visibility = "Collapsed"
         $ui.pageProgress.Visibility = "Visible"
         $script:RestoreTimelineKeys = @($selectedKeys)
         $script:RestoreTimelineLabels = @($selectedKeys | ForEach-Object { $friendlyMap[$_] })
         $script:RestoreTimelineResults = @{}
-        $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $selectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested)
+        $capabilityEvaluations = @(Get-RestoreCapabilityEvaluation -SelectedKeys $selectedKeys -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -RestoreScope $scopeValue)
         $capabilityMap = @{}
         foreach ($capabilityEvaluation in $capabilityEvaluations) { $capabilityMap[$capabilityEvaluation.Key] = $capabilityEvaluation }
         $runnableKeys = @($capabilityEvaluations | Where-Object CanMutate | ForEach-Object Key)
         foreach ($blockedCapability in @($capabilityEvaluations | Where-Object { -not $_.CanMutate })) {
             Write-Log "Capability gate: $($blockedCapability.Key) will not run - $($blockedCapability.Reason)" -Level Warning
         }
-        $actionPlan = Get-RestoreActionPlan -SelectedKeys $selectedKeys -HealthReport $script:HealthReport -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -CreateRestorePoint:(($doRestorePoint -and -not $scanOnlyMode))
+        $actionPlan = Get-RestoreActionPlan -SelectedKeys $selectedKeys -HealthReport $script:HealthReport -MachineProfile $script:CapabilityProfile -AllowManagedPolicy:$script:ManagedPolicyOverrideRequested -CreateRestorePoint:(($doRestorePoint -and -not $scanOnlyMode)) -RestoreScope $scopeValue
         $rollbackJournal = $null
 
         if ($scanOnlyMode) {
@@ -7374,6 +7605,7 @@ function Show-MainWindow {
         Write-Log "=== Windows Restore Tool v$($script:Version) - $mode MODE ===" -Level Section
         Write-Log "User: $env:USERNAME | Computer: $env:COMPUTERNAME | OS: $([System.Environment]::OSVersion.VersionString)" -Level Info
         Write-Log "Categories selected: $($selectedKeys.Count)" -Level Info
+        if ($selectedKeys -contains "chkAppx") { Write-Log "Target AppX scope: $scopeValue" -Level Info }
         Write-Log "" -Level Info
 
         if ($scanOnlyMode) {
@@ -7387,7 +7619,7 @@ function Show-MainWindow {
             if ($actionPlan.OpaqueOperationCount -gt 0) {
                 Write-Log "Some category mutations still require review because they are not represented as individual plan operations." -Level Warning
             }
-            $impactPreview = @(Get-RestoreImpactPreview -SelectedKeys $selectedKeys -HealthReport $script:HealthReport)
+            $impactPreview = @(Get-RestoreImpactPreview -SelectedKeys $selectedKeys -HealthReport $script:HealthReport -RestoreScope $scopeValue)
             Write-Log "Pre-flight impact preview:" -Level Section
             foreach ($impact in $impactPreview) {
                 $impactLabel = $friendlyMap[$impact.FixKey]; if (-not $impactLabel) { $impactLabel = $impact.FixKey }
@@ -7629,8 +7861,9 @@ function Show-MainWindow {
         if (!$sel.Count) {
             [System.Windows.MessageBox]::Show("Select at least one category.", "Nothing Selected", "OK", "Information"); return
         }
+        $scope = if ($ui.cmbAppxScope.SelectedItem -and $ui.cmbAppxScope.SelectedItem.Tag) { [string]$ui.cmbAppxScope.SelectedItem.Tag } else { $script:DefaultAppxRestoreScope }
         $r = [System.Windows.MessageBox]::Show("Restore $($sel.Count) categories?", "Confirm", "YesNo", "Question")
-        if ($r -eq "Yes") { & $runRestore $sel $ui.chkAutoRestoreC.IsChecked $false }
+        if ($r -eq "Yes") { & $runRestore $sel $ui.chkAutoRestoreC.IsChecked $false $scope }
     })
 
     $ui.btnScheduleCustom.Add_Click({
@@ -7639,8 +7872,13 @@ function Show-MainWindow {
         if (!$sel.Count) {
             [System.Windows.MessageBox]::Show("Select at least one category.", "Nothing Selected", "OK", "Information"); return
         }
+        $scope = if ($ui.cmbAppxScope.SelectedItem -and $ui.cmbAppxScope.SelectedItem.Tag) { [string]$ui.cmbAppxScope.SelectedItem.Tag } else { $script:DefaultAppxRestoreScope }
+        if ($sel -contains "chkAppx" -and $scope -ne "CurrentUser") {
+            [System.Windows.MessageBox]::Show("Only the Current user AppX scope can be scheduled by the online restore executor. The selected scope is read-only or requires the separate offline workflow.", "AppX Scope Not Schedulable", "OK", "Information")
+            return
+        }
         try {
-            $scheduledPath = Register-RestoreAtNextBoot -SelectedKeys $sel -CreateRestorePoint:$ui.chkAutoRestoreC.IsChecked
+            $scheduledPath = Register-RestoreAtNextBoot -SelectedKeys $sel -CreateRestorePoint:$ui.chkAutoRestoreC.IsChecked -RestoreScope $scope
             [System.Windows.MessageBox]::Show("The selected restore will run once at the next boot.`n`nState: $scheduledPath", "Restore Scheduled", "OK", "Information")
         } catch {
             [System.Windows.MessageBox]::Show("Could not schedule restore: $($_.Exception.Message)", "Schedule Error", "OK", "Error")
@@ -7746,8 +7984,8 @@ if ($BaselineReport) {
 
 if ($CapabilityReport) {
     $capabilityKeys = if ($RestoreCategories) { @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { $null }
-    if ($AllowManagedPolicy) { $capabilityReportDocument = Get-RestoreCapabilityReport -SelectedKeys $capabilityKeys -AllowManagedPolicy }
-    else { $capabilityReportDocument = Get-RestoreCapabilityReport -SelectedKeys $capabilityKeys }
+    if ($AllowManagedPolicy) { $capabilityReportDocument = Get-RestoreCapabilityReport -SelectedKeys $capabilityKeys -AllowManagedPolicy -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath }
+    else { $capabilityReportDocument = Get-RestoreCapabilityReport -SelectedKeys $capabilityKeys -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath }
     Write-Output ($capabilityReportDocument | ConvertTo-Json -Depth 20)
     exit 0
 }
@@ -7755,8 +7993,8 @@ if ($CapabilityReport) {
 if ($WhatIf -or $PlanPath) {
     if (-not $RestoreCategories) { throw "-WhatIf or -PlanPath requires -RestoreCategories so the plan scope is explicit" }
     $planKeys = @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($AllowManagedPolicy) { $actionPlan = Get-RestoreActionPlan -SelectedKeys $planKeys -AllowManagedPolicy }
-    else { $actionPlan = Get-RestoreActionPlan -SelectedKeys $planKeys }
+    if ($AllowManagedPolicy) { $actionPlan = Get-RestoreActionPlan -SelectedKeys $planKeys -AllowManagedPolicy -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath }
+    else { $actionPlan = Get-RestoreActionPlan -SelectedKeys $planKeys -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath }
     if ($PlanPath) { $null = Export-RestoreActionPlan -ActionPlan $actionPlan -OutputPath $PlanPath }
     else { Write-Output ($actionPlan | ConvertTo-Json -Depth 30) }
     if ($actionPlan.Status -eq "Blocked") { exit 2 }
@@ -7832,14 +8070,14 @@ if ($RestoreTier) {
 if ($ScheduleRestore) {
     $scheduledKeys = if ($RestoreCategories) { @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
         else { @("chkDefender","chkFirewall","chkSmartScreen","chkWindowsUpdate","chkServices","chkTasks") }
-    Register-RestoreAtNextBoot -SelectedKeys $scheduledKeys -CreateRestorePoint
+    Register-RestoreAtNextBoot -SelectedKeys $scheduledKeys -CreateRestorePoint -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath
     exit
 }
 
 if ($RestoreCategories) {
     $directKeys = @($RestoreCategories -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($AllowManagedPolicy) { $directResult = Invoke-RestoreSelection -SelectedKeys $directKeys -CreateRollbackSnapshot -AllowManagedPolicy }
-    else { $directResult = Invoke-RestoreSelection -SelectedKeys $directKeys -CreateRollbackSnapshot }
+    if ($AllowManagedPolicy) { $directResult = Invoke-RestoreSelection -SelectedKeys $directKeys -CreateRollbackSnapshot -AllowManagedPolicy -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath }
+    else { $directResult = Invoke-RestoreSelection -SelectedKeys $directKeys -CreateRollbackSnapshot -RestoreScope $RestoreScope -OfflineImagePath $OfflineImagePath }
     Write-Output ($directResult | ConvertTo-Json -Depth 20)
     exit ([int]$directResult.ExitCode)
 }
