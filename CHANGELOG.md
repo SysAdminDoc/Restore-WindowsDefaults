@@ -16,6 +16,7 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 - Added explicit AppX scope contracts for current-user, all-existing-user, provisioned-image, and offline-image observations, with read-only capability gates, scope-aware registry metadata, CLI/GUI selectors, and scheduled-state propagation.
 - Hardened next-boot restore into an expiring, integrity-checked job with owner/plan/rollback metadata, failure-safe two-phase registration, status and cancellation commands, stale-job refusal, and idempotent journal-backed resume.
 - Reworked support bundles around a fixed allowlist with bounded redacted event text, aggregate health/scan summaries, collision-safe output, size limits, SHA-256 payload manifests, and machine-readable exclusion/redaction reports.
+- Added plan-first offline WIM/VHD servicing with source/index/edition/architecture/DISM/scratch/lock gates, explicit commit/discard lifecycle actions, cleanup guards, and bounded AppX, optional-feature, task, and machine-policy adapters.
 
 ## [v4.4.0] - 2026-08-03
 

@@ -19,6 +19,14 @@ param(
     [ValidateSet("Quick","Full","Nuclear")][string]$RestoreTier,
     [switch]$PostUpdateCheck,
     [string]$ExportSupportBundle,
+    [Alias("OfflineSourcePath","OfflineWimPath")][string]$OfflineImageFile,
+    [Alias("OfflineAction")][ValidateSet("Plan","Commit","Discard")][string]$OfflineImageAction,
+    [Alias("OfflinePlanPath")][string]$OfflineServicingPlanPath,
+    [ValidateRange(1,999)][int]$OfflineImageIndex = 1,
+    [string]$OfflineScratchPath,
+    [string]$OfflineAdapters = "AppX,Features,Tasks,Policy",
+    [string]$OfflineFeatureNames,
+    [switch]$OfflineResetPolicies,
     [switch]$CapabilityReport,
     [switch]$BaselineReport,
     [switch]$AllowManagedPolicy,
@@ -89,6 +97,10 @@ $script:ScheduledRestoreRunOncePathOverride = $null
 $script:ScheduledRestoreRunOnceReadProvider = $null
 $script:ScheduledRestoreRunOnceWriteProvider = $null
 $script:ScheduledRestoreRunOnceRemoveProvider = $null
+$script:OfflineServicingSchemaVersion = 1
+$script:OfflineServicingMaxPlanBytes = 2MB
+$script:OfflineServicingMinimumScratchBytes = 512MB
+$script:OfflineServicingDefaultAdapters = @("AppX","Features","Tasks","Policy")
 $script:SupportBundleSchemaVersion = 2
 $script:SupportBundleManifestSchemaVersion = 1
 $script:SupportBundleMaxBytes = 10MB
@@ -151,6 +163,14 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
     if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
     if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
+    if ($OfflineImageFile) { $relaunchArgs += @("-OfflineImageFile", "`"$OfflineImageFile`"") }
+    if ($OfflineImageAction) { $relaunchArgs += @("-OfflineImageAction", $OfflineImageAction) }
+    if ($OfflineServicingPlanPath) { $relaunchArgs += @("-OfflineServicingPlanPath", "`"$OfflineServicingPlanPath`"") }
+    if ($OfflineImageIndex -ne 1) { $relaunchArgs += @("-OfflineImageIndex", $OfflineImageIndex) }
+    if ($OfflineScratchPath) { $relaunchArgs += @("-OfflineScratchPath", "`"$OfflineScratchPath`"") }
+    if ($OfflineAdapters -ne "AppX,Features,Tasks,Policy") { $relaunchArgs += @("-OfflineAdapters", "`"$OfflineAdapters`"") }
+    if ($OfflineFeatureNames) { $relaunchArgs += @("-OfflineFeatureNames", "`"$OfflineFeatureNames`"") }
+    if ($OfflineResetPolicies) { $relaunchArgs += "-OfflineResetPolicies" }
     if ($CapabilityReport) { $relaunchArgs += "-CapabilityReport" }
     if ($BaselineReport) { $relaunchArgs += "-BaselineReport" }
     if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
@@ -183,6 +203,14 @@ if (-not $NoElevation -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($RestoreTier) { $relaunchArgs += @("-RestoreTier", $RestoreTier) }
     if ($PostUpdateCheck) { $relaunchArgs += "-PostUpdateCheck" }
     if ($ExportSupportBundle) { $relaunchArgs += @("-ExportSupportBundle", "`"$ExportSupportBundle`"") }
+    if ($OfflineImageFile) { $relaunchArgs += @("-OfflineImageFile", "`"$OfflineImageFile`"") }
+    if ($OfflineImageAction) { $relaunchArgs += @("-OfflineImageAction", $OfflineImageAction) }
+    if ($OfflineServicingPlanPath) { $relaunchArgs += @("-OfflineServicingPlanPath", "`"$OfflineServicingPlanPath`"") }
+    if ($OfflineImageIndex -ne 1) { $relaunchArgs += @("-OfflineImageIndex", $OfflineImageIndex) }
+    if ($OfflineScratchPath) { $relaunchArgs += @("-OfflineScratchPath", "`"$OfflineScratchPath`"") }
+    if ($OfflineAdapters -ne "AppX,Features,Tasks,Policy") { $relaunchArgs += @("-OfflineAdapters", "`"$OfflineAdapters`"") }
+    if ($OfflineFeatureNames) { $relaunchArgs += @("-OfflineFeatureNames", "`"$OfflineFeatureNames`"") }
+    if ($OfflineResetPolicies) { $relaunchArgs += "-OfflineResetPolicies" }
     if ($CapabilityReport) { $relaunchArgs += "-CapabilityReport" }
     if ($BaselineReport) { $relaunchArgs += "-BaselineReport" }
     if ($AllowManagedPolicy) { $relaunchArgs += "-AllowManagedPolicy" }
@@ -1078,6 +1106,20 @@ $script:RegistryDefaultCatalog = @(
     @{Name="Defender CPU cap";Path="HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Scan";ValueName="AvgCPULoadFactor";Action="Remove";Category="chkDefenderCpuCap"}
 )
 
+$script:OfflineDefaultEnabledFeatures = @(
+    "MicrosoftWindowsPowerShellV2",
+    "MicrosoftWindowsPowerShellV2Root",
+    "WCF-TCP-PortSharing45",
+    "SmbDirect",
+    "Printing-Foundation-Features",
+    "Printing-PrintToPDFServices-Features",
+    "Printing-XPSServices-Features",
+    "SearchEngine-Client-Package",
+    "MediaPlayback",
+    "WindowsMediaPlayer",
+    "WorkFolders-Client"
+)
+
 function Get-RegistryDefaultBaselineReport {
     param([object[]]$Catalog = $script:RegistryDefaultCatalog,[object]$MachineProfile)
     $context = Get-RestoreBaselineContext -MachineProfile $MachineProfile
@@ -1730,6 +1772,537 @@ function Compare-AppxPackageBaseline {
     $report | Add-Member -NotePropertyName BaselineScope -NotePropertyValue $(if($WimPath){"OfflineImage"}else{"ExternalBaseline"})
     $report | Add-Member -NotePropertyName BaselineScopeStatus -NotePropertyValue $(if($WimPath){"ReadOnlyEvidence"}else{"ReadOnlyEvidence"})
     return $report
+}
+
+function Get-RestoreOfflineAdapterCatalog {
+    return @(
+        [pscustomobject][ordered]@{
+            Key="AppX"; Resource="Provisioned AppX packages"; Observation="DISM /Image:<mount> /Get-ProvisionedAppxPackages"
+            CanObserve=$true; CanMutate=$false; Status="ReadOnly"
+            Reason="Offline AppX restoration requires a separately trusted package source and is not inferred from package names alone"
+        },
+        [pscustomobject][ordered]@{
+            Key="Features"; Resource="Windows optional features"; Observation="DISM /Image:<mount> /Get-Features"
+            CanObserve=$true; CanMutate=$true; Status="Allowlisted"
+            Reason="Only the versioned default-enabled feature catalog can be requested for offline enablement"
+        },
+        [pscustomobject][ordered]@{
+            Key="Tasks"; Resource="Offline scheduled-task files"; Observation="Mounted Windows\\System32\\Tasks inventory"
+            CanObserve=$true; CanMutate=$false; Status="ReadOnly"
+            Reason="Task XML restoration requires a trusted source task definition and is not guessed from filenames"
+        },
+        [pscustomobject][ordered]@{
+            Key="Policy"; Resource="Offline machine policy hive"; Observation="Mounted SOFTWARE hive and allowlisted policy values"
+            CanObserve=$true; CanMutate=$true; Status="Allowlisted"
+            Reason="Only the versioned machine policy catalog can be explicitly reset"
+        }
+    )
+}
+
+function ConvertTo-RestoreOfflineNativeResult {
+    param(
+        [object]$Value,
+        [string]$FilePath,
+        [string[]]$ArgumentList
+    )
+    if ($null -eq $Value) {
+        return [pscustomobject][ordered]@{Success=$false;ExitCode=$null;Output="";Stderr="";FailureCategory="NoResult";Payload=$null;FilePath=$FilePath;ArgumentList=@($ArgumentList)}
+    }
+    if ($Value -is [string] -or ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary] -and $Value.PSObject.Properties.Count -eq 0)) {
+        $output = @($Value | ForEach-Object { [string]$_ }) -join "`r`n"
+        return [pscustomobject][ordered]@{Success=$true;ExitCode=0;Output=$output;Stderr="";FailureCategory=$null;Payload=$null;FilePath=$FilePath;ArgumentList=@($ArgumentList)}
+    }
+    $successProperty = $Value.PSObject.Properties["Success"]
+    $exitProperty = $Value.PSObject.Properties["ExitCode"]
+    $outputProperty = $Value.PSObject.Properties["Output"]
+    $stderrProperty = $Value.PSObject.Properties["Stderr"]
+    $success = if ($successProperty) { [bool]$successProperty.Value } elseif ($exitProperty) { [int]$exitProperty.Value -eq 0 } else { $true }
+    $exitCode = if ($exitProperty) { $exitProperty.Value } elseif ($success) { 0 } else { $null }
+    $output = if ($outputProperty) { @($outputProperty.Value | ForEach-Object { [string]$_ }) -join "`r`n" } else { "" }
+    $stderr = if ($stderrProperty) { @($stderrProperty.Value | ForEach-Object { [string]$_ }) -join "`r`n" } else { "" }
+    $failure = if ($Value.PSObject.Properties["FailureCategory"]) { [string]$Value.FailureCategory } elseif ($success) { $null } else { "CommandFailed" }
+    return [pscustomobject][ordered]@{
+        Success=$success; ExitCode=$exitCode; Output=$output; Stderr=$stderr; FailureCategory=$failure; Payload=$Value
+        FilePath=$FilePath; ArgumentList=@($ArgumentList)
+    }
+}
+
+function Invoke-RestoreOfflineCommand {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$FilePath,
+        [string[]]$ArgumentList=@(),
+        [scriptblock]$Provider,
+        [int[]]$ExpectedExitCodes=@(0)
+    )
+    if ($Provider) {
+        try {
+            $provided = & $Provider $FilePath @($ArgumentList)
+            return (ConvertTo-RestoreOfflineNativeResult -Value $provided -FilePath $FilePath -ArgumentList $ArgumentList)
+        } catch {
+            return [pscustomobject][ordered]@{Success=$false;ExitCode=$null;Output="";Stderr=$_.Exception.Message;FailureCategory="ProviderFailed";Payload=$null;FilePath=$FilePath;ArgumentList=@($ArgumentList)}
+        }
+    }
+    $native = Invoke-RestoreNativeCommand -FilePath $FilePath -ArgumentList $ArgumentList -ExpectedExitCodes $ExpectedExitCodes -Scope "OfflineImage" -Silent
+    return [pscustomobject][ordered]@{
+        Success=[bool]$native.Success; ExitCode=$native.ExitCode; Output=[string]$native.Stdout; Stderr=[string]$native.Stderr
+        FailureCategory=$native.FailureCategory; Payload=$native; FilePath=$FilePath; ArgumentList=@($ArgumentList)
+    }
+}
+
+function ConvertFrom-RestoreDismImageInfo {
+    param([object[]]$Output)
+    $images = New-Object System.Collections.Generic.List[object]
+    $current = $null
+    foreach ($lineObject in @($Output)) {
+        $line = [string]$lineObject
+        $indexMatch = [regex]::Match($line, '^\s*Index\s*:\s*(\d+)\s*$')
+        if ($indexMatch.Success) {
+            if ($null -ne $current) { $images.Add([pscustomobject]$current) }
+            $current = [ordered]@{Index=[int]$indexMatch.Groups[1].Value;Name=$null;Description=$null;Edition=$null;Architecture=$null;Version=$null;Size=$null}
+            continue
+        }
+        if ($null -eq $current) { continue }
+        foreach ($field in @("Name","Description","Edition","Architecture","Version","Size")) {
+            $fieldMatch = [regex]::Match($line, ("^\s*{0}\s*:\s*(.+?)\s*$" -f [regex]::Escape($field)))
+            if ($fieldMatch.Success) { $current[$field] = $fieldMatch.Groups[1].Value.Trim(); break }
+        }
+    }
+    if ($null -ne $current) { $images.Add([pscustomobject]$current) }
+    return @($images.ToArray())
+}
+
+function Get-RestoreOfflineImageFileHash {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    try { return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() } catch { return $null }
+}
+
+function Test-RestoreOfflinePathUnder {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Directory
+    )
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        $fullDirectory = [System.IO.Path]::GetFullPath($Directory).TrimEnd([System.IO.Path]::DirectorySeparatorChar)
+        return $fullPath.StartsWith($fullDirectory + [System.IO.Path]::DirectorySeparatorChar, [System.StringComparison]::OrdinalIgnoreCase)
+    } catch { return $false }
+}
+
+function Get-RestoreOfflinePlanIntegrityPayload {
+    param([Parameter(Mandatory=$true)][object]$Plan)
+    $payload = [ordered]@{}
+    foreach ($property in @($Plan.PSObject.Properties)) {
+        if ($property.Name -notin @("PlanHash","Integrity")) { $payload[$property.Name] = $property.Value }
+    }
+    return [pscustomobject]$payload
+}
+
+function Set-RestoreOfflinePlanIntegrity {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param([Parameter(Mandatory=$true)][object]$Plan)
+    if (-not $PSCmdlet.ShouldProcess("offline servicing plan", "refresh integrity hash")) { return $Plan }
+    $Plan.PlanHash = $null
+    $Plan.Integrity = $null
+    $hash = Get-RestoreJsonSha256 -Value (Get-RestoreOfflinePlanIntegrityPayload -Plan $Plan)
+    $Plan.PlanHash = $hash
+    $Plan.Integrity = [pscustomobject][ordered]@{Algorithm="SHA256";PlanHash=$hash}
+    return $Plan
+}
+
+function Get-RestoreOfflineImagePlan {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$ImageFile,
+        [ValidateRange(1,999)][int]$ImageIndex = 1,
+        [string]$ScratchPath,
+        [string[]]$AdapterKeys,
+        [string[]]$FeatureNames,
+        [switch]$ResetAllowlistedPolicies,
+        [scriptblock]$DismProvider,
+        [scriptblock]$MachineProfileProvider,
+        [scriptblock]$LockProvider,
+        [int64]$MinimumScratchBytes = $script:OfflineServicingMinimumScratchBytes
+    )
+    $validation = New-Object System.Collections.Generic.List[object]
+    $validationErrors = New-Object System.Collections.Generic.List[string]
+    $addValidation = {
+        param([string]$Name,[bool]$Passed,[string]$Reason)
+        $validation.Add([pscustomobject][ordered]@{Name=$Name;Passed=$Passed;Reason=$Reason})
+        if (-not $Passed) { $validationErrors.Add($Reason) }
+    }
+    $fullImagePath = $null
+    try { $fullImagePath = [System.IO.Path]::GetFullPath($ImageFile) } catch { & $addValidation "SourcePath" $false "Image path is not a valid fully qualified path" }
+    $sourceInfo = $null
+    if ($fullImagePath) {
+        try { $sourceInfo = Get-Item -LiteralPath $fullImagePath -ErrorAction Stop } catch { $sourceInfo = $null }
+    }
+    $sourceExists = $null -ne $sourceInfo -and -not $sourceInfo.PSIsContainer
+    & $addValidation "SourceExists" $sourceExists $(if($sourceExists){"Image source exists"}else{"Image source file was not found"})
+    $extension = if ($fullImagePath) { [System.IO.Path]::GetExtension($fullImagePath).ToLowerInvariant() } else { "" }
+    $supportedExtension = $extension -in @(".wim",".vhd",".vhdx",".ffu")
+    & $addValidation "SourceFormat" $supportedExtension $(if($supportedExtension){"Image format $extension is supported"}else{"Only .wim, .vhd, .vhdx, and .ffu image sources are supported"})
+    if ($sourceInfo -and $sourceInfo.Length -le 0) { & $addValidation "SourceSize" $false "Image source is empty" }
+
+    $scratch = if ($ScratchPath) { $ScratchPath } else { Join-Path ([System.IO.Path]::GetTempPath()) "Restore-WindowsDefaults-Offline" }
+    try { $scratch = [System.IO.Path]::GetFullPath($scratch) } catch { & $addValidation "ScratchPath" $false "Scratch path is not a valid fully qualified path" }
+    $scratchExists = $scratch -and (Test-Path -LiteralPath $scratch -PathType Container)
+    $scratchParent = if ($scratchExists) { $scratch } elseif ($scratch) { Split-Path -Parent $scratch } else { $null }
+    $scratchParentExists = $scratchParent -and (Test-Path -LiteralPath $scratchParent -PathType Container)
+    & $addValidation "ScratchPath" $scratchParentExists $(if($scratchExists){"Scratch directory exists"}elseif($scratchParentExists){"Scratch directory can be created beneath an existing parent"}else{"Scratch directory parent does not exist"})
+    $freeBytes = 0
+    if ($scratchParentExists) {
+        try {
+            $root = [System.IO.Path]::GetPathRoot($scratchParent)
+            $freeBytes = [int64](New-Object System.IO.DriveInfo($root)).AvailableFreeSpace
+        } catch { $freeBytes = 0 }
+    }
+    $sourceBytes = if ($sourceInfo) { [int64]$sourceInfo.Length } else { 0 }
+    $requiredScratchBytes = [int64][Math]::Max([int64]$MinimumScratchBytes, [int64]($sourceBytes * 2))
+    $scratchCapacity = $freeBytes -ge $requiredScratchBytes
+    & $addValidation "ScratchFreeSpace" $scratchCapacity $(if($scratchCapacity){"Scratch volume has at least $requiredScratchBytes bytes available"}else{"Scratch volume does not have the required $requiredScratchBytes bytes available"})
+
+    $lockResult = $false
+    if ($sourceExists) {
+        if ($LockProvider) {
+            try {
+                $providedLock = & $LockProvider $fullImagePath
+                $lockResult = if ($providedLock -is [bool]) { [bool]$providedLock } elseif ($providedLock -and $providedLock.PSObject.Properties["Available"]) { [bool]$providedLock.Available } else { [bool]$providedLock }
+            } catch { $lockResult = $false }
+        } else {
+            $stream = $null
+            try {
+                $stream = [System.IO.File]::Open($fullImagePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+                $lockResult = $true
+            } catch { $lockResult = $false } finally { if ($stream) { $stream.Dispose() } }
+        }
+    }
+    & $addValidation "SourceLock" $lockResult $(if($lockResult){"Image source is readable and not exclusively locked"}else{"Image source is unavailable or exclusively locked"})
+
+    $dismPath = $null
+    $dismVersion = $null
+    if (-not $DismProvider) {
+        $dismCommand = Get-Command dism.exe -ErrorAction SilentlyContinue
+        if ($dismCommand) {
+            $dismPath = $dismCommand.Source
+            try { $dismVersion = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($dismPath).FileVersion } catch { $dismVersion = $null }
+        }
+    } else {
+        $dismPath = "provider:dism.exe"
+        try {
+            $versionResult = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Version") -Provider $DismProvider
+            if ($versionResult.Payload -and $versionResult.Payload.PSObject.Properties["Version"]) { $dismVersion = [string]$versionResult.Payload.Version }
+            if (-not $dismVersion -and $versionResult.Output -match '\b\d+\.\d+(?:\.\d+){1,2}\b') { $dismVersion = $Matches[0] }
+        } catch { $dismVersion = $null }
+    }
+    $dismAvailable = $null -ne $dismPath
+    & $addValidation "DismAvailable" $dismAvailable $(if($dismAvailable){"DISM is available"}else{"DISM is unavailable"})
+    $dismVersionValid = $dismVersion -and $dismVersion -match '^\d+\.\d+(?:\.\d+){1,2}'
+    & $addValidation "DismVersion" $dismVersionValid $(if($dismVersionValid){"DISM version $dismVersion is recorded"}else{"DISM version could not be determined"})
+
+    $imageInfoResult = $null
+    $imageRecords = @()
+    if ($sourceExists -and $supportedExtension -and $dismAvailable) {
+        $imageInfoResult = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Get-WimInfo","/WimFile:$fullImagePath") -Provider $DismProvider
+        if ($imageInfoResult.Payload -and $imageInfoResult.Payload.PSObject.Properties["Images"]) { $imageRecords = @($imageInfoResult.Payload.Images) }
+        elseif ($imageInfoResult.Success) { $imageRecords = @(ConvertFrom-RestoreDismImageInfo -Output @($imageInfoResult.Output -split "`r?`n")) }
+    }
+    $imageInfoAvailable = $imageInfoResult -and $imageInfoResult.Success -and $imageRecords.Count -gt 0
+    & $addValidation "ImageMetadata" $imageInfoAvailable $(if($imageInfoAvailable){"DISM returned image metadata"}else{"DISM did not return a readable image index"})
+    $selectedImage = @($imageRecords | Where-Object { [int]$_.Index -eq $ImageIndex } | Select-Object -First 1)
+    $selectedImageExists = $selectedImage.Count -eq 1
+    & $addValidation "ImageIndex" $selectedImageExists $(if($selectedImageExists){"Image index $ImageIndex is present"}else{"Image index $ImageIndex is not present in the source"})
+
+    $machineProfile = if ($MachineProfileProvider) { & $MachineProfileProvider } else { Get-RestoreMachineProfile }
+    $hostArchitecture = [string](Get-RestoreSupportObjectProperty -InputObject $machineProfile -Name "Architecture")
+    $hostArchitecture = ConvertTo-RestoreArchitecture $hostArchitecture
+    $imageArchitecture = if ($selectedImage) { ConvertTo-RestoreArchitecture ([string](Get-RestoreSupportObjectProperty -InputObject $selectedImage[0] -Name "Architecture")) } else { $null }
+    $architectureMatches = $hostArchitecture -and $imageArchitecture -and $hostArchitecture -eq $imageArchitecture
+    & $addValidation "Architecture" $architectureMatches $(if($architectureMatches){"Image architecture $imageArchitecture matches host architecture $hostArchitecture"}else{"Image architecture is missing or does not match the host architecture"})
+    $imageName = if ($selectedImage) { [string](Get-RestoreSupportObjectProperty -InputObject $selectedImage[0] -Name "Name") } else { "" }
+    $imageFamily = if ($imageName -match '(?i)Windows\s+11') { "Windows 11" } elseif ($imageName -match '(?i)Windows\s+10') { "Windows 10" } else { $null }
+    $familyValid = $imageFamily -in @("Windows 10","Windows 11")
+    & $addValidation "ProductFamily" $familyValid $(if($familyValid){"Image belongs to $imageFamily"}else{"Image product family is unknown or unsupported"})
+    $imageEdition = if ($selectedImage) { [string](Get-RestoreSupportObjectProperty -InputObject $selectedImage[0] -Name "Edition") } else { "" }
+    if ([string]::IsNullOrWhiteSpace($imageEdition) -and $imageName -match '(?i)\b(Pro|Professional|Home|Enterprise|Education|IoTEnterprise)\b') { $imageEdition = $Matches[1] }
+    if ($imageEdition -eq "Pro") { $imageEdition = "Professional" }
+    $editionValid = $imageEdition -in $script:BaselineSupportedEditions
+    & $addValidation "Edition" $editionValid $(if($editionValid){"Image edition $imageEdition is supported"}else{"Image edition is unknown or outside the supported edition catalog"})
+
+    $requestedAdapters = if ($AdapterKeys) { @($AdapterKeys) } else { @($script:OfflineServicingDefaultAdapters) }
+    $requestedAdapters = @($requestedAdapters | ForEach-Object { [string]$_ } | Where-Object { $_ } | Select-Object -Unique)
+    $knownAdapters = @(Get-RestoreOfflineAdapterCatalog | ForEach-Object { $_.Key })
+    $unknownAdapters = @($requestedAdapters | Where-Object { $_ -notin $knownAdapters })
+    if ($unknownAdapters.Count -gt 0) { & $addValidation "Adapters" $false ("Unknown offline adapters: " + ($unknownAdapters -join ", ")) }
+    $validAdapters = @($requestedAdapters | Where-Object { $_ -in $knownAdapters })
+    $featureSelection = if ($FeatureNames) { @($FeatureNames) } elseif ($validAdapters -contains "Features") { @($script:OfflineDefaultEnabledFeatures) } else { @() }
+    $featureOperations = New-Object System.Collections.Generic.List[object]
+    foreach ($feature in @($featureSelection | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ } | Select-Object -Unique)) {
+        $featureValid = $feature.Length -le 128 -and $feature -match '^[A-Za-z0-9._-]+$' -and $feature -in $script:OfflineDefaultEnabledFeatures
+        if (-not $featureValid) { & $addValidation "Feature:$feature" $false "Feature is not in the allowlisted offline default-enabled feature catalog" }
+        $featureOperations.Add([pscustomobject][ordered]@{Kind="OptionalFeature";Action="Enable";Target=$feature;Scope="OfflineImage";CanExecute=$featureValid;RequiresCommit=$true;Reason=if($featureValid){$null}else{"Feature is not allowlisted"}})
+    }
+    $operations = New-Object System.Collections.Generic.List[object]
+    $operations.Add([pscustomobject][ordered]@{Kind="OfflineImage";Action="Mount";Target=$fullImagePath;Scope="OfflineImage";CanExecute=$true;RequiresCommit=$false;Reason=$null})
+    if ($validAdapters -contains "AppX") { $operations.Add([pscustomobject][ordered]@{Kind="AppX";Action="ObserveProvisioned";Target="Provisioned AppX packages";Scope="OfflineImage";CanExecute=$true;RequiresCommit=$false;Reason="Observation only; trusted package source is required for restoration"}) }
+    foreach ($operation in @($featureOperations.ToArray())) { $operations.Add($operation) }
+    if ($validAdapters -contains "Tasks") { $operations.Add([pscustomobject][ordered]@{Kind="ScheduledTask";Action="Observe";Target="Windows\System32\Tasks";Scope="OfflineImage";CanExecute=$true;RequiresCommit=$false;Reason="Task inventory only; trusted XML source is required for restoration"}) }
+    if ($validAdapters -contains "Policy") {
+        if ($ResetAllowlistedPolicies) {
+            foreach ($entry in @($script:RegistryDefaultCatalog | Where-Object { $_.Path -like "HKLM:\*" -and $_.Action -eq "Remove" })) {
+                $operations.Add([pscustomobject][ordered]@{Kind="OfflinePolicy";Action="Remove";Target="$($entry.Path)\$($entry.ValueName)";Scope="OfflineImage";CanExecute=$true;RequiresCommit=$true;CatalogName=$entry.Name;ValueName=$entry.ValueName;RelativePath=($entry.Path -replace '^HKLM:\\','');Reason=$null})
+            }
+        } else {
+            $operations.Add([pscustomobject][ordered]@{Kind="OfflinePolicy";Action="ObserveAllowlisted";Target="SOFTWARE policy catalog";Scope="OfflineImage";CanExecute=$true;RequiresCommit=$false;Reason="Use -OfflineResetPolicies to request allowlisted policy removal"})
+        }
+    }
+    if ($validAdapters -contains "Tasks" -or $validAdapters -contains "AppX" -or ($validAdapters -contains "Policy" -and -not $ResetAllowlistedPolicies)) {
+        $readOnlyReasons = @()
+        if ($validAdapters -contains "AppX") { $readOnlyReasons += "AppX package restoration requires a trusted package source" }
+        if ($validAdapters -contains "Tasks") { $readOnlyReasons += "Task restoration requires trusted XML" }
+        if ($validAdapters -contains "Policy" -and -not $ResetAllowlistedPolicies) { $readOnlyReasons += "Policy removal was not explicitly requested" }
+    } else { $readOnlyReasons = @() }
+    $planId = [guid]::NewGuid().ToString()
+    $mountDirectory = Join-Path $scratch ("rwd-offline-{0}" -f $planId.Replace("-",""))
+    $sourceHash = if ($sourceExists) { Get-RestoreOfflineImageFileHash -Path $fullImagePath } else { $null }
+    $plan = [pscustomobject][ordered]@{
+        SchemaVersion=$script:OfflineServicingSchemaVersion; ToolVersion=$script:Version; PlanType="OfflineImageServicing"; Scope="OfflineImage"; OnlineMutationAllowed=$false; PlanId=$planId
+        GeneratedAtUtc=(Get-Date).ToUniversalTime().ToString("o"); Status=if($validationErrors.Count -eq 0){"Ready"}elseif(-not $dismAvailable){"Unsupported"}else{"Blocked"}; ExecutionAllowed=($validationErrors.Count -eq 0)
+        Source=[pscustomobject][ordered]@{Path=$fullImagePath;Extension=$extension;Bytes=$sourceBytes;Sha256=$sourceHash;PreserveSourceOnFailure=$true}
+        ImageIndex=$ImageIndex; Image=if($selectedImage){$selectedImage[0]}else{$null}; MachineArchitecture=$hostArchitecture
+        Scratch=[pscustomobject][ordered]@{Path=$scratch;Exists=$scratchExists;AvailableBytes=$freeBytes;RequiredBytes=$requiredScratchBytes;MountDirectory=$mountDirectory}
+        Dism=[pscustomobject][ordered]@{Path=$dismPath;Version=$dismVersion;CheckIntegritySupported=($extension -notin @(".vhd",".vhdx"))}
+        SelectedAdapters=$validAdapters; AdapterCatalog=@(Get-RestoreOfflineAdapterCatalog); Validation=@($validation.ToArray()); ValidationErrors=@($validationErrors.ToArray())
+        Operations=@($operations.ToArray()); ReadOnlyReasons=@($readOnlyReasons)
+        Lifecycle=[pscustomobject][ordered]@{MountRequired=$true;CommitAction="Unmount-Image /Commit";DiscardAction="Unmount-Image /Discard";CommitMustBeExplicit=$true;SourcePreservedOnFailure=$true}
+        PlanHash=$null; Integrity=$null
+    }
+    Set-RestoreOfflinePlanIntegrity -Plan $plan -Confirm:$false | Out-Null
+    return $plan
+}
+
+function Export-RestoreOfflineImagePlan {
+    param(
+        [Parameter(Mandatory=$true)][object]$Plan,
+        [Parameter(Mandatory=$true)][string]$OutputPath
+    )
+    $fullPath = [System.IO.Path]::GetFullPath($OutputPath)
+    $json = $Plan | ConvertTo-Json -Depth 50
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    if ($bytes.Length -gt $script:OfflineServicingMaxPlanBytes) { throw "Offline servicing plan exceeds the maximum supported size" }
+    $parent = [System.IO.Path]::GetDirectoryName($fullPath)
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+    [System.IO.File]::WriteAllBytes($fullPath, $bytes)
+    return $fullPath
+}
+
+function Read-RestoreOfflineImagePlan {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $file = Get-Item -LiteralPath $fullPath -ErrorAction Stop
+    if ($file.Length -gt $script:OfflineServicingMaxPlanBytes) { throw "Offline servicing plan exceeds the maximum supported size" }
+    $plan = [System.IO.File]::ReadAllText($fullPath) | ConvertFrom-Json -ErrorAction Stop
+    if ([int]$plan.SchemaVersion -ne $script:OfflineServicingSchemaVersion) { throw "Unsupported offline servicing plan schema: $($plan.SchemaVersion)" }
+    if ([string]::IsNullOrWhiteSpace([string]$plan.PlanHash) -or [string]$plan.Integrity.Algorithm -ne "SHA256") { throw "Offline servicing plan integrity metadata is missing" }
+    $expectedHash = Get-RestoreJsonSha256 -Value (Get-RestoreOfflinePlanIntegrityPayload -Plan $plan)
+    if ([string]$plan.PlanHash -ne $expectedHash -or [string]$plan.Integrity.PlanHash -ne $expectedHash) { throw "Offline servicing plan integrity validation failed" }
+    return $plan
+}
+
+function ConvertFrom-RestoreDismFeatureState {
+    param([object[]]$Output)
+    $states = @{}
+    $currentName = $null
+    foreach ($lineObject in @($Output)) {
+        $line = [string]$lineObject
+        $nameMatch = [regex]::Match($line, '^\s*Feature\s+Name\s*:\s*(.+?)\s*$')
+        if ($nameMatch.Success) { $currentName = $nameMatch.Groups[1].Value.Trim(); continue }
+        if ($currentName) {
+            $stateMatch = [regex]::Match($line, '^\s*State\s*:\s*(.+?)\s*$')
+            if ($stateMatch.Success) { $states[$currentName] = $stateMatch.Groups[1].Value.Trim(); $currentName = $null }
+        }
+    }
+    return $states
+}
+
+function Invoke-RestoreOfflinePolicyOperation {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory=$true)][object]$Operation,
+        [Parameter(Mandatory=$true)][string]$MountDirectory,
+        [Parameter(Mandatory=$true)][string]$PlanId,
+        [scriptblock]$CommandProvider,
+        [scriptblock]$PolicyProvider
+    )
+    if ($PolicyProvider) {
+        try {
+            $provided = & $PolicyProvider $Operation $MountDirectory
+            return (ConvertTo-RestoreOfflineNativeResult -Value $provided -FilePath "offline-policy" -ArgumentList @($Operation.Target))
+        } catch {
+            return [pscustomobject][ordered]@{Success=$false;Status="Failed";Changed=$false;Target=$Operation.Target;Reason=$_.Exception.Message}
+        }
+    }
+    $hivePath = Join-Path $MountDirectory "Windows\System32\Config\SOFTWARE"
+    if (-not (Test-Path -LiteralPath $hivePath -PathType Leaf)) { return [pscustomobject][ordered]@{Success=$false;Status="Unsupported";Changed=$false;Target=$Operation.Target;Reason="Offline SOFTWARE hive was not found"} }
+    $regCommand = Get-Command reg.exe -ErrorAction SilentlyContinue
+    if (-not $regCommand) { return [pscustomobject][ordered]@{Success=$false;Status="Unsupported";Changed=$false;Target=$Operation.Target;Reason="reg.exe is unavailable"} }
+    $hiveName = "RestoreWindowsDefaultsOffline_$($PlanId.Replace('-',''))"
+    $load = Invoke-RestoreOfflineCommand -FilePath "reg.exe" -ArgumentList @("load","HKLM\$hiveName",$hivePath) -Provider $CommandProvider
+    if (-not $load.Success) { return [pscustomobject][ordered]@{Success=$false;Status="Failed";Changed=$false;Target=$Operation.Target;Reason="Could not load offline SOFTWARE hive";Native=$load} }
+    $changed = $false
+    $status = "NoOp"
+    $reason = $null
+    try {
+        $registryPath = "HKLM:\$hiveName\$($Operation.RelativePath)"
+        $property = Get-ItemProperty -LiteralPath $registryPath -Name $Operation.ValueName -ErrorAction SilentlyContinue
+        $exists = $null -ne $property -and $property.PSObject.Properties[$Operation.ValueName]
+        if ($exists) {
+            if (-not $PSCmdlet.ShouldProcess($Operation.Target, "remove the allowlisted value from the offline image")) {
+                $status = "Skipped"; $reason = "ShouldProcess declined"
+            } else {
+                Remove-ItemProperty -LiteralPath $registryPath -Name $Operation.ValueName -Force -ErrorAction Stop
+                $changed = $true; $status = "Changed"
+            }
+        } else { $reason = "Allowlisted policy value is not present" }
+    } catch { $status = "Failed"; $reason = $_.Exception.Message }
+    finally {
+        $null = Invoke-RestoreOfflineCommand -FilePath "reg.exe" -ArgumentList @("unload","HKLM\$hiveName") -Provider $CommandProvider
+    }
+    return [pscustomobject][ordered]@{Success=($status -in @("Changed","NoOp","Skipped"));Status=$status;Changed=$changed;Target=$Operation.Target;Reason=$reason}
+}
+
+function Invoke-RestoreOfflineImagePlan {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory=$true)][object]$Plan,
+        [Parameter(Mandatory=$true)][ValidateSet("Commit","Discard")][string]$Action,
+        [scriptblock]$CommandProvider,
+        [scriptblock]$PolicyProvider
+    )
+    if ($Plan -is [string]) { $Plan = Read-RestoreOfflineImagePlan -Path ([string]$Plan) }
+    try {
+        $expectedPlanHash = Get-RestoreJsonSha256 -Value (Get-RestoreOfflinePlanIntegrityPayload -Plan $Plan)
+        if ([int]$Plan.SchemaVersion -ne $script:OfflineServicingSchemaVersion -or [string]$Plan.PlanHash -ne $expectedPlanHash) {
+            return [pscustomobject][ordered]@{Status="InvalidPlan";Success=$false;Action=$Action;ExitCode=2;Reason="Offline servicing plan integrity validation failed"}
+        }
+    } catch {
+        return [pscustomobject][ordered]@{Status="InvalidPlan";Success=$false;Action=$Action;ExitCode=2;Reason=$_.Exception.Message}
+    }
+    $sourcePath = [string]$Plan.Source.Path
+    $sourceBefore = Get-RestoreOfflineImageFileHash -Path $sourcePath
+    if ($Action -eq "Commit" -and [string]$Plan.Source.Sha256 -and $sourceBefore -ne [string]$Plan.Source.Sha256) {
+        return [pscustomobject][ordered]@{Status="SourceChanged";Success=$false;Action=$Action;ExitCode=2;PlanHash=$Plan.PlanHash;SourcePath=$sourcePath;Reason="Image source hash no longer matches the reviewed plan"}
+    }
+    $scratchPath = [string]$Plan.Scratch.Path
+    $mountDirectory = [string]$Plan.Scratch.MountDirectory
+    $mountLeaf = if ($mountDirectory) { [System.IO.Path]::GetFileName($mountDirectory) } else { "" }
+    $mountPathValid = $scratchPath -and $mountDirectory -and (Test-RestoreOfflinePathUnder -Path $mountDirectory -Directory $scratchPath) -and $mountLeaf -match '^rwd-offline-[0-9a-fA-F]+$'
+    if (-not $mountPathValid) { return [pscustomobject][ordered]@{Status="InvalidPlan";Success=$false;Action=$Action;ExitCode=2;PlanHash=$Plan.PlanHash;Reason="Offline mount directory is outside the reviewed scratch path"} }
+    $operations = New-Object System.Collections.Generic.List[object]
+    $mounted = $false
+    $cleanupResult = [pscustomobject][ordered]@{Attempted=$false;Success=$true;Reason=$null}
+    $cleanup = {
+        $cleanupResult.Attempted = $true
+        if (Test-Path -LiteralPath $mountDirectory) {
+            if ($mounted) {
+                $cleanupResult.Success = $false; $cleanupResult.Reason = "Mounted image remains active; mount directory was retained"; return
+            }
+            if (-not (Test-RestoreOfflinePathUnder -Path $mountDirectory -Directory $scratchPath)) {
+                $cleanupResult.Success = $false; $cleanupResult.Reason = "Mount directory escaped the scratch path"; return
+            }
+            try { Remove-Item -LiteralPath $mountDirectory -Recurse -Force -ErrorAction Stop } catch { $cleanupResult.Success = $false; $cleanupResult.Reason = $_.Exception.Message }
+        }
+    }
+    if ($Action -eq "Discard") {
+        if (-not (Test-Path -LiteralPath $mountDirectory -PathType Container)) {
+            $afterHash = Get-RestoreOfflineImageFileHash -Path $sourcePath
+            return [pscustomobject][ordered]@{Status="Discarded";Success=$true;Idempotent=$true;Action=$Action;ExitCode=0;PlanHash=$Plan.PlanHash;SourcePath=$sourcePath;SourcePreserved=($sourceBefore -eq $afterHash);Cleanup=$cleanupResult}
+        }
+        if (-not $PSCmdlet.ShouldProcess($mountDirectory, "discard and unmount the offline image")) { return [pscustomobject][ordered]@{Status="Skipped";Success=$false;Action=$Action;ExitCode=2;PlanHash=$Plan.PlanHash} }
+        $discard = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Unmount-Image","/MountDir:$mountDirectory","/Discard") -Provider $CommandProvider
+        $operations.Add([pscustomobject][ordered]@{Kind="Unmount";Action="Discard";Success=$discard.Success;ExitCode=$discard.ExitCode;FailureCategory=$discard.FailureCategory})
+        if ($discard.Success) { & $cleanup }
+        $afterHash = Get-RestoreOfflineImageFileHash -Path $sourcePath
+        return [pscustomobject][ordered]@{Status=if($discard.Success -and $cleanupResult.Success){"Discarded"}else{"DiscardFailed"};Success=($discard.Success -and $cleanupResult.Success);Idempotent=$false;Action=$Action;ExitCode=if($discard.Success -and $cleanupResult.Success){0}else{1};PlanHash=$Plan.PlanHash;SourcePath=$sourcePath;SourcePreserved=($sourceBefore -eq $afterHash);Operations=@($operations.ToArray());Cleanup=$cleanupResult;Reason=if($discard.Success){$cleanupResult.Reason}else{"DISM discard failed"}}
+    }
+    if ($Plan.Status -ne "Ready" -or -not $Plan.ExecutionAllowed) { return [pscustomobject][ordered]@{Status="Blocked";Success=$false;Action=$Action;ExitCode=2;PlanHash=$Plan.PlanHash;Reason="Offline servicing plan is not executable"} }
+    if (-not $PSCmdlet.ShouldProcess($sourcePath, "mount, service, and commit the offline image")) { return [pscustomobject][ordered]@{Status="Skipped";Success=$false;Action=$Action;ExitCode=2;PlanHash=$Plan.PlanHash} }
+    try {
+        if (-not (Test-Path -LiteralPath $scratchPath -PathType Container)) { New-Item -ItemType Directory -Path $scratchPath -Force | Out-Null }
+        if (Test-Path -LiteralPath $mountDirectory) { throw "Offline mount directory already exists" }
+        New-Item -ItemType Directory -Path $mountDirectory -Force | Out-Null
+        $mountArgs = @("/English","/Mount-Image","/ImageFile:$sourcePath","/Index:$([int]$Plan.ImageIndex)","/MountDir:$mountDirectory")
+        if ([bool]$Plan.Dism.CheckIntegritySupported) { $mountArgs += "/CheckIntegrity" }
+        $mount = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList $mountArgs -Provider $CommandProvider
+        $operations.Add([pscustomobject][ordered]@{Kind="Mount";Action="Mount";Success=$mount.Success;ExitCode=$mount.ExitCode;FailureCategory=$mount.FailureCategory})
+        if (-not $mount.Success) { throw "DISM mount failed" }
+        $mounted = $true
+
+        $appxOperation = @($Plan.Operations | Where-Object { $_.Kind -eq "AppX" -and $_.Action -eq "ObserveProvisioned" })
+        if ($appxOperation.Count -gt 0) {
+            $appx = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Image:$mountDirectory","/Get-ProvisionedAppxPackages") -Provider $CommandProvider
+            $operations.Add([pscustomobject][ordered]@{Kind="AppX";Action="ObserveProvisioned";Success=$appx.Success;ExitCode=$appx.ExitCode;PackageLineCount=@($appx.Output -split "`r?`n" | Where-Object { $_ -match 'PackageName\s*:' }).Count;FailureCategory=$appx.FailureCategory})
+            if (-not $appx.Success) { throw "Offline AppX observation failed" }
+        }
+
+        $featureOperations = @($Plan.Operations | Where-Object { $_.Kind -eq "OptionalFeature" -and $_.Action -eq "Enable" })
+        $featureStates = @{}
+        if ($featureOperations.Count -gt 0) {
+            $featureRead = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Image:$mountDirectory","/Get-Features","/Format:Table") -Provider $CommandProvider
+            if (-not $featureRead.Success) { throw "Offline feature observation failed" }
+            $featureStates = ConvertFrom-RestoreDismFeatureState -Output @($featureRead.Output -split "`r?`n")
+            foreach ($feature in $featureOperations) {
+                $currentState = if ($featureStates.ContainsKey([string]$feature.Target)) { [string]$featureStates[[string]$feature.Target] } else { "Unknown" }
+                if ($currentState -match '(?i)^Enabled$') {
+                    $operations.Add([pscustomobject][ordered]@{Kind="OptionalFeature";Action="Enable";Target=$feature.Target;Status="AlreadyEnabled";Success=$true;Changed=$false})
+                    continue
+                }
+                $enable = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Image:$mountDirectory","/Enable-Feature","/FeatureName:$($feature.Target)","/All") -Provider $CommandProvider -ExpectedExitCodes @(0,3010)
+                $operations.Add([pscustomobject][ordered]@{Kind="OptionalFeature";Action="Enable";Target=$feature.Target;Status=if($enable.Success){"Changed"}else{"Failed"};Success=$enable.Success;Changed=$enable.Success;ExitCode=$enable.ExitCode;FailureCategory=$enable.FailureCategory})
+                if (-not $enable.Success) { throw "Offline feature enablement failed: $($feature.Target)" }
+            }
+        }
+
+        $taskOperation = @($Plan.Operations | Where-Object { $_.Kind -eq "ScheduledTask" -and $_.Action -eq "Observe" })
+        if ($taskOperation.Count -gt 0) {
+            $taskRoot = Join-Path $mountDirectory "Windows\System32\Tasks"
+            try { $taskCount = if (Test-Path -LiteralPath $taskRoot -PathType Container) { @(Get-ChildItem -LiteralPath $taskRoot -File -Recurse -ErrorAction Stop | Select-Object -First 1000).Count } else { 0 }; $taskSuccess = $true; $taskReason = $null } catch { $taskCount = 0; $taskSuccess = $false; $taskReason = $_.Exception.Message }
+            $operations.Add([pscustomobject][ordered]@{Kind="ScheduledTask";Action="Observe";Target=$taskRoot;Status=if($taskSuccess){"Observed"}else{"Failed"};Success=$taskSuccess;TaskCount=$taskCount;Reason=$taskReason})
+            if (-not $taskSuccess) { throw "Offline task inventory failed" }
+        }
+
+        $policyOperations = @($Plan.Operations | Where-Object { $_.Kind -eq "OfflinePolicy" -and $_.Action -eq "Remove" })
+        foreach ($policy in $policyOperations) {
+            $policyResult = Invoke-RestoreOfflinePolicyOperation -Operation $policy -MountDirectory $mountDirectory -PlanId ([string]$Plan.PlanId) -CommandProvider $CommandProvider -PolicyProvider $PolicyProvider -Confirm:$false
+            $operations.Add($policyResult)
+            if (-not $policyResult.Success) { throw "Offline policy operation failed: $($policy.Target)" }
+        }
+
+        $unmountArgs = @("/English","/Unmount-Image","/MountDir:$mountDirectory","/Commit")
+        if ([bool]$Plan.Dism.CheckIntegritySupported) { $unmountArgs += "/CheckIntegrity" }
+        $commit = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList $unmountArgs -Provider $CommandProvider
+        $operations.Add([pscustomobject][ordered]@{Kind="Unmount";Action="Commit";Success=$commit.Success;ExitCode=$commit.ExitCode;FailureCategory=$commit.FailureCategory})
+        if (-not $commit.Success) {
+            $discard = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Unmount-Image","/MountDir:$mountDirectory","/Discard") -Provider $CommandProvider
+            $operations.Add([pscustomobject][ordered]@{Kind="Unmount";Action="DiscardAfterCommitFailure";Success=$discard.Success;ExitCode=$discard.ExitCode;FailureCategory=$discard.FailureCategory})
+            $mounted = -not $discard.Success
+            if ($discard.Success) { & $cleanup }
+            throw "DISM commit failed"
+        }
+        $mounted = $false
+        & $cleanup
+        $sourceAfter = Get-RestoreOfflineImageFileHash -Path $sourcePath
+        return [pscustomobject][ordered]@{Status=if($cleanupResult.Success){"Committed"}else{"CleanupFailed"};Success=$cleanupResult.Success;Action=$Action;ExitCode=if($cleanupResult.Success){0}else{1};PlanHash=$Plan.PlanHash;SourcePath=$sourcePath;SourcePreserved=($sourceBefore -eq $sourceAfter);Operations=@($operations.ToArray());Cleanup=$cleanupResult}
+    } catch {
+        if ($mounted) {
+            $discard = Invoke-RestoreOfflineCommand -FilePath "dism.exe" -ArgumentList @("/English","/Unmount-Image","/MountDir:$mountDirectory","/Discard") -Provider $CommandProvider
+            $operations.Add([pscustomobject][ordered]@{Kind="Unmount";Action="DiscardAfterFailure";Success=$discard.Success;ExitCode=$discard.ExitCode;FailureCategory=$discard.FailureCategory})
+            $mounted = -not $discard.Success
+        }
+        & $cleanup
+        $sourceAfter = Get-RestoreOfflineImageFileHash -Path $sourcePath
+        return [pscustomobject][ordered]@{Status="Failed";Success=$false;Action=$Action;ExitCode=1;PlanHash=$Plan.PlanHash;SourcePath=$sourcePath;SourcePreserved=($sourceBefore -eq $sourceAfter);Operations=@($operations.ToArray());Cleanup=$cleanupResult;Reason=$_.Exception.Message}
+    }
 }
 
 # ============================================================================
@@ -3937,19 +4510,7 @@ function Restore-WindowsFeatures {
     Write-Log "Re-enabling Windows optional features (this may take several minutes)..." -Level Info
 
     # Features that are enabled by default on a fresh Windows install
-    $defaultEnabledFeatures = @(
-        "MicrosoftWindowsPowerShellV2",
-        "MicrosoftWindowsPowerShellV2Root",
-        "WCF-TCP-PortSharing45",
-        "SmbDirect",
-        "Printing-Foundation-Features",
-        "Printing-PrintToPDFServices-Features",
-        "Printing-XPSServices-Features",
-        "SearchEngine-Client-Package",
-        "MediaPlayback",
-        "WindowsMediaPlayer",
-        "WorkFolders-Client"
-    )
+    $defaultEnabledFeatures = @($script:OfflineDefaultEnabledFeatures)
 
     # Features disabled by default (skip restoring these - they were disabled for security)
     $defaultDisabledFeatures = @(
@@ -8647,6 +9208,24 @@ Set-Alias -Name Restore-LocalGroupPolicyDefaults -Value Restore-LocalGroupPolicy
 # ============================================================================
 # ENTRY POINT
 # ============================================================================
+
+if ($OfflineImageFile -or $OfflineServicingPlanPath -or $OfflineImageAction) {
+    $offlineAction = if ($OfflineImageAction) { $OfflineImageAction } else { "Plan" }
+    if ($offlineAction -eq "Plan") {
+        if (-not $OfflineImageFile) { throw "Offline plan action requires -OfflineImageFile" }
+        $requestedOfflineAdapters = @($OfflineAdapters -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        $requestedOfflineFeatures = if ($OfflineFeatureNames) { @($OfflineFeatureNames -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }) } else { $null }
+        $offlinePlan = Get-RestoreOfflineImagePlan -ImageFile $OfflineImageFile -ImageIndex $OfflineImageIndex -ScratchPath $OfflineScratchPath -AdapterKeys $requestedOfflineAdapters -FeatureNames $requestedOfflineFeatures -ResetAllowlistedPolicies:$OfflineResetPolicies
+        if ($OfflineServicingPlanPath) { $null = Export-RestoreOfflineImagePlan -Plan $offlinePlan -OutputPath $OfflineServicingPlanPath }
+        Write-Output ($offlinePlan | ConvertTo-Json -Depth 50)
+        if ($offlinePlan.Status -eq "Ready") { exit 0 }
+        exit 2
+    }
+    if (-not $OfflineServicingPlanPath) { throw "Offline $offlineAction action requires -OfflineServicingPlanPath" }
+    $offlineResult = Invoke-RestoreOfflineImagePlan -Plan $OfflineServicingPlanPath -Action $offlineAction
+    Write-Output ($offlineResult | ConvertTo-Json -Depth 30)
+    exit ([int]$offlineResult.ExitCode)
+}
 
 if ($BaselineReport) {
     $catalogReportDocument = Get-RestoreBaselineCatalogReport

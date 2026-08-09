@@ -1269,3 +1269,110 @@ safe diagnostic line
         }
     }
 }
+
+Describe "Restore-WindowsDefaults offline servicing contracts" {
+    It "builds a read-only validated plan and round-trips its integrity" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-offline-plan-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $image = Join-Path $root "install.wim"
+        $scratch = Join-Path $root "scratch"
+        $planPath = Join-Path $root "offline-plan.json"
+        New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($image, [byte[]](1..32))
+        try {
+            $dismProvider = {
+                param($file,[object[]]$arguments)
+                $null = $file
+                if ($arguments -contains "/Version") { return [pscustomobject]@{Success=$true;ExitCode=0;Version="10.0.26100.1"} }
+                if ($arguments -contains "/Get-WimInfo") {
+                    return [pscustomobject]@{Success=$true;ExitCode=0;Images=@([pscustomobject]@{Index=1;Name="Windows 11 Pro";Edition="Professional";Architecture="x64";Version="10.0.26100.1"})}
+                }
+                return [pscustomobject]@{Success=$true;ExitCode=0;Output=""}
+            }
+            $machineProvider = { [pscustomobject]@{Architecture="x64";ProductFamily="Windows 11";Build=26100;Edition="Professional";Locale="en-US";PowerShellMajor=5;IsOnline=$true;IsAdministrator=$true;Management=[pscustomobject]@{IsKnown=$true;IsManaged=$false}} }
+            $plan = Get-RestoreOfflineImagePlan -ImageFile $image -ImageIndex 1 -ScratchPath $scratch -AdapterKeys @("AppX","Features","Tasks","Policy") -FeatureNames @("MediaPlayback") -ResetAllowlistedPolicies -DismProvider $dismProvider -MachineProfileProvider $machineProvider -MinimumScratchBytes 0
+
+            $plan.Status | Should -Be "Ready"
+            $plan.ExecutionAllowed | Should -BeTrue
+            $plan.Image.Name | Should -Be "Windows 11 Pro"
+            $plan.Image.Architecture | Should -Be "x64"
+            $plan.ValidationErrors.Count | Should -Be 0
+            @($plan.Operations | Where-Object Kind -eq "AppX").Count | Should -Be 1
+            @($plan.Operations | Where-Object Kind -eq "OptionalFeature").Count | Should -Be 1
+            @($plan.Operations | Where-Object Kind -eq "ScheduledTask").Count | Should -Be 1
+            @($plan.Operations | Where-Object Kind -eq "OfflinePolicy").Count | Should -BeGreaterThan 0
+            $plan.Lifecycle.CommitMustBeExplicit | Should -BeTrue
+            $plan.Source.PreserveSourceOnFailure | Should -BeTrue
+            (Export-RestoreOfflineImagePlan -Plan $plan -OutputPath $planPath) | Should -Be $planPath
+            (Read-RestoreOfflineImagePlan -Path $planPath).PlanHash | Should -Be $plan.PlanHash
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "commits only after an explicit action and discards on an adapter failure" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-offline-life-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $image = Join-Path $root "install.wim"
+        $scratch = Join-Path $root "scratch"
+        New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($image, [byte[]](1..32))
+        try {
+            $dismProvider = {
+                param($file,[object[]]$arguments)
+                $null = $file
+                if ($arguments -contains "/Enable-Feature") { return [pscustomobject]@{Success=$false;ExitCode=87;FailureCategory="UnexpectedExitCode"} }
+                if ($arguments -contains "/Get-WimInfo") { return [pscustomobject]@{Success=$true;ExitCode=0;Images=@([pscustomobject]@{Index=1;Name="Windows 11 Pro";Edition="Professional";Architecture="x64"})} }
+                if ($arguments -contains "/Version") { return [pscustomobject]@{Success=$true;ExitCode=0;Version="10.0.26100.1"} }
+                [pscustomobject]@{Success=$true;ExitCode=0;Output=""}
+            }
+            $machineProvider = { [pscustomobject]@{Architecture="x64";ProductFamily="Windows 11";Build=26100;Edition="Professional";PowerShellMajor=5;IsOnline=$true;IsAdministrator=$true;Management=[pscustomobject]@{IsKnown=$true;IsManaged=$false}} }
+            $plan = Get-RestoreOfflineImagePlan -ImageFile $image -ScratchPath $scratch -AdapterKeys @("Features") -FeatureNames @("MediaPlayback") -DismProvider $dismProvider -MachineProfileProvider $machineProvider -MinimumScratchBytes 0
+            $plan.Status | Should -Be "Ready"
+            $failed = Invoke-RestoreOfflineImagePlan -Plan $plan -Action Commit -CommandProvider $dismProvider
+            $failed.Status | Should -Be "Failed"
+            $failed.Success | Should -BeFalse
+            $failed.SourcePreserved | Should -BeTrue
+            (Test-Path -LiteralPath $plan.Scratch.MountDirectory) | Should -BeFalse
+
+            New-Item -ItemType Directory -Path $plan.Scratch.MountDirectory -Force | Out-Null
+            $discarded = Invoke-RestoreOfflineImagePlan -Plan $plan -Action Discard -CommandProvider $dismProvider
+            $discarded.Status | Should -Be "Discarded"
+            $discarded.Success | Should -BeTrue
+            $discarded.SourcePreserved | Should -BeTrue
+            (Test-Path -LiteralPath $plan.Scratch.MountDirectory) | Should -BeFalse
+
+            $successProvider = {
+                param($file,[object[]]$arguments)
+                $null = $file
+                if ($arguments -contains "/Get-WimInfo") { return [pscustomobject]@{Success=$true;ExitCode=0;Images=@([pscustomobject]@{Index=1;Name="Windows 11 Pro";Edition="Professional";Architecture="x64"})} }
+                if ($arguments -contains "/Version") { return [pscustomobject]@{Success=$true;ExitCode=0;Version="10.0.26100.1"} }
+                [pscustomobject]@{Success=$true;ExitCode=0;Output=""}
+            }
+            $successPlan = Get-RestoreOfflineImagePlan -ImageFile $image -ScratchPath $scratch -AdapterKeys @("Features") -FeatureNames @("MediaPlayback") -DismProvider $successProvider -MachineProfileProvider $machineProvider -MinimumScratchBytes 0
+            $committed = Invoke-RestoreOfflineImagePlan -Plan $successPlan -Action Commit -CommandProvider $successProvider
+            $committed.Status | Should -Be "Committed"
+            $committed.Success | Should -BeTrue
+            @($committed.Operations | Where-Object { $_.Kind -eq "Unmount" -and $_.Action -eq "Commit" }).Count | Should -Be 1
+            (Test-Path -LiteralPath $successPlan.Scratch.MountDirectory) | Should -BeFalse
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It "fails closed for unsupported formats and architecture mismatches" {
+        $root = Join-Path ([System.IO.Path]::GetTempPath()) ("rwd-offline-gates-{0}" -f ([guid]::NewGuid().ToString("N")))
+        $image = Join-Path $root "install.iso"
+        $scratch = Join-Path $root "scratch"
+        New-Item -ItemType Directory -Path $scratch -Force | Out-Null
+        [System.IO.File]::WriteAllBytes($image, [byte[]](1..8))
+        try {
+            $dismProvider = { param($file,[object[]]$arguments); $null = $file; if ($arguments -contains "/Version") { [pscustomobject]@{Success=$true;ExitCode=0;Version="10.0.26100.1"} } else { [pscustomobject]@{Success=$true;ExitCode=0;Images=@([pscustomobject]@{Index=1;Name="Windows 11 Pro";Edition="Professional";Architecture="arm64"})} } }
+            $machineProvider = { [pscustomobject]@{Architecture="x64";ProductFamily="Windows 11";Build=26100;Edition="Professional";PowerShellMajor=5;IsOnline=$true;IsAdministrator=$true;Management=[pscustomobject]@{IsKnown=$true;IsManaged=$false}} }
+            $plan = Get-RestoreOfflineImagePlan -ImageFile $image -ScratchPath $scratch -DismProvider $dismProvider -MachineProfileProvider $machineProvider -MinimumScratchBytes 0
+            $plan.Status | Should -Be "Blocked"
+            $plan.ExecutionAllowed | Should -BeFalse
+            $plan.ValidationErrors -join ";" | Should -Match "format|architecture"
+        } finally {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}

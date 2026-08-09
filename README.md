@@ -25,6 +25,7 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 - **Import undo manifest** - Load JSON manifests from Debloat-Win11 v1.1.0 for precise restoration
 - **Debloat fingerprinting** - Detects evidence from O&O ShutUp10, WPD, ThisIsWin11, Sophia Script, and Win10Privacy without executing their code
 - **Baseline inventory** - Exports and compares registry/AppX state, including provisioned-package and offline-WIM comparisons
+- **Bounded offline servicing** - Validates a WIM/VHD source, image index, edition, architecture, DISM version, locks, and scratch capacity before mounting; commit and discard are separate explicit actions
 - **Explicit restore scopes** - Names current-user, all-existing-user, provisioned-image, and offline-image AppX observations; only current-user online registration is executable by the restore executor
 - **Managed-device safety** - Reports structured domain, MDM, Group Policy, local-policy, and account-join provenance; managed values and categories are skipped by default unless an explicit operator override is recorded
 - **Independent restore verification** - Records bounded native-command exit codes, stderr, failure taxonomy, fresh postconditions, and pending-reboot state in CLI, GUI, and deployment-wrapper results
@@ -98,6 +99,16 @@ The same script supports non-GUI workflows for automation and diagnostics:
 `-NoGui` is intended for automation. The Intune and Configuration Manager wrappers under `deploy\` emit JSON compliance results by default; add `-Remediate` to run the critical security and service/task categories in an already elevated management context.
 
 AppX scope is selected with `-RestoreScope CurrentUser|AllUsers|Provisioned|OfflineImage`. `CurrentUser` observes online registration and is the only AppX mutation scope supported by the online executor. `AllUsers` observes registrations for existing users, `Provisioned` observes the online image, and `OfflineImage` observes a mounted image through `-OfflineImagePath`; those targets are explicitly read-only or unsupported in the online restore plan. Registry snapshots and plan operations likewise declare `CurrentUser`, `Machine`, `AllUsers`, or `MachineAndUser` hive scope.
+
+Offline WIM/VHD servicing is plan-first and never reuses the online mutation path. Generate a reviewed plan without mounting, then choose one explicit lifecycle action:
+
+```powershell
+.\Restore-WindowsDefaults.ps1 -NoGui -OfflineImageFile .\install.wim -OfflineImageAction Plan -OfflineImageIndex 1 -OfflineServicingPlanPath .\offline-plan.json
+.\Restore-WindowsDefaults.ps1 -NoGui -OfflineImageAction Commit -OfflineServicingPlanPath .\offline-plan.json
+.\Restore-WindowsDefaults.ps1 -NoGui -OfflineImageAction Discard -OfflineServicingPlanPath .\offline-plan.json
+```
+
+The plan validates the source lock, free scratch space, selected index, Windows edition/build family, host/image architecture, and DISM version. The bounded adapters observe provisioned AppX and offline tasks, enable only the catalogued default-enabled optional features, and can remove only the versioned machine-policy values when `-OfflineResetPolicies` is explicitly included in the plan. AppX/task restoration remains read-only without a trusted package or XML source. Failed servicing attempts discard the mount and retain the original source whenever DISM permits cleanup.
 
 Scheduled restores are versioned, integrity-checked jobs with an owner, plan hash, rollback-journal reference, and configurable 1–168 hour expiry (24 hours by default). `-ScheduledRestoreStatus` reports stale or incomplete registration without replaying it; `-CancelScheduledRestore` removes the matching RunOnce value, job state, and prepared rollback journal. Resume consumes the job once and later resume calls return an idempotent result.
 
