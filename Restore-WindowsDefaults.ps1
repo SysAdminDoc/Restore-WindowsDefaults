@@ -19,6 +19,10 @@ param(
     [ValidateSet("Quick","Full","Nuclear")][string]$RestoreTier,
     [switch]$PostUpdateCheck,
     [string]$ExportSupportBundle,
+    [switch]$HealthWorker,
+    [string]$HealthProgressPath,
+    [string]$HealthResultPath,
+    [string]$HealthCancelPath,
     [Alias("OfflineSourcePath","OfflineWimPath")][string]$OfflineImageFile,
     [Alias("OfflineAction")][ValidateSet("Plan","Commit","Discard")][string]$OfflineImageAction,
     [Alias("OfflinePlanPath")][string]$OfflineServicingPlanPath,
@@ -110,6 +114,11 @@ $script:SupportBundleMaxLogBytes = 512KB
 $script:SupportBundleMaxLogFiles = 3
 $script:SupportBundleMaxCategories = 100
 $script:SupportBundleMaxIssueSummaries = 20
+$script:HealthScanSchemaVersion = 1
+$script:HealthScanDefaultPerCheckTimeoutSeconds = 15
+$script:HealthScanDefaultGlobalTimeoutSeconds = 120
+$script:HealthScanMaxProgressBytes = 256KB
+$script:LastHealthPartialReport = [ordered]@{}
 $script:ExternalImportSchemaVersion = 2
 $script:ExternalImportMaxBytes = 2MB
 $script:ExternalImportMaxLines = 5000
