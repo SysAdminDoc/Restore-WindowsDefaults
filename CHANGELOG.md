@@ -4,6 +4,8 @@ All notable changes to Restore-WindowsDefaults will be documented in this file.
 
 ## [Unreleased]
 
+- Fixed the placeholder `YOUR_USERNAME/YOUR_REPO` one-liner in the README. The README no longer asks anyone to paste an `irm | iex` command at all; the download option now links straight to the script on GitHub and says to read it first.
+
 - Added a versioned, build-aware baseline catalog contract across registry defaults, AppX expectations, debloat fingerprints, service/task evidence, and CLI reporting, with provenance, confidence, and warning-only unknown entries.
 - Added structured managed-policy provenance across health findings, capability reports, action plans, and restore results, including domain/MDM/Group Policy evidence, labeled `dsregcmd` fallbacks, default preservation of organization-owned values, and recorded operator overrides.
 - Constrained external undo imports to schema v2 with bounded input, allowlisted paths and operations, provenance, and distinct verified, untrusted, malformed, and unsupported evidence results.

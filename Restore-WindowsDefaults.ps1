@@ -55,7 +55,7 @@ param(
 
 .NOTES
     Author: SysAdminDoc
-    Version: 4.4.0
+    Version: 4.4.1
     Requires: Administrator privileges
 #>
 
@@ -63,7 +63,7 @@ param(
 # CONFIGURATION
 # ============================================================================
 
-$script:Version = "4.4.0"
+$script:Version = "4.4.1"
 $script:CapabilitySchemaVersion = 1
 $script:ManagementSchemaVersion = 1
 $script:CapabilityProfile = $null

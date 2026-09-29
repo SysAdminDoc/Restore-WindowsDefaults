@@ -4,7 +4,7 @@
 
 A one-click solution to fix Windows PCs broken by debloat scripts, privacy.sexy tweaks, and aggressive registry modifications.
 
-![Version](https://img.shields.io/badge/version-4.4.0-green)
+![Version](https://img.shields.io/badge/version-4.4.1-green)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1-blue)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -55,7 +55,7 @@ Debloat scripts and privacy tools like privacy.sexy, Win10Debloater, and similar
 ## Quick Start
 
 ### Option 1: Right-click (easiest)
-1. Download `Restore-WindowsDefaults.ps1`
+1. [Download `Restore-WindowsDefaults.ps1`](https://github.com/SysAdminDoc/Restore-WindowsDefaults/blob/main/Restore-WindowsDefaults.ps1) from GitHub (use the Download button on that page). It's one file, so give it a read first.
 2. Right-click the file
 3. Select **Run with PowerShell**
 
@@ -65,14 +65,9 @@ Set-ExecutionPolicy Bypass -Scope Process -Force
 .\Restore-WindowsDefaults.ps1
 ```
 
-### Option 3: One-liner
-```powershell
-irm https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/Restore-WindowsDefaults.ps1 | iex
-```
-
 The script automatically elevates to Administrator and runs in Windows PowerShell 5.1 for maximum compatibility.
 
-### Option 4: Detection and recovery CLI
+### Option 3: Detection and recovery CLI
 
 The same script supports non-GUI workflows for automation and diagnostics:
 
